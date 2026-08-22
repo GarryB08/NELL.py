@@ -230,7 +230,8 @@ table {{ width: 100%; border-collapse: collapse; margin-bottom: 20px; font-size:
 th {{ background-color: #1b5e20; color: #ffffff; text-align: left; padding: 10px; text-transform: uppercase; letter-spacing: 1px; }}
 td {{ padding: 10px 8px; border-bottom: 1px solid #f0f0f0; }}
 .qty-col, .desccol, .pricecol, .deliverycol, .totalcol {{ text-align: left; }}
-.desccol {{ font-weight: 700; color: #333333; }}
+td.desccol {{ font-weight: 700; color: #333333; }}
+th.desccol {{ color: #ffffff; }}
 .summary-container {{ display: flex; justify-content: flex-end; }}
 .summary-table {{ width: 100%; }}
 @media (min-width: 768px) {{ .summary-table {{ width: 420px; }} }}
@@ -253,7 +254,7 @@ td {{ padding: 10px 8px; border-bottom: 1px solid #f0f0f0; }}
 <div class="receipt-container" id="receiptContent">
 <div class="header">
 <div class="company-info">
-<h1></h1>
+<h1>AILYN HOUSE PROJECT</h1>
 <p>Official Material & Expense Inventory</p>
 <p>Management System {APP_VERSION}</p>
 <p>Backup Receiver: <i>{RECEIVER_AILYN}</i></p>
@@ -696,6 +697,19 @@ section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h3{
 .dashboard-heading-sub{margin-top:5px;color:#9fe5b8;font-size:9px;font-weight:800;letter-spacing:.20em;text-align:center;text-transform:uppercase;}
 .dashboard-welcome{max-width:920px;margin:0 auto 18px;text-align:center;color:#b9d9c5;font-size:12px;font-weight:600;}
 .dashboard-welcome b{color:#72f7b0;}
+
+/* Keep construction ledger entries readable against their light rows. */
+.ledger-entry{
+    margin:12px 0 8px;
+    padding:14px 16px;
+    background:#ffffff;
+    border:1px solid #d7e3dc;
+    border-radius:10px;
+    color:#24332a;
+}
+.ledger-entry p{margin:0;color:#24332a!important;}
+.ledger-entry strong{color:#102218!important;}
+.ledger-entry hr{display:none;}
 
 /* Re-center the dashboard content after removing both title bars. */
 .block-container{max-width:1500px!important;padding-top:18px!important;}
@@ -1347,10 +1361,11 @@ elif view == "ledger":
                 continue
 
             st.markdown(f"""
-            ---
-            **{r['name']}** • PHP {float(r['amount']):,.2f}  
-            👤 {r['sender']} | 🏷️ {r['type']} | 📅 {r['date']}
-            """)
+            <div class="ledger-entry">
+            <strong>{r['name']}</strong> • PHP {float(r['amount']):,.2f}<br>
+            <span>👤 {r['sender']} | 🏷️ {r['type']} | 📅 {r['date']}</span>
+            </div>
+            """, unsafe_allow_html=True)
             if st.button("✏️ EDIT ENTRY", key=f"edit_{r['id']}", use_container_width=True):
                 st.session_state.editing_record_id = r["id"]
                 st.rerun()
@@ -1550,7 +1565,7 @@ elif view == "payroll_ledger":
 
 elif view == "export":
     st.subheader("📄 EXPORT CONSTRUCTION REPORT")
-    receipt_title = st.text_input("Receipt Title", value="AILYN HOUSE PROJECT",
+    receipt_title = st.text_input("Receipt Title", value="OFFICIAL RECEIPT",
                                   placeholder="Enter a title for this receipt")
     html = build_html_report(st.session_state.records, st.session_state.budget, custom_title=receipt_title)
     st.components.v1.html(

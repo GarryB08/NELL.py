@@ -1,0 +1,21 @@
+{
+  "records": [
+    {
+      "id": "1787386635.593587",
+      "date": "Aug 22, 2026",
+      "name": "CEMENT",
+      "price": 15555.0,
+      "qty": 166,
+      "delivery": 6.0,
+      "amount": 2582136.0,
+      "type": "material",
+      "sender": "Garr"
+    }
+  ],
+  "labor_records": [],
+  "payroll_expenses": [],
+  "planner_tasks": [],
+  "budget": 0.0,
+  "remaining_money": 0.0,
+  "view": "export"
+}
