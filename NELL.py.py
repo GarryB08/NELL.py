@@ -1,7 +1,11 @@
 import os
 import time
 import base64
+import ast
+import operator
+import smtplib
 from datetime import datetime
+from email.message import EmailMessage
 from zoneinfo import ZoneInfo
 import streamlit as st
 import json
@@ -22,32 +26,26 @@ PERSISTENT_KEYS = [
     "payroll_expenses",
     "planner_tasks",
     "budget",
+    "budget_history",
     "remaining_money",
     "view"
 ]
 
-try:
-    from persistence import load_state, save_state
-except ImportError:
-    import json
+def load_state():
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r") as f:
+                data = json.load(f)
+            return {k: v for k, v in data.items() if k in PERSISTENT_KEYS}
+        except (OSError, json.JSONDecodeError):
+            return {}
+    return {}
 
 
-    def load_state():
-        if os.path.exists(STATE_FILE):
-            try:
-                with open(STATE_FILE, "r") as f:
-                    data = json.load(f)
-                # Filter out any streamlit internal widget/form submitter keys
-                return {k: v for k, v in data.items() if k in PERSISTENT_KEYS}
-            except Exception:
-                return {}
-        return {}
-
-
-    def save_state(state):
-        data = {k: state[k] for k in PERSISTENT_KEYS if k in state}
-        with open(STATE_FILE, "w") as f:
-            json.dump(data, f, indent=2, default=str)
+def save_state(state):
+    data = {k: state[k] for k in PERSISTENT_KEYS if k in state}
+    with open(STATE_FILE, "w") as f:
+        json.dump(data, f, indent=2, default=str)
 
 # --- TIER SCHEDULE & PAYROLL CALCULATOR CORE LOGIC ---
 TIER_TABLE = {
@@ -117,6 +115,8 @@ if "planner_tasks" not in st.session_state:
     st.session_state.planner_tasks = []
 if "budget" not in st.session_state:
     st.session_state.budget = 0.0
+if "budget_history" not in st.session_state:
+    st.session_state.budget_history = []
 if "remaining_money" not in st.session_state:
     st.session_state.remaining_money = 0.0
 if "view" not in st.session_state:
@@ -509,6 +509,7 @@ def clear_all():
     st.session_state.payroll_expenses = []
     st.session_state.planner_tasks = []
     st.session_state.budget = 0.0
+    st.session_state.budget_history = []
     st.session_state.remaining_money = 0.0
     st.session_state.view = "home"
     st.session_state.selected_role = "Labor"
@@ -517,6 +518,121 @@ def clear_all():
 
 def persist_state():
     save_state(st.session_state)
+
+
+def record_budget_change(action, amount, previous_budget):
+    st.session_state.budget_history.append({
+        "date": manila_now().strftime("%b %d, %Y %I:%M %p"),
+        "action": action,
+        "amount": float(amount),
+        "previous": float(previous_budget),
+        "total": float(st.session_state.budget),
+    })
+    persist_state()
+
+
+CALCULATOR_OPERATORS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.Pow: operator.pow,
+    ast.USub: operator.neg,
+    ast.UAdd: operator.pos,
+}
+
+
+def calculate_expression(expression):
+    def evaluate(node):
+        if isinstance(node, ast.Expression):
+            return evaluate(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return float(node.value)
+        if isinstance(node, ast.BinOp) and type(node.op) in CALCULATOR_OPERATORS:
+            left = evaluate(node.left)
+            right = evaluate(node.right)
+            if isinstance(node.op, ast.Div) and right == 0:
+                raise ValueError("Cannot divide by zero.")
+            if isinstance(node.op, ast.Pow) and abs(right) > 10:
+                raise ValueError("Exponent is limited to 10.")
+            return CALCULATOR_OPERATORS[type(node.op)](left, right)
+        if isinstance(node, ast.UnaryOp) and type(node.op) in CALCULATOR_OPERATORS:
+            return CALCULATOR_OPERATORS[type(node.op)](evaluate(node.operand))
+        raise ValueError("Use numbers and +, -, *, /, or ** only.")
+
+    try:
+        result = evaluate(ast.parse(expression, mode="eval"))
+    except (SyntaxError, ValueError, TypeError, ZeroDivisionError, OverflowError):
+        raise ValueError("Enter a valid arithmetic expression.") from None
+    if not result or abs(result) <= 1e12:
+        return result
+    raise ValueError("Result is limited to 1,000,000,000,000.")
+
+
+@st.dialog("Budget Control", width="small")
+def budget_dialog():
+    st.caption(f"Current budget: PHP {float(st.session_state.budget):,.2f}")
+    apply_tab, edit_tab, calculator_tab, history_tab = st.tabs(
+        ["Apply", "Edit", "Calculator", "History"]
+    )
+
+    with apply_tab:
+        with st.form("budget_apply_dialog_form", clear_on_submit=True):
+            amount = st.number_input("Amount to add", min_value=0.01, value=None,
+                                     placeholder="0.00")
+            submitted = st.form_submit_button("Apply Budget", use_container_width=True)
+        if submitted:
+            if amount is not None:
+                previous_budget = float(st.session_state.budget)
+                st.session_state.budget = previous_budget + float(amount)
+                record_budget_change("Applied", amount, previous_budget)
+                st.success("Budget applied.")
+                st.rerun()
+            else:
+                st.warning("Enter an amount first.")
+
+    with edit_tab:
+        with st.form("budget_edit_dialog_form"):
+            edited_budget = st.number_input(
+                "New total budget", min_value=0.0,
+                value=float(st.session_state.budget), step=100.0,
+            )
+            edited = st.form_submit_button("Save Budget Edit", use_container_width=True)
+        if edited:
+            previous_budget = float(st.session_state.budget)
+            st.session_state.budget = float(edited_budget)
+            record_budget_change("Edited", edited_budget - previous_budget, previous_budget)
+            st.success("Budget updated.")
+            st.rerun()
+
+    with calculator_tab:
+        st.caption("Use expressions such as 12500 - 3200 + 450 or 1500 * 2.")
+        if st.button("Clear", key="budget_calculator_clear", use_container_width=True):
+            st.session_state["budget_calculator_expression"] = ""
+            st.rerun()
+        with st.form("budget_calculator_form"):
+            expression = st.text_input(
+                "Expression", placeholder="0 + 0", key="budget_calculator_expression"
+            )
+            calculate = st.form_submit_button("Calculate", use_container_width=True)
+        if calculate:
+            try:
+                result = calculate_expression(expression)
+                st.metric("Result", f"PHP {result:,.2f}")
+            except ValueError as error:
+                st.warning(str(error))
+
+    with history_tab:
+        history = st.session_state.budget_history
+        if history:
+            st.dataframe(
+                [{"Date": entry["date"], "Action": entry["action"],
+                  "Change": f"PHP {entry['amount']:,.2f}",
+                  "Total": f"PHP {entry['total']:,.2f}"} for entry in reversed(history)],
+                use_container_width=True, hide_index=True,
+            )
+        else:
+            st.info("No budget changes yet.")
 
 
 def add_tx(name, price, qty, delivery, ttype, sender):
@@ -967,63 +1083,48 @@ with st.sidebar:
     )
 
     st.subheader("Executive Overview")
-    if st.button("▣   Dashboard   ›", use_container_width=True, key="side_dashboard"):
+    if st.button("📊   Dashboard   ›", use_container_width=True, key="side_dashboard"):
         set_view("home")
 
-    st.markdown("<div class='sidebar-budget-card'><div class='budget-title'>Set Account Budget</div></div>",
+    st.markdown("<div class='sidebar-budget-card'><div class='budget-title'>Budget Control</div></div>",
                 unsafe_allow_html=True)
-    with st.form(key="budget_form", clear_on_submit=True):
-        budget_input = st.number_input(
-            "Set Account Budget",
-            min_value=0.0,
-            key="budget_input_sidebar",
-            value=None,
-            placeholder="Enter budget...",
-            label_visibility="collapsed",
-        )
-        apply_budget = st.form_submit_button("＋   Apply Budget", use_container_width=True)
-    if apply_budget:
-        if budget_input is not None:
-            st.session_state.budget += float(budget_input)
-            persist_state()
-            st.success("Budget applied!")
-        else:
-            st.warning("Please enter a budget amount.")
+    if st.button("💰   Apply Budget", use_container_width=True, key="side_budget"):
+        budget_dialog()
 
-    if st.button("⚙   Restart System   ›", use_container_width=True, key="side_restart"):
+    if st.button("🔄   Restart System   ›", use_container_width=True, key="side_restart"):
         clear_all()
         set_view("home")
 
     st.subheader("Project Control")
-    if st.button("▣   New Work Entry   ›", use_container_width=True, key="side_new_work"):
+    if st.button("📝   New Work Entry   ›", use_container_width=True, key="side_new_work"):
         set_view("planner_input")
-    if st.button("☷   Schedule & Progress   ›", use_container_width=True, key="side_schedule"):
+    if st.button("📅   Schedule & Progress   ›", use_container_width=True, key="side_schedule"):
         set_view("planner_output")
 
     st.subheader("Financial Operations")
-    if st.button("◇   Material Entry   ›", use_container_width=True, key="side_material"):
+    if st.button("🧱   Material Entry   ›", use_container_width=True, key="side_material"):
         set_view("material")
-    if st.button("▤   Expense Entry   ›", use_container_width=True, key="side_expense"):
+    if st.button("🧾   Expense Entry   ›", use_container_width=True, key="side_expense"):
         set_view("expense")
-    if st.button("♨   Encash Deposit   ›", use_container_width=True, key="side_excess"):
+    if st.button("🏦   Encash Deposit   ›", use_container_width=True, key="side_excess"):
         set_view("excess")
-    if st.button("▣   Financial Ledger   ›", use_container_width=True, key="side_ledger"):
+    if st.button("📒   Financial Ledger   ›", use_container_width=True, key="side_ledger"):
         set_view("ledger")
-    if st.button("▥   Financial Report   ›", use_container_width=True, key="side_financial_report"):
+    if st.button("📈   Financial Report   ›", use_container_width=True, key="side_financial_report"):
         set_view("export")
 
     st.subheader("Payroll Operations")
-    if st.button("●   Labor Account   ›", use_container_width=True, key="side_labor"):
+    if st.button("👷   Labor Account   ›", use_container_width=True, key="side_labor"):
         set_view("add_labor")
-    if st.button("▣   Payroll Expense   ›", use_container_width=True, key="side_payroll_expense"):
+    if st.button("💳   Payroll Expense   ›", use_container_width=True, key="side_payroll_expense"):
         set_view("add_payroll_expense")
-    if st.button("♟   Account Remainder   ›", use_container_width=True, key="side_payroll_remaining"):
+    if st.button("🪙   Account Remainder   ›", use_container_width=True, key="side_payroll_remaining"):
         set_view("payroll_remaining")
-    if st.button("♟   Labor Accounts   ›", use_container_width=True, key="side_payroll_ledger"):
+    if st.button("👥   Labor Accounts   ›", use_container_width=True, key="side_payroll_ledger"):
         set_view("payroll_ledger")
-    if st.button("▤   Payroll Report   ›", use_container_width=True, key="side_payroll_report"):
+    if st.button("📋   Payroll Report   ›", use_container_width=True, key="side_payroll_report"):
         set_view("payroll_export")
-    if st.button("▣   Receipts Archive   ›", use_container_width=True, key="side_archive"):
+    if st.button("🗃️   Receipts Archive   ›", use_container_width=True, key="side_archive"):
         set_view("receipt_archive")
 
 view = st.session_state.view
@@ -1047,7 +1148,7 @@ if view == "home":
 
     st.markdown(f"""
     <div class="dashboard-heading">
-      <img src="{AILYN_LOGO_DATA}" alt="Ailyn Construction Logo">
+    <img src="{AILYN_LOGO_DATA}" alt="Ailyn Construction Logo">
       <div>
         <div class="dashboard-heading-title">AILYN CONSTRUCTION</div>
         <div class="dashboard-heading-sub">PROJECT MANAGEMENT SYSTEM</div>

@@ -3,7 +3,23 @@
   "labor_records": [],
   "payroll_expenses": [],
   "planner_tasks": [],
-  "budget": 0.0,
+  "budget": 200.0,
+  "budget_history": [
+    {
+      "date": "Aug 24, 2026 10:02 PM",
+      "action": "Applied",
+      "amount": 2000.0,
+      "previous": 0.0,
+      "total": 2000.0
+    },
+    {
+      "date": "Aug 24, 2026 10:02 PM",
+      "action": "Edited",
+      "amount": -1800.0,
+      "previous": 2000.0,
+      "total": 200.0
+    }
+  ],
   "remaining_money": 0.0,
-  "view": "home"
+  "view": "add_payroll_expense"
 }
