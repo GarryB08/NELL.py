@@ -129,6 +129,12 @@ if "editing_labor_index" not in st.session_state:
     st.session_state.editing_labor_index = None
 if "editing_payroll_expense_index" not in st.session_state:
     st.session_state.editing_payroll_expense_index = None
+if "show_budget_calculator" not in st.session_state:
+    st.session_state.show_budget_calculator = False
+if "budget_calc_amount" not in st.session_state:
+    st.session_state.budget_calc_amount = 0.0
+if "budget_calc_operation" not in st.session_state:
+    st.session_state.budget_calc_operation = "add"
 
 
 def set_view(v):
@@ -154,7 +160,7 @@ def get_total():
 
 
 def get_balance():
-    return float(st.session_state.budget) + total_excess() - get_total()
+    return float(st.session_state.budget) - total_excess() - get_total()
 
 
 # ================================================================
@@ -1058,13 +1064,110 @@ if view == "home":
 
     m1, m2, m3, m4 = st.columns(4)
     with m1:
-        st.metric("TOTAL BUDGET", f"₱{budget:,.2f}")
+        st.markdown(f"""
+        <div style="background: linear-gradient(135deg, #075c28, #0d8d4a); padding: 20px; border-radius: 10px; text-align: center; cursor: pointer; transition: all 0.3s ease;" 
+             onclick="document.getElementById('budget_calc_btn').click();">
+            <div style="color: #a5d6a7; font-size: 12px; font-weight: 700; letter-spacing: 0.05em;">TOTAL BUDGET</div>
+            <div style="color: #ffffff; font-size: 24px; font-weight: 700; margin-top: 8px;">₱{budget:,.2f}</div>
+            <div style="color: #72f7b0; font-size: 11px; margin-top: 8px;">✎ Click to adjust</div>
+        </div>
+        """, unsafe_allow_html=True)
+        if st.button("", key="budget_calc_btn", label_visibility="collapsed", use_container_width=False):
+            st.session_state.show_budget_calculator = not st.session_state.show_budget_calculator
+            st.rerun()
     with m2:
         st.metric("TOTAL EXPENSES", f"₱{used:,.2f}")
     with m3:
         st.metric("REMAINING BALANCE", f"₱{balance:,.2f}")
     with m4:
         st.metric("TOTAL WORKERS", workers)
+
+    # Budget Calculator Modal
+    if st.session_state.show_budget_calculator:
+        st.markdown("<div style='height: 12px'></div>", unsafe_allow_html=True)
+        with st.container():
+            st.markdown(f"""
+            <div style="background: linear-gradient(145deg, rgba(7, 92, 40, 0.9), rgba(13, 141, 74, 0.8)); 
+                        border: 2px solid #72f7b0; border-radius: 15px; padding: 24px; 
+                        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);">
+                <div style="color: #72f7b0; font-size: 16px; font-weight: 700; margin-bottom: 20px; letter-spacing: 0.05em;">
+                    💰 BUDGET CALCULATOR - Adjust Your Project Budget
+                </div>
+                <div style="background: rgba(255,255,255,0.05); padding: 16px; border-radius: 10px; margin-bottom: 20px; border: 1px solid rgba(114,247,176,0.2);">
+                    <div style="color: #a5d6a7; font-size: 12px; margin-bottom: 8px;">CURRENT BUDGET:</div>
+                    <div style="color: #ffffff; font-size: 28px; font-weight: 700;">₱{budget:,.2f}</div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # Calculator interface
+            calc_col1, calc_col2 = st.columns(2)
+            
+            with calc_col1:
+                st.markdown("**Operation:**")
+                operation = st.radio("Select operation:", ("ADD ➕", "SUBTRACT ➖"), 
+                                    key="budget_operation", horizontal=True, label_visibility="collapsed")
+                st.session_state.budget_calc_operation = "add" if "ADD" in operation else "subtract"
+            
+            with calc_col2:
+                st.markdown("**Amount:**")
+                amount = st.number_input("Enter amount to add or subtract:", min_value=0.0, 
+                                        value=st.session_state.budget_calc_amount, step=100.0,
+                                        key="budget_amount_input", label_visibility="collapsed")
+                st.session_state.budget_calc_amount = amount
+            
+            # Action buttons
+            btn_col1, btn_col2, btn_col3 = st.columns(3)
+            
+            with btn_col1:
+                if st.button("✅ APPLY CHANGE", use_container_width=True, key="apply_budget_change"):
+                    if amount > 0:
+                        if st.session_state.budget_calc_operation == "add":
+                            st.session_state.budget += amount
+                            st.success(f"✅ Added ₱{amount:,.2f} to budget. New total: ₱{st.session_state.budget:,.2f}")
+                        else:
+                            new_budget = st.session_state.budget - amount
+                            st.session_state.budget = max(0, new_budget)
+                            st.success(f"✅ Subtracted ₱{amount:,.2f} from budget. New total: ₱{st.session_state.budget:,.2f}")
+                        st.session_state.budget_calc_amount = 0.0
+                        persist_state()
+                        st.session_state.show_budget_calculator = False
+                        st.rerun()
+                    else:
+                        st.warning("Please enter an amount greater than 0")
+            
+            with btn_col2:
+                if st.button("🔄 RESET CALCULATOR", use_container_width=True, key="reset_budget_calc"):
+                    st.session_state.budget_calc_amount = 0.0
+                    st.rerun()
+            
+            with btn_col3:
+                if st.button("❌ CLOSE", use_container_width=True, key="close_budget_calc"):
+                    st.session_state.show_budget_calculator = False
+                    st.session_state.budget_calc_amount = 0.0
+                    st.rerun()
+            
+            # Quick preset buttons
+            st.markdown("**Quick Amount Presets:**")
+            preset_col1, preset_col2, preset_col3, preset_col4 = st.columns(4)
+            presets = [1000, 5000, 10000, 50000]
+            
+            with preset_col1:
+                if st.button(f"₱1,000", use_container_width=True, key="preset_1000"):
+                    st.session_state.budget_calc_amount = 1000
+                    st.rerun()
+            with preset_col2:
+                if st.button(f"₱5,000", use_container_width=True, key="preset_5000"):
+                    st.session_state.budget_calc_amount = 5000
+                    st.rerun()
+            with preset_col3:
+                if st.button(f"₱10,000", use_container_width=True, key="preset_10000"):
+                    st.session_state.budget_calc_amount = 10000
+                    st.rerun()
+            with preset_col4:
+                if st.button(f"₱50,000", use_container_width=True, key="preset_50000"):
+                    st.session_state.budget_calc_amount = 50000
+                    st.rerun()
 
     st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
     left, right = st.columns([1.05, 1])
