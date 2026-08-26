@@ -4,14 +4,28 @@ import base64
 import ast
 import operator
 import smtplib
+import shutil
+import tempfile
+import hashlib
+import hmac
+import uuid
+import re
 from datetime import datetime
 from email.message import EmailMessage
 from zoneinfo import ZoneInfo
 import streamlit as st
 import json
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill
+from storage import BACKUP_DIR, DB_FILE, create_backup, load_state as load_sqlite_state
+from storage import restore_backup, save_state as save_sqlite_state
+from app_logic import FULL_DAY_RATES, TIER_TABLE, calculate_labor_pay, get_partial_rate
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(APP_DIR, "app_state.json")
+EXCEL_FILE = os.path.join(APP_DIR, "ailyn_project_ledger.xlsx")
+MATERIALS_EXCEL_FILE = os.path.join(APP_DIR, "materials_ledger.xlsx")
+LABOR_EXCEL_FILE = os.path.join(APP_DIR, "labor_ledger.xlsx")
 PHILIPPINES_TZ = ZoneInfo("Asia/Manila")
 
 
@@ -28,60 +42,145 @@ PERSISTENT_KEYS = [
     "budget",
     "budget_history",
     "remaining_money",
-    "view"
+    "view",
+    "receipt_archive",
+    "project"
 ]
 
 def load_state():
-    if os.path.exists(STATE_FILE):
+    return load_sqlite_state()
+
+
+def month_key(record):
+    recorded_at = record.get("recorded_at")
+    if recorded_at:
         try:
-            with open(STATE_FILE, "r") as f:
-                data = json.load(f)
-            return {k: v for k, v in data.items() if k in PERSISTENT_KEYS}
-        except (OSError, json.JSONDecodeError):
-            return {}
-    return {}
+            return datetime.fromisoformat(recorded_at).strftime("%Y-%m")
+        except ValueError:
+            pass
+    try:
+        return datetime.strptime(record.get("date", ""), "%b %d, %Y").strftime("%Y-%m")
+    except ValueError:
+        return manila_now().strftime("%Y-%m")
+
+
+def write_excel(state, archive_entry=None):
+    """Write the current app data to a durable workbook with monthly totals."""
+    workbook = Workbook()
+    transactions_sheet = workbook.active
+    transactions_sheet.title = "Transactions"
+    transaction_headers = ["Date", "Month", "Category", "Description", "Supplier", "Invoice", "Payment Method", "Sender", "Qty", "Unit Price", "Delivery", "Amount"]
+    transactions_sheet.append(transaction_headers)
+    for record in state.get("records", []):
+        transactions_sheet.append([
+            record.get("date", ""), month_key(record), record.get("type", "").title(),
+            record.get("name", ""), record.get("supplier", ""), record.get("invoice_number", ""),
+            record.get("payment_method", ""), record.get("sender", ""), record.get("qty", 1),
+            float(record.get("price", 0)), float(record.get("delivery", 0)), float(record.get("amount", 0)),
+        ])
+
+    payroll_sheet = workbook.create_sheet("Payroll")
+    payroll_sheet.append(["Date", "Month", "Type", "Worker ID", "Worker / Description", "Role", "Pay Period", "Days", "Gross Pay", "Cash Advance", "Net / Amount"])
+    for record in state.get("labor_records", []):
+        payroll_sheet.append([
+            record.get("date", ""), month_key(record), "Labor", record.get("worker_id", ""), record.get("name", ""),
+            record.get("role", ""), record.get("pay_period", ""), float(record.get("days", 0)), float(record.get("gross_pay", 0)),
+            float(record.get("ca", 0)), float(record.get("net", 0)),
+        ])
+    for record in state.get("payroll_expenses", []):
+        payroll_sheet.append([
+            record.get("date", ""), month_key(record), "Payroll Expense", record.get("item", ""),
+            "", "", "", "", float(record.get("price", 0)),
+        ])
+
+    summary = workbook.create_sheet("Monthly Summary")
+    summary.append(["Month", "Materials", "Construction Expenses", "Excess Money", "Labor", "Payroll Expenses", "Total Spent"])
+    months = {month_key(record) for record in state.get("records", [])}
+    months.update(month_key(record) for record in state.get("labor_records", []))
+    months.update(month_key(record) for record in state.get("payroll_expenses", []))
+    for month in sorted(months, reverse=True):
+        materials = sum(float(r.get("amount", 0)) for r in state.get("records", []) if month_key(r) == month and r.get("type") == "material")
+        construction = sum(float(r.get("amount", 0)) for r in state.get("records", []) if month_key(r) == month and r.get("type") == "expense")
+        excess = sum(float(r.get("amount", 0)) for r in state.get("records", []) if month_key(r) == month and r.get("type") == "excess")
+        labor = sum(float(r.get("net", 0)) for r in state.get("labor_records", []) if month_key(r) == month)
+        payroll = sum(float(r.get("price", 0)) for r in state.get("payroll_expenses", []) if month_key(r) == month)
+        summary.append([month, materials, construction, excess, labor, payroll, materials + construction + labor + payroll])
+
+    archive = workbook.create_sheet("Receipt Archive")
+    archive.append(["Receipt ID", "Saved At", "Report Type", "Title", "HTML File"])
+    for entry in state.get("receipt_archive", []):
+        archive.append([entry.get("id", ""), entry.get("saved_at", ""), entry.get("report_type", ""), entry.get("title", ""), entry.get("file", "")])
+    if archive_entry:
+            archive.append([archive_entry["id"], archive_entry["saved_at"], archive_entry["report_type"], archive_entry["title"], archive_entry["file"]])
+
+    for sheet in workbook.worksheets:
+        sheet.freeze_panes = "A2"
+        sheet.auto_filter.ref = sheet.dimensions
+        for cell in sheet[1]:
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill("solid", fgColor="1B5E20")
+        for column in sheet.columns:
+            width = min(max(len(str(cell.value or "")) for cell in column) + 2, 32)
+            sheet.column_dimensions[column[0].column_letter].width = width
+    workbook.save(EXCEL_FILE)
+
+
+def write_separate_excel_files(state):
+    """Write focused workbooks so materials and labor can be shared independently."""
+    materials_book = Workbook()
+    materials_sheet = materials_book.active
+    materials_sheet.title = "Materials"
+    materials_sheet.append(["Date", "Month", "Description", "Supplier", "Invoice", "Payment Method", "Sender", "Qty", "Unit Price", "Delivery", "Amount"])
+    for record in state.get("records", []):
+        if record.get("type") == "material":
+            materials_sheet.append([
+                record.get("date", ""), month_key(record), record.get("name", ""), record.get("supplier", ""),
+                record.get("invoice_number", ""), record.get("payment_method", ""), record.get("sender", ""),
+                record.get("qty", 1), float(record.get("price", 0)), float(record.get("delivery", 0)),
+                float(record.get("amount", 0)),
+            ])
+
+    labor_book = Workbook()
+    labor_sheet = labor_book.active
+    labor_sheet.title = "Labor"
+    labor_sheet.append(["Date", "Month", "Worker ID", "Worker", "Role", "Pay Period", "Days", "Gross Pay", "Cash Advance", "Net Pay"])
+    for record in state.get("labor_records", []):
+        labor_sheet.append([
+            record.get("date", ""), month_key(record), record.get("worker_id", ""), record.get("name", ""), record.get("role", ""), record.get("pay_period", ""),
+            float(record.get("days", 0)), float(record.get("gross_pay", 0)), float(record.get("ca", 0)),
+            float(record.get("net", 0)),
+        ])
+
+    for workbook, path in ((materials_book, MATERIALS_EXCEL_FILE), (labor_book, LABOR_EXCEL_FILE)):
+        summary = workbook.create_sheet("Monthly Summary")
+        summary.append(["Month", "Total"])
+        source_records = state.get("records", []) if path == MATERIALS_EXCEL_FILE else state.get("labor_records", [])
+        months = sorted({month_key(record) for record in source_records}, reverse=True)
+        for month in months:
+            total = sum(
+                float(record.get("amount", 0) if path == MATERIALS_EXCEL_FILE else record.get("net", 0))
+                for record in source_records if month_key(record) == month
+            )
+            summary.append([month, total])
+        for sheet in workbook.worksheets:
+            sheet.freeze_panes = "A2"
+            sheet.auto_filter.ref = sheet.dimensions
+            for cell in sheet[1]:
+                cell.font = Font(bold=True, color="FFFFFF")
+                cell.fill = PatternFill("solid", fgColor="1B5E20")
+            for column in sheet.columns:
+                width = min(max(len(str(cell.value or "")) for cell in column) + 2, 32)
+                sheet.column_dimensions[column[0].column_letter].width = width
+        workbook.save(path)
 
 
 def save_state(state):
-    data = {k: state[k] for k in PERSISTENT_KEYS if k in state}
-    with open(STATE_FILE, "w") as f:
-        json.dump(data, f, indent=2, default=str)
+    data = save_sqlite_state(state)
+    write_excel(state)
+    write_separate_excel_files(state)
 
-# --- TIER SCHEDULE & PAYROLL CALCULATOR CORE LOGIC ---
-TIER_TABLE = {
-    0.1: {"Labor": 0.00, "Skill": 0.00, "Forman": 0.00},
-    0.2: {"Labor": 62.50, "Skill": 81.25, "Forman": 100.00},
-    0.3: {"Labor": 125.00, "Skill": 162.50, "Forman": 200.00},
-    0.4: {"Labor": 187.50, "Skill": 243.75, "Forman": 300.00},
-    0.5: {"Labor": 250.00, "Skill": 325.00, "Forman": 400.00},
-    0.6: {"Labor": 312.50, "Skill": 406.25, "Forman": 500.00},
-    0.7: {"Labor": 375.00, "Skill": 487.50, "Forman": 600.00},
-    0.8: {"Labor": 437.50, "Skill": 568.75, "Forman": 700.00},
-    0.9: {"Labor": 500.00, "Skill": 650.00, "Forman": 800.00}
-}
-
-FULL_DAY_RATES = {
-    "Labor": 500.00,
-    "Skill": 650.00,
-    "Forman": 800.00
-}
-
-
-def get_partial_rate(decimal_part: float, role: str) -> float:
-    decimal_key = round(decimal_part, 1)
-    return TIER_TABLE.get(decimal_key, {}).get(role, 0.0)
-
-
-def calculate_labor_pay(worked_days: float, role: str):
-    full_days = int(worked_days)
-    decimal_part = round(worked_days - full_days, 1)
-    full_days_pay = full_days * FULL_DAY_RATES.get(role, 0.0)
-    partial_days_pay = get_partial_rate(decimal_part, role)
-    gross_pay = full_days_pay + partial_days_pay
-    return gross_pay, full_days_pay, partial_days_pay
-
-
-APP_VERSION = "AILYHOUSEPROJECT — Ailyn Project Management System"
+APP_VERSION = "AILYN HOUSE"
+APP_NAME = "AILYN HOUSE | Ailyn House Project"
 
 # ================================================================
 # Construction/Materials, Payroll, and Schedule are intentionally unified.
@@ -90,14 +189,28 @@ APP_VERSION = "AILYHOUSEPROJECT — Ailyn Project Management System"
 RECEIVER_EMAIL = "garryboypepito2004@gmail.com"
 RECEIVER_AILYN = "ailyn_peps0678@yahoo.com"
 AILYN_LOGO_DATA = "data:image/png;base64,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"
-SENDER_EMAIL = "garryboypepito71@gmail.com"
-SENDER_PASSWORD = "fhyv cimp gync wjmj"
+SENDER_EMAIL = os.getenv("AILYN_SENDER_EMAIL", "")
+SENDER_PASSWORD = os.getenv("AILYN_SENDER_PASSWORD", "")
+ADMIN_PASSWORD = os.getenv("AILYN_ADMIN_PASSWORD", "")
+UPDATE_SIGNING_KEY = os.getenv("AILYN_UPDATE_SIGNING_KEY", "")
+LOGIN_PASSWORD = os.getenv("AILYN_LOGIN_PASSWORD", "")
 
 st.set_page_config(
-    page_title="Ailyn Project Management System",
+    page_title=APP_NAME,
     page_icon="🅰️",
     layout="wide",
 )
+
+if LOGIN_PASSWORD and not st.session_state.get("authenticated"):
+    st.title("Ailyn House Project")
+    st.caption("Sign in to access this project workspace.")
+    login_password = st.text_input("Workspace password", type="password")
+    if st.button("SIGN IN", use_container_width=True):
+        if hmac.compare_digest(login_password, LOGIN_PASSWORD):
+            st.session_state.authenticated = True
+            st.rerun()
+        st.error("Invalid workspace password.")
+    st.stop()
 
 # Load persisted state safely
 state_data = load_state()
@@ -111,6 +224,13 @@ if "labor_records" not in st.session_state:
     st.session_state.labor_records = []
 if "payroll_expenses" not in st.session_state:
     st.session_state.payroll_expenses = []
+if "receipt_archive" not in st.session_state:
+    st.session_state.receipt_archive = []
+if "project" not in st.session_state:
+    st.session_state.project = {
+        "name": "Ailyn House Project", "client": "", "address": "", "manager": "",
+        "status": "Active", "target_date": "",
+    }
 if "planner_tasks" not in st.session_state:
     st.session_state.planner_tasks = []
 if "budget" not in st.session_state:
@@ -121,6 +241,13 @@ if "remaining_money" not in st.session_state:
     st.session_state.remaining_money = 0.0
 if "view" not in st.session_state:
     st.session_state.view = "home"
+if st.session_state.view not in {
+    "home", "payroll_dashboard", "planner_input", "planner_output", "material",
+    "expense", "excess", "ledger", "add_labor", "add_payroll_expense",
+    "payroll_remaining", "payroll_ledger", "export", "payroll_export",
+    "receipt_archive", "update",
+}:
+    st.session_state.view = "home"
 if "selected_role" not in st.session_state:
     st.session_state.selected_role = "Labor"
 if "editing_record_id" not in st.session_state:
@@ -129,12 +256,34 @@ if "editing_labor_index" not in st.session_state:
     st.session_state.editing_labor_index = None
 if "editing_payroll_expense_index" not in st.session_state:
     st.session_state.editing_payroll_expense_index = None
+if not os.path.exists(EXCEL_FILE):
+    write_excel(st.session_state)
+if not os.path.exists(MATERIALS_EXCEL_FILE) or not os.path.exists(LABOR_EXCEL_FILE):
+    write_separate_excel_files(st.session_state)
 
 
 def set_view(v):
     st.session_state.view = v
     persist_state()
     st.rerun()
+
+
+def project_settings_dialog():
+    project = st.session_state.project
+    with st.form("project_settings_form"):
+        name = st.text_input("Project name", value=project.get("name", "Ailyn House Project"))
+        client = st.text_input("Client name", value=project.get("client", ""))
+        address = st.text_input("Site address", value=project.get("address", ""))
+        manager = st.text_input("Project manager", value=project.get("manager", ""))
+        status = st.selectbox("Project status", ["Planning", "Active", "On Hold", "Completed"], index=["Planning", "Active", "On Hold", "Completed"].index(project.get("status", "Active")))
+        target_date = st.date_input("Target completion", value=datetime.fromisoformat(project["target_date"]).date() if project.get("target_date") else manila_now().date())
+        if st.form_submit_button("SAVE PROJECT DETAILS", use_container_width=True):
+            if not name.strip():
+                st.error("Project name is required.")
+            else:
+                st.session_state.project = {"name": name.strip(), "client": client.strip(), "address": address.strip(), "manager": manager.strip(), "status": status, "target_date": target_date.isoformat()}
+                persist_state()
+                st.success("Project details saved.")
 
 
 def total_materials():
@@ -157,6 +306,25 @@ def get_balance():
     return float(st.session_state.budget) - total_excess() - get_total()
 
 
+def monthly_spend(month=None):
+    month = month or manila_now().strftime("%Y-%m")
+    construction = sum(
+        float(record.get("amount", 0)) for record in st.session_state.records
+        if record.get("type") in {"material", "expense"} and month_key(record) == month
+    )
+    labor = sum(float(record.get("net", 0)) for record in st.session_state.labor_records if month_key(record) == month)
+    payroll_expenses = sum(float(record.get("price", 0)) for record in st.session_state.payroll_expenses if month_key(record) == month)
+    return construction + labor + payroll_expenses
+
+
+def monthly_construction_spend(month=None):
+    month = month or manila_now().strftime("%Y-%m")
+    return sum(
+        float(record.get("amount", 0)) for record in st.session_state.records
+        if record.get("type") in {"material", "expense"} and month_key(record) == month
+    )
+
+
 # ================================================================
 # COMBINED MAIN RECEIPTS — FINANCIAL REPORT + PAYROLL REPORT
 # Copied from the MAIN receipt implementation.
@@ -164,9 +332,19 @@ def get_balance():
 def save_report_html(report_type, html_content, title="Receipt"):
     folder = os.path.join(APP_DIR, "archive", report_type)
     os.makedirs(folder, exist_ok=True)
-    filename = os.path.join(folder, f"{title}_{int(time.time())}.html")
+    safe_title = re.sub(r"[^A-Za-z0-9._-]+", "_", title).strip("._") or "receipt"
+    filename = os.path.join(folder, f"{safe_title}_{int(time.time())}.html")
     with open(filename, "w", encoding="utf-8") as f:
         f.write(html_content)
+    archive_entry = {
+        "id": str(uuid.uuid4()),
+        "saved_at": manila_now().isoformat(),
+        "report_type": report_type,
+        "title": title,
+        "file": os.path.relpath(filename, APP_DIR),
+    }
+    st.session_state.receipt_archive.append(archive_entry)
+    persist_state()
     return filename
 
 
@@ -181,12 +359,21 @@ def list_saved_reports(report_type):
 def delete_report_file(path):
     if os.path.exists(path):
         os.remove(path)
+    relative_path = os.path.relpath(path, APP_DIR)
+    if "receipt_archive" in st.session_state:
+        st.session_state.receipt_archive = [
+            entry for entry in st.session_state.receipt_archive
+            if entry.get("file") != relative_path
+        ]
+        persist_state()
 
 
 def clear_saved_reports():
     for report_type in ("construction", "payroll"):
         for report_path in list_saved_reports(report_type):
             delete_report_file(report_path)
+    st.session_state.receipt_archive = []
+    persist_state()
 
 
 def receipt_preview_height(item_count, row_height=58, base_height=560):
@@ -400,7 +587,7 @@ body {{ font-family: 'Inter', sans-serif !important; background-color: #f0f4f0 !
 <table style="width: 100%; border-collapse: collapse; margin-bottom: 30px;">
 <tr>
 <td>
-<h1 style="color: #1b5e20; margin: 0; text-transform: uppercase;">Ailyn Construction</h1>
+<h1 style="color: #1b5e20; margin: 0; text-transform: uppercase;">Ailyn House Project</h1>
 <p style="color: #555; margin: 5px 0 0 0;">Official Labor & Payroll Inventory</p>
 <p style="color: #777; font-size: 14px; margin: 0;">Management System v3.6 Enterprise</p>
 </td>
@@ -511,6 +698,11 @@ def clear_all():
     st.session_state.budget = 0.0
     st.session_state.budget_history = []
     st.session_state.remaining_money = 0.0
+    st.session_state.receipt_archive = []
+    for report_type in ("construction", "payroll"):
+        for report_path in list_saved_reports(report_type):
+            if os.path.exists(report_path):
+                os.remove(report_path)
     st.session_state.view = "home"
     st.session_state.selected_role = "Labor"
     save_state(st.session_state)
@@ -518,6 +710,41 @@ def clear_all():
 
 def persist_state():
     save_state(st.session_state)
+
+
+def install_update(uploaded_file, signature):
+    """Validate and atomically install an uploaded app upgrade after a backup."""
+    source = uploaded_file.getvalue()
+    if not source:
+        raise ValueError("The uploaded upgrade file is empty.")
+    try:
+        ast.parse(source.decode("utf-8"), filename=uploaded_file.name)
+    except (UnicodeDecodeError, SyntaxError) as error:
+        raise ValueError(f"The upgrade was rejected: {error}") from None
+    if not UPDATE_SIGNING_KEY:
+        raise ValueError("Updates are disabled until AILYN_UPDATE_SIGNING_KEY is configured.")
+    expected_signature = hmac.new(
+        UPDATE_SIGNING_KEY.encode("utf-8"), source, hashlib.sha256
+    ).hexdigest()
+    if not hmac.compare_digest(expected_signature, signature.strip()):
+        raise ValueError("The upgrade signature is invalid.")
+
+    backup_dir = os.path.join(APP_DIR, "backups")
+    os.makedirs(backup_dir, exist_ok=True)
+    backup_path = os.path.join(backup_dir, f"NELL.py.py.{int(time.time())}.bak")
+    temporary_path = None
+    try:
+        shutil.copy2(__file__, backup_path)
+        with tempfile.NamedTemporaryFile("wb", delete=False, dir=APP_DIR,
+                                         prefix=".nell-upgrade-") as temporary:
+            temporary.write(source)
+            temporary_path = temporary.name
+        os.replace(temporary_path, __file__)
+    except OSError as error:
+        if temporary_path and os.path.exists(temporary_path):
+            os.remove(temporary_path)
+        raise ValueError(f"The upgrade could not be installed: {error}") from None
+    return backup_path
 
 
 def record_budget_change(action, amount, previous_budget):
@@ -635,7 +862,79 @@ def budget_dialog():
             st.info("No budget changes yet.")
 
 
-def add_tx(name, price, qty, delivery, ttype, sender):
+@st.dialog("Add Labor Account", width="small")
+def payroll_labor_dialog():
+    role = st.selectbox("Role", list(FULL_DAY_RATES), key="popup_labor_role")
+    worker = st.text_input("Worker name", key="popup_labor_worker")
+    days = st.number_input("Worked days", min_value=0.1, value=1.0, step=0.1, key="popup_labor_days")
+    cash_advance = st.number_input("Cash advance", min_value=0.0, value=0.0, step=50.0, key="popup_labor_ca")
+    if st.button("SAVE LABOR ACCOUNT", use_container_width=True, key="popup_save_labor"):
+        if not worker.strip():
+            st.warning("Enter a worker name.")
+            return
+        gross_pay, full_pay, partial_pay = calculate_labor_pay(float(days), role)
+        st.session_state.labor_records.append({
+            "id": str(uuid.uuid4()),
+            "date": manila_now().strftime("%b %d, %Y"),
+            "recorded_at": manila_now().isoformat(),
+            "name": worker.strip().upper(),
+            "role": role,
+            "days": float(days),
+            "rate": FULL_DAY_RATES[role],
+            "gross_pay": gross_pay,
+            "full_pay": full_pay,
+            "partial_pay": partial_pay,
+            "ca": float(cash_advance),
+            "net": gross_pay - float(cash_advance),
+        })
+        persist_state()
+        st.success(f"{worker.strip().upper()} saved. Net pay: PHP {gross_pay - float(cash_advance):,.2f}")
+
+
+@st.dialog("Payroll Ledger", width="medium")
+def payroll_ledger_dialog():
+    if not st.session_state.labor_records and not st.session_state.payroll_expenses:
+        st.info("No payroll records yet.")
+        return
+    rows = [
+        {
+            "Date": record.get("date", ""),
+            "Worker": record.get("name", ""),
+            "Role": record.get("role", ""),
+            "Days": f"{float(record.get('days', 0)):.1f}",
+            "Net Pay": f"PHP {float(record.get('net', 0)):,.2f}",
+        }
+        for record in reversed(st.session_state.labor_records)
+    ]
+    rows.extend({
+        "Date": record.get("date", ""),
+        "Worker": record.get("item", ""),
+        "Role": "Payroll Expense",
+        "Days": "-",
+        "Net Pay": f"PHP {float(record.get('price', 0)):,.2f}",
+    } for record in reversed(st.session_state.payroll_expenses))
+    st.dataframe(rows, use_container_width=True, hide_index=True)
+    if st.button("OPEN FULL PAYROLL LEDGER", use_container_width=True, key="popup_open_payroll_ledger"):
+        set_view("payroll_ledger")
+
+
+@st.dialog("Payroll Report Summary", width="small")
+def payroll_report_dialog():
+    labor_total = sum(float(record.get("net", 0)) for record in st.session_state.labor_records)
+    expense_total = sum(float(record.get("price", 0)) for record in st.session_state.payroll_expenses)
+    remainder = float(st.session_state.remaining_money or 0)
+    st.dataframe([
+        {"Item": "Workers", "Value": len(st.session_state.labor_records)},
+        {"Item": "Net labor", "Value": f"PHP {labor_total:,.2f}"},
+        {"Item": "Payroll expenses", "Value": f"PHP {expense_total:,.2f}"},
+        {"Item": "Remainder", "Value": f"PHP {remainder:,.2f}"},
+        {"Item": "Final payout", "Value": f"PHP {labor_total + expense_total - remainder:,.2f}"},
+    ], use_container_width=True, hide_index=True)
+    if st.button("OPEN FULL PAYROLL REPORT", use_container_width=True, key="popup_open_payroll_report"):
+        set_view("payroll_export")
+
+
+def add_tx(name, price, qty, delivery, ttype, sender, record_date=None, details=None):
     p = float(price or 0.0)
     q = int(qty or 0)
     d = float(delivery or 0.0)
@@ -645,13 +944,15 @@ def add_tx(name, price, qty, delivery, ttype, sender):
     st.session_state.records.append({
         "id": str(time.time()),
         "date": manila_now().strftime("%b %d, %Y"),
+        "recorded_at": datetime.combine(record_date or manila_now().date(), datetime.min.time(), PHILIPPINES_TZ).isoformat(),
         "name": name.upper(),
         "price": p,
         "qty": q,
         "delivery": d,
         "amount": float(amount),
         "type": ttype,
-        "sender": sender
+        "sender": sender,
+        **(details or {}),
     })
     persist_state()
     return True
@@ -1070,7 +1371,7 @@ with st.sidebar:
       <div class="brand-row">
         <img class="brand-logo" src="{AILYN_LOGO_DATA}" alt="Ailyn Construction Logo">
         <div class="brand-copy">
-          <div class="brand-title"><span>AILYN</span><span>CONSTRUCTION</span></div>
+        <div class="brand-title"><span>AILYN HOUSE</span><span>PROJECT</span></div>
           <div class="brand-sub">Official Project Control</div>
         </div>
       </div>
@@ -1095,6 +1396,12 @@ with st.sidebar:
         clear_all()
         set_view("home")
 
+    with st.expander("Project Details", expanded=False):
+        project = st.session_state.project
+        st.caption(f"{project.get('status', 'Active')} project")
+        if st.button("EDIT PROJECT DETAILS", use_container_width=True, key="side_project_details"):
+            project_settings_dialog()
+
     st.subheader("Project Control")
     if st.button("📝   New Work Entry   ›", use_container_width=True, key="side_new_work"):
         set_view("planner_input")
@@ -1114,6 +1421,8 @@ with st.sidebar:
         set_view("export")
 
     st.subheader("Payroll Operations")
+    if st.button("📊   Payroll Dashboard   ›", use_container_width=True, key="side_payroll_dashboard"):
+        set_view("payroll_dashboard")
     if st.button("👷   Labor Account   ›", use_container_width=True, key="side_labor"):
         set_view("add_labor")
     if st.button("💳   Payroll Expense   ›", use_container_width=True, key="side_payroll_expense"):
@@ -1127,21 +1436,23 @@ with st.sidebar:
     if st.button("🗃️   Receipts Archive   ›", use_container_width=True, key="side_archive"):
         set_view("receipt_archive")
 
+    st.subheader("Administrator")
+    if st.button("🔐   Admin Console   ›", use_container_width=True, key="side_admin"):
+        set_view("update")
+
 view = st.session_state.view
 
 if view == "home":
     budget = float(st.session_state.budget or 0)
     used = float(get_total() or 0)
     balance = float(get_balance() or 0)
-    workers = len(st.session_state.labor_records)
     material = float(total_materials() or 0)
-    labor = float(sum(r.get("net", 0) for r in st.session_state.labor_records))
     expenses = float(total_expenses() or 0)
     excess = float(total_excess() or 0)
-    chart_total = max(material + labor + expenses + excess, 1.0)
+    chart_total = max(material + expenses + excess, 1.0)
     p1 = material / chart_total * 360
-    p2 = p1 + labor / chart_total * 360
-    p3 = p2 + expenses / chart_total * 360
+    p2 = p1 + expenses / chart_total * 360
+    p3 = p2 + excess / chart_total * 360
     today_key = manila_now().strftime("%Y-%m-%d")
     today_tasks = [t for t in st.session_state.planner_tasks if t.get("date_obj") == today_key]
     upcoming_tasks = [t for t in st.session_state.planner_tasks if t.get("date_obj", "") >= today_key]
@@ -1150,12 +1461,27 @@ if view == "home":
     <div class="dashboard-heading">
     <img src="{AILYN_LOGO_DATA}" alt="Ailyn Construction Logo">
       <div>
-        <div class="dashboard-heading-title">AILYN CONSTRUCTION</div>
+        <div class="dashboard-heading-title">AILYN HOUSE PROJECT</div>
         <div class="dashboard-heading-sub">PROJECT MANAGEMENT SYSTEM</div>
       </div>
     </div>
-    <div class="dashboard-welcome">🛡️ &nbsp; Welcome back, <b>Ailyn Project!</b> &nbsp;|&nbsp; Manage your construction project efficiently.</div>
+    <div class="dashboard-welcome">🛡️ &nbsp; Welcome back, <b>{st.session_state.project.get("name", "Ailyn House Project")}</b> &nbsp;|&nbsp; Manage your construction project efficiently.</div>
     """, unsafe_allow_html=True)
+    project = st.session_state.project
+    if project.get("client") or project.get("address") or project.get("target_date"):
+        st.caption(
+            f"Client: {project.get('client') or 'Not set'}  |  Site: {project.get('address') or 'Not set'}  |  "
+            f"Target: {project.get('target_date') or 'Not set'}  |  Status: {project.get('status', 'Active')}"
+        )
+    overdue_tasks = [
+        task for task in st.session_state.planner_tasks
+        if task.get("date_obj", "") < manila_now().strftime("%Y-%m-%d")
+        and task.get("status") != "Completed"
+    ]
+    if balance < 0:
+        st.error(f"Budget warning: project is over budget by PHP {abs(balance):,.2f}.")
+    if overdue_tasks:
+        st.warning(f"{len(overdue_tasks)} scheduled task(s) are overdue.")
 
     m1, m2, m3, m4 = st.columns(4)
     with m1:
@@ -1165,7 +1491,10 @@ if view == "home":
     with m3:
         st.metric("REMAINING BALANCE", f"₱{balance:,.2f}")
     with m4:
-        st.metric("TOTAL WORKERS", workers)
+        st.metric(
+            f"PROJECT SPENT THIS MONTH ({manila_now().strftime('%b %Y').upper()})",
+            f"₱{monthly_construction_spend():,.2f}",
+        )
 
     st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
     left, right = st.columns([1.05, 1])
@@ -1177,13 +1506,12 @@ if view == "home":
             <div class="donut" style="--p1:{p1}deg;--p2:{p2}deg;--p3:{p3}deg"><div class="donut-center">₱{used:,.0f}<small>Total Expenses</small></div></div>
             <div class="legend">
               <div class="legend-row"><span><i class="dot" style="background:#075c28"></i>Materials</span><b>₱{material:,.2f}</b></div>
-              <div class="legend-row"><span><i class="dot" style="background:#8fc77d"></i>Labor</span><b>₱{labor:,.2f}</b></div>
               <div class="legend-row"><span><i class="dot" style="background:#e0aa25"></i>Expenses</span><b>₱{expenses:,.2f}</b></div>
               <div class="legend-row"><span><i class="dot" style="background:#e85d4a"></i>Excess</span><b>₱{excess:,.2f}</b></div>
             </div>
-          </div>
-        </div>
-        """, unsafe_allow_html=True)
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
     with right:
         tx = list(reversed(st.session_state.records))[:5]
         tx_html = ""
@@ -1211,6 +1539,69 @@ if view == "home":
     """, unsafe_allow_html=True)
     if st.button("OPEN CONSTRUCTION PLANNER", use_container_width=True):
         set_view("planner_output")
+
+elif view == "payroll_dashboard":
+    payroll_labor = sum(float(record.get("net", 0)) for record in st.session_state.labor_records)
+    payroll_expenses = sum(float(record.get("price", 0)) for record in st.session_state.payroll_expenses)
+    payroll_total = payroll_labor + payroll_expenses
+    payroll_remaining = float(st.session_state.remaining_money or 0)
+    payroll_output = payroll_total - payroll_remaining
+
+    st.markdown(f"""
+        <div class="dashboard-heading">
+            <img src="{AILYN_LOGO_DATA}" alt="Ailyn Construction Logo">
+            <div>
+                <div class="dashboard-heading-title">PAYROLL DASHBOARD</div>
+                <div class="dashboard-heading-sub">AILYN HOUSE PROJECT | AILYN HOUSE</div>
+            </div>
+        </div>
+        <div class="dashboard-welcome">Payroll control center for labor accounts, payroll expenses, and final payouts.</div>
+    """, unsafe_allow_html=True)
+    st.caption("A focused view of labor, payroll expenses, and the current payout.")
+    p1, p2, p3, p4 = st.columns(4)
+    with p1:
+        st.metric("Workers", len(st.session_state.labor_records))
+    with p2:
+        st.metric("Net labor", f"PHP {payroll_labor:,.2f}")
+    with p3:
+        st.metric("Payroll expenses", f"PHP {payroll_expenses:,.2f}")
+    with p4:
+        st.metric("Final payout", f"PHP {payroll_output:,.2f}")
+
+    st.divider()
+    left, right = st.columns(2)
+    with left:
+        st.subheader("Role summary")
+        role_rows = []
+        for role in FULL_DAY_RATES:
+            role_records = [r for r in st.session_state.labor_records if r.get("role") == role]
+            role_rows.append({
+                "Role": role,
+                "Workers": len(role_records),
+                "Days": sum(float(r.get("days", 0)) for r in role_records),
+                "Net pay": f"PHP {sum(float(r.get('net', 0)) for r in role_records):,.2f}",
+            })
+        st.dataframe(role_rows, use_container_width=True, hide_index=True)
+    with right:
+        st.subheader("Payroll controls")
+        st.write(f"Current remainder: **PHP {payroll_remaining:,.2f}**")
+        if st.button("ADD LABOR ACCOUNT", use_container_width=True):
+            payroll_labor_dialog()
+        if st.button("OPEN PAYROLL LEDGER", use_container_width=True):
+            payroll_ledger_dialog()
+        if st.button("CREATE PAYROLL REPORT", use_container_width=True):
+            payroll_report_dialog()
+
+    st.subheader("Latest labor accounts")
+    if st.session_state.labor_records:
+        st.dataframe([
+            {"Worker": r.get("name", ""), "Role": r.get("role", "Labor"),
+             "Days": f"{float(r.get('days', 0)):.1f}",
+             "Net pay": f"PHP {float(r.get('net', 0)):,.2f}"}
+            for r in reversed(st.session_state.labor_records[-8:])
+        ], use_container_width=True, hide_index=True)
+    else:
+        st.info("No labor accounts yet. Add the first worker from Payroll Operations.")
 
 elif view == "planner_input":
     st.subheader("📅 PLANNER INPUT - ADD NEW WORK TASK")
@@ -1388,6 +1779,7 @@ elif view == "excess":
                 st.session_state.records.append({
                     "id": str(time.time()),
                     "date": manila_now().strftime("%b %d, %Y"),
+                    "recorded_at": manila_now().isoformat(),
                     "name": name.upper(),
                     "price": float(amount),
                     "qty": 1,
@@ -1407,10 +1799,17 @@ elif view == "excess":
 
 elif view == "ledger":
     st.subheader("📖 CONSTRUCTION LEDGER")
+    ledger_query = st.text_input("Search construction entries", key="construction_ledger_search").strip().lower()
+    visible_records = [
+        record for record in st.session_state.records
+        if not ledger_query or ledger_query in str(record).lower()
+    ]
     if not st.session_state.records:
         st.info("No transaction records found in ledger.")
+    elif not visible_records:
+        st.info("No construction entries match your search.")
     else:
-        for r in list(st.session_state.records):
+        for r in visible_records:
             if st.session_state.editing_record_id == r["id"]:
                 with st.form(key=f"edit_record_form_{r['id']}"):
                     edited_name = st.text_input("Name", value=r.get("name", ""))
@@ -1511,6 +1910,9 @@ elif view == "add_labor":
                 net = gross_pay - c
                 rate = FULL_DAY_RATES.get(active_role, 0.0)
                 st.session_state.labor_records.append({
+                    "id": str(uuid.uuid4()),
+                    "date": manila_now().strftime("%b %d, %Y"),
+                    "recorded_at": manila_now().isoformat(),
                     "name": name.upper(),
                     "role": active_role,
                     "days": d,
@@ -1534,6 +1936,9 @@ elif view == "add_payroll_expense":
         if submitted:
             if amt and amt > 0:
                 st.session_state.payroll_expenses.append({
+                    "id": str(uuid.uuid4()),
+                    "date": manila_now().strftime("%b %d, %Y"),
+                    "recorded_at": manila_now().isoformat(),
                     "item": desc.upper(),
                     "price": float(amt)
                 })
@@ -1558,11 +1963,16 @@ elif view == "payroll_remaining":
 
 elif view == "payroll_ledger":
     st.subheader("📋 LABOR & PAYROLL LEDGER")
+    payroll_query = st.text_input("Search payroll entries", key="payroll_ledger_search").strip().lower()
+    visible_labor = [record for record in st.session_state.labor_records if not payroll_query or payroll_query in str(record).lower()]
+    visible_payroll_expenses = [record for record in st.session_state.payroll_expenses if not payroll_query or payroll_query in str(record).lower()]
     st.markdown("### Labor Records")
     if not st.session_state.labor_records:
         st.info("No labor records.")
     else:
-        for i, r in enumerate(list(st.session_state.labor_records)):
+        for i, r in enumerate(st.session_state.labor_records):
+            if r not in visible_labor:
+                continue
             if st.session_state.editing_labor_index == i:
                 with st.form(key=f"edit_labor_form_{i}"):
                     edited_worker = st.text_input("Worker Name", value=r.get("name", ""))
@@ -1630,7 +2040,9 @@ elif view == "payroll_ledger":
     if not st.session_state.payroll_expenses:
         st.info("No payroll expenses.")
     else:
-        for i, e in enumerate(list(st.session_state.payroll_expenses)):
+        for i, e in enumerate(st.session_state.payroll_expenses):
+            if e not in visible_payroll_expenses:
+                continue
             if st.session_state.editing_payroll_expense_index == i:
                 with st.form(key=f"edit_payroll_expense_form_{i}"):
                     edited_description = st.text_input("Expense Description", value=e.get("item", ""))
@@ -1725,6 +2137,8 @@ elif view == "payroll_export":
         set_view("receipt_archive")
     if st.button("📧 EMAIL PAYROLL REPORT", use_container_width=True):
         try:
+            if not SENDER_EMAIL or not SENDER_PASSWORD:
+                raise ValueError("Email is disabled. Configure AILYN_SENDER_EMAIL and AILYN_SENDER_PASSWORD.")
             msg = EmailMessage()
             msg['Subject'] = f"Construction Report: PHP {total:,.2f} - {manila_now().strftime('%Y-%m-%d')}"
             msg['From'] = SENDER_EMAIL
@@ -1738,8 +2152,77 @@ elif view == "payroll_export":
             st.error(f"❌ EMAIL FAILED: {e}")
 
 elif view == "receipt_archive":
-    st.subheader("📂 RECEIPT ARCHIVE")
-    st.caption("Browse newly saved construction and payroll receipts.")
+    st.subheader("📂 RECEIPT ARCHIVE | AILYN HOUSE")
+    st.caption("Every saved receipt is preserved here and summarized in the complete Excel ledger.")
+    st.metric(
+        f"TOTAL SPENT THIS MONTH ({manila_now().strftime('%b %Y').upper()})",
+        f"PHP {monthly_spend():,.2f}",
+    )
+    backup_col, restore_col = st.columns(2)
+    with backup_col:
+        if st.button("CREATE DATABASE BACKUP", use_container_width=True):
+            backup_path = create_backup()
+            with open(backup_path, "rb") as backup_file:
+                st.download_button(
+                    "DOWNLOAD BACKUP",
+                    data=backup_file.read(),
+                    file_name=os.path.basename(backup_path),
+                    mime="application/octet-stream",
+                    use_container_width=True,
+                )
+    with restore_col:
+        restore_admin_password = st.text_input("Admin password for restore", type="password", key="restore_admin_password")
+        restore_file = st.file_uploader("Restore SQLite backup", type=["db"], key="restore_backup_file")
+        if restore_file and st.button("RESTORE BACKUP", use_container_width=True):
+            if not ADMIN_PASSWORD or not hmac.compare_digest(restore_admin_password, ADMIN_PASSWORD):
+                st.error("Administrator authentication failed.")
+                st.stop()
+            temporary_restore = os.path.join(APP_DIR, ".uploaded-restore.db")
+            with open(temporary_restore, "wb") as restore_target:
+                restore_target.write(restore_file.getvalue())
+            try:
+                restored_state = restore_backup(temporary_restore)
+                for key, value in restored_state.items():
+                    st.session_state[key] = value
+                write_excel(st.session_state)
+                write_separate_excel_files(st.session_state)
+                st.success("Backup restored successfully.")
+                st.rerun()
+            except ValueError as error:
+                st.error(str(error))
+            finally:
+                if os.path.exists(temporary_restore):
+                    os.remove(temporary_restore)
+    if os.path.exists(EXCEL_FILE):
+        with open(EXCEL_FILE, "rb") as excel_file:
+            st.download_button(
+                "📊 DOWNLOAD ALL DATA AS ONE EXCEL FILE",
+                data=excel_file.read(),
+                file_name="ailyn_project_ledger.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+    download_materials, download_labor = st.columns(2)
+    with download_materials:
+        if os.path.exists(MATERIALS_EXCEL_FILE):
+            with open(MATERIALS_EXCEL_FILE, "rb") as materials_file:
+                st.download_button(
+                    "📦 DOWNLOAD MATERIALS EXCEL",
+                    data=materials_file.read(),
+                    file_name="materials_ledger.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+    with download_labor:
+        if os.path.exists(LABOR_EXCEL_FILE):
+            with open(LABOR_EXCEL_FILE, "rb") as labor_file:
+                st.download_button(
+                    "👷 DOWNLOAD LABOR EXCEL",
+                    data=labor_file.read(),
+                    file_name="labor_ledger.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
     if st.button("🗑️ CLEAR RECEIPT HISTORY", use_container_width=True, key="clear_receipt_history"):
         clear_saved_reports()
         st.success("Previous receipt history cleared.")
@@ -1782,6 +2265,32 @@ elif view == "receipt_archive":
                     delete_report_file(report_path)
                     st.success(f"Deleted: {report_path.name}")
                     st.rerun()
+
+elif view == "update":
+    st.markdown("## Upgrade Center")
+    st.caption("Administrator-only signed release installation. The current app is backed up first.")
+    admin_password = st.text_input("Administrator password", type="password", key="admin_update_password")
+    uploaded_upgrade = st.file_uploader("Choose signed Python upgrade", type=["py"], key="upgrade_file")
+    signature = st.text_input("Release SHA-256 HMAC signature", key="upgrade_signature")
+    confirm_upgrade = st.checkbox("I have reviewed this signed release and want to install it.")
+    if st.button("INSTALL SIGNED UPGRADE", use_container_width=True,
+                 disabled=not (admin_password and uploaded_upgrade and signature and confirm_upgrade)):
+        try:
+            if not ADMIN_PASSWORD or not hmac.compare_digest(admin_password, ADMIN_PASSWORD):
+                raise ValueError("Administrator authentication failed.")
+            backup_path = install_update(uploaded_upgrade, signature)
+            st.success(f"Upgrade installed. Backup created at {os.path.basename(backup_path)}.")
+            st.warning("Restart the Streamlit app to load the new version.")
+        except ValueError as error:
+            st.error(str(error))
+    st.divider()
+    st.subheader("Backups")
+    backup_dir = os.path.join(APP_DIR, "backups")
+    backup_names = sorted(os.listdir(backup_dir), reverse=True) if os.path.isdir(backup_dir) else []
+    if backup_names:
+        st.dataframe([{"Backup": name} for name in backup_names[:10]], use_container_width=True, hide_index=True)
+    else:
+        st.caption("No upgrades have been installed yet.")
 
 else:
     st.info("Welcome to Ailyn Project Management System. Use the command sidebar to navigate.")

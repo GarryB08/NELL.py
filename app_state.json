@@ -3,23 +3,22 @@
   "labor_records": [],
   "payroll_expenses": [],
   "planner_tasks": [],
-  "budget": 200.0,
-  "budget_history": [
+  "budget": 0.0,
+  "budget_history": [],
+  "remaining_money": 0.0,
+  "view": "payroll_dashboard",
+  "receipt_archive": [
     {
-      "date": "Aug 24, 2026 10:02 PM",
-      "action": "Applied",
-      "amount": 2000.0,
-      "previous": 0.0,
-      "total": 2000.0
+      "saved_at": "2026-08-26T21:23:29.959714+08:00",
+      "report_type": "construction",
+      "title": "OFFICIAL RECEIPT",
+      "file": "archive/construction/OFFICIAL RECEIPT_1787750609.html"
     },
     {
-      "date": "Aug 24, 2026 10:02 PM",
-      "action": "Edited",
-      "amount": -1800.0,
-      "previous": 2000.0,
-      "total": 200.0
+      "saved_at": "2026-08-26T21:24:20.074960+08:00",
+      "report_type": "construction",
+      "title": "OFFICIAL RECEIPT",
+      "file": "archive/construction/OFFICIAL RECEIPT_1787750660.html"
     }
-  ],
-  "remaining_money": 0.0,
-  "view": "add_payroll_expense"
+  ]
 }
