@@ -2,6 +2,7 @@ import os
 import time
 import base64
 import ast
+from io import BytesIO
 import operator
 import smtplib
 import shutil
@@ -17,6 +18,8 @@ import streamlit as st
 import json
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
+from PIL import Image
+import pytesseract
 from storage import BACKUP_DIR, DB_FILE, create_backup, load_state as load_sqlite_state
 from storage import restore_backup, save_state as save_sqlite_state
 from app_logic import FULL_DAY_RATES, TIER_TABLE, calculate_labor_pay, get_partial_rate
@@ -31,6 +34,29 @@ PHILIPPINES_TZ = ZoneInfo("Asia/Manila")
 
 def manila_now():
     return datetime.now(PHILIPPINES_TZ)
+
+
+def scan_photo_text(photo):
+    """Read text from a camera photo using the local OCR engine."""
+    image = Image.open(BytesIO(photo.getvalue()))
+    return pytesseract.image_to_string(image).strip()
+
+
+def parse_scanned_receipt(text):
+    """Extract conservative material-entry suggestions from OCR text."""
+    amount_pattern = r"(?:PHP|₱)\s*([0-9][0-9,]*(?:\.\d{1,2})?)"
+    currency_amounts = [float(value.replace(",", "")) for value in re.findall(amount_pattern, text, re.IGNORECASE)]
+    all_amounts = [float(value.replace(",", "")) for value in re.findall(r"\b[0-9][0-9,]*\.\d{2}\b", text)]
+    amounts = currency_amounts or all_amounts
+    quantity_match = re.search(r"\b(?:qty|quantity)\s*[:x-]?\s*(\d+)\b|\b(\d+)\s*(?:pcs?|pieces?|units?|x)\b", text, re.IGNORECASE)
+    quantity = int(next(value for value in quantity_match.groups() if value)) if quantity_match else 1
+    delivery_match = re.search(r"delivery\D+([0-9][0-9,]*(?:\.\d{1,2})?)", text, re.IGNORECASE)
+    delivery = float(delivery_match.group(1).replace(",", "")) if delivery_match else 0.0
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    name = next((line for line in lines if not re.search(r"(?:php|₱|total|qty|quantity|delivery|receipt|invoice|date)", line, re.IGNORECASE)), "")
+    total = amounts[-1] if amounts else 0.0
+    price = total / quantity if quantity > 0 else total
+    return {"name": name[:120], "price": price, "qty": quantity, "delivery": delivery}
 
 
 # --- PERSISTENCE HELPERS
@@ -588,7 +614,7 @@ body {{ font-family: 'Inter', sans-serif !important; background-color: #f0f4f0 !
 <tr>
 <td>
 <h1 style="color: #1b5e20; margin: 0; text-transform: uppercase;">Ailyn House Project</h1>
-<p style="color: #555; margin: 5px 0 0 0;">Official Labor & Payroll Inventory</p>
+<p style="color: #555; margin: 5px 0 0 0;">Official Labor Tally</p>
 <p style="color: #777; font-size: 14px; margin: 0;">Management System v3.6 Enterprise</p>
 </td>
 <td style="text-align: right;">
@@ -866,20 +892,21 @@ def budget_dialog():
 def payroll_labor_dialog():
     role = st.selectbox("Role", list(FULL_DAY_RATES), key="popup_labor_role")
     worker = st.text_input("Worker name", key="popup_labor_worker")
-    days = st.number_input("Worked days", min_value=0.1, value=1.0, step=0.1, key="popup_labor_days")
+    days = st.number_input("Worked days", min_value=0.0, value=None, placeholder="Enter days", key="popup_labor_days")
     cash_advance = st.number_input("Cash advance", min_value=0.0, value=0.0, step=50.0, key="popup_labor_ca")
     if st.button("SAVE LABOR ACCOUNT", use_container_width=True, key="popup_save_labor"):
-        if not worker.strip():
-            st.warning("Enter a worker name.")
+        worked_days = float(days or 0.0)
+        if not worker.strip() or worked_days <= 0:
+            st.warning("Enter a worker name and valid worked days.")
             return
-        gross_pay, full_pay, partial_pay = calculate_labor_pay(float(days), role)
+        gross_pay, full_pay, partial_pay = calculate_labor_pay(worked_days, role)
         st.session_state.labor_records.append({
             "id": str(uuid.uuid4()),
             "date": manila_now().strftime("%b %d, %Y"),
             "recorded_at": manila_now().isoformat(),
             "name": worker.strip().upper(),
             "role": role,
-            "days": float(days),
+            "days": worked_days,
             "rate": FULL_DAY_RATES[role],
             "gross_pay": gross_pay,
             "full_pay": full_pay,
@@ -1383,6 +1410,39 @@ with st.sidebar:
         unsafe_allow_html=True
     )
 
+    st.subheader("Photo Scanner")
+    scanned_photo = st.camera_input("Take a photo to scan its text", key="sidebar_photo_scanner")
+    if scanned_photo:
+        photo_hash = hashlib.sha256(scanned_photo.getvalue()).hexdigest()
+        if st.session_state.get("scanned_photo_hash") != photo_hash:
+            try:
+                st.session_state.scanned_photo_text = scan_photo_text(scanned_photo)
+                st.session_state.scanned_photo_hash = photo_hash
+            except pytesseract.TesseractNotFoundError:
+                st.session_state.scanned_photo_text = "OCR is unavailable. Install Tesseract OCR on the server."
+                st.session_state.scanned_photo_hash = photo_hash
+            except (OSError, ValueError):
+                st.session_state.scanned_photo_text = "The photo could not be read. Try taking it again."
+                st.session_state.scanned_photo_hash = photo_hash
+        scanned_text = st.session_state.get("scanned_photo_text", "")
+        if scanned_text:
+            st.text_area("Scanned text", value=scanned_text, height=160,
+                         key="sidebar_scanned_text", disabled=True)
+            scanned_fields = parse_scanned_receipt(scanned_text)
+            st.caption(
+                f"Detected: {scanned_fields['name'] or 'item not found'} | "
+                f"Qty {scanned_fields['qty']} | PHP {scanned_fields['price']:,.2f}"
+            )
+            if st.button("USE SCAN IN MATERIAL ENTRY", use_container_width=True,
+                         key="use_scanned_material"):
+                st.session_state.material_name = scanned_fields["name"]
+                st.session_state.material_price = scanned_fields["price"] or None
+                st.session_state.material_qty = scanned_fields["qty"]
+                st.session_state.material_delivery = scanned_fields["delivery"] or None
+                set_view("material")
+        else:
+            st.info("No text was detected in the photo.")
+
     st.subheader("Executive Overview")
     if st.button("📊   Dashboard   ›", use_container_width=True, key="side_dashboard"):
         set_view("home")
@@ -1732,10 +1792,10 @@ elif view == "planner_output":
 elif view == "material":
     st.subheader("➕ ADD MATERIAL")
     with st.form(key="material_form", clear_on_submit=True):
-        name = st.text_input("Material Name")
-        price = st.number_input("Price", min_value=0.01, value=None, placeholder="0.00")
-        qty = st.number_input("Qty", min_value=1, value=None, placeholder="1")
-        delivery = st.number_input("Delivery", min_value=0.0, value=None, placeholder="0.00")
+        name = st.text_input("Material Name", key="material_name")
+        price = st.number_input("Price", min_value=0.01, value=None, placeholder="0.00", key="material_price")
+        qty = st.number_input("Qty", min_value=1, value=None, placeholder="1", key="material_qty")
+        delivery = st.number_input("Delivery", min_value=0.0, value=None, placeholder="0.00", key="material_delivery")
         sender = st.selectbox("Sender", ["Garr", "Aily"])
         submitted = st.form_submit_button(label="SAVE MATERIAL")
         if submitted:
@@ -1898,7 +1958,7 @@ elif view == "add_labor":
 
     with st.form(key="labor_input_form", clear_on_submit=True):
         name = st.text_input("Worker Name")
-        days = st.number_input("Worked Days / Point", min_value=0.1, value=1.0, step=0.1, placeholder="1.0")
+        days = st.number_input("Worked Days / Point", min_value=0.0, value=None, placeholder="Enter days")
         ca = st.number_input("Cash Advance (C.A.)", min_value=0.0, value=None, placeholder="0.00")
         submitted = st.form_submit_button("💾 SAVE LABOR ACCOUNT")
 
@@ -1983,9 +2043,8 @@ elif view == "payroll_ledger":
                     )
                     edited_days = st.number_input(
                         "Worked Days / Point",
-                        min_value=0.1,
-                        value=float(r.get("days", 0.1)),
-                        step=0.1,
+                        min_value=0.0,
+                        value=float(r.get("days", 1.0)),
                     )
                     edited_ca = st.number_input(
                         "Cash Advance (C.A.)",
@@ -2104,7 +2163,7 @@ elif view == "export":
 
 elif view == "payroll_export":
     st.subheader("📄 EXPORT PAYROLL REPORT")
-    receipt_title = st.text_input("Receipt Title", value="AILYN HOUSE PROJECT",
+    receipt_title = st.text_input("Receipt Title", value="OFFICIAL LABOR TALLY",
                                   placeholder="Enter a title for this receipt")
     html, total = generate_payroll_html(
         st.session_state.labor_records,
