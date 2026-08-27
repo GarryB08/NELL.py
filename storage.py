@@ -10,9 +10,10 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.path.join(APP_DIR, "ailyn_house.db")
 LEGACY_STATE_FILE = os.path.join(APP_DIR, "app_state.json")
 BACKUP_DIR = os.path.join(APP_DIR, "backups")
+SCANNER_PHOTO_DIR = os.path.join(APP_DIR, "archive", "scanner_photos")
 PERSISTENT_KEYS = (
     "records", "labor_records", "payroll_expenses", "planner_tasks", "budget",
-    "budget_history", "remaining_money", "view", "receipt_archive", "project",
+    "budget_history", "remaining_money", "view", "receipt_archive", "project", "scanner_photos",
 )
 
 
@@ -27,7 +28,7 @@ def _empty_state():
     return {
         "records": [], "labor_records": [], "payroll_expenses": [], "planner_tasks": [],
         "budget": 0.0, "budget_history": [], "remaining_money": 0.0,
-        "view": "home", "receipt_archive": [],
+        "view": "home", "receipt_archive": [], "scanner_photos": [],
         "project": {"name": "Ailyn House Project", "client": "", "address": "", "manager": "", "status": "Active", "target_date": ""},
     }
 
@@ -118,3 +119,34 @@ def history_count():
     initialize()
     with _connect() as connection:
         return connection.execute("SELECT COUNT(*) FROM state_history").fetchone()[0]
+
+
+def save_scanner_photo(photo_bytes, mime_type="image/jpeg", photo_id=None):
+    """Save a captured scanner image under the application directory."""
+    if not photo_bytes:
+        raise ValueError("The captured photo is empty.")
+    extension = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}.get(mime_type)
+    if extension is None:
+        raise ValueError("Unsupported scanner photo format.")
+    os.makedirs(SCANNER_PHOTO_DIR, exist_ok=True)
+    filename = f"{photo_id or datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}{extension}"
+    target = os.path.join(SCANNER_PHOTO_DIR, filename)
+    with tempfile.NamedTemporaryFile(delete=False, dir=SCANNER_PHOTO_DIR, prefix=".photo-") as temporary:
+        temporary.write(photo_bytes)
+        temporary_path = temporary.name
+    os.replace(temporary_path, target)
+    return os.path.relpath(target, APP_DIR)
+
+
+def delete_scanner_photo(relative_path):
+    """Delete a scanner image only when it belongs to the scanner photo directory."""
+    if not relative_path:
+        return False
+    target = os.path.abspath(os.path.join(APP_DIR, relative_path))
+    photo_root = os.path.abspath(SCANNER_PHOTO_DIR)
+    if os.path.commonpath((target, photo_root)) != photo_root:
+        raise ValueError("Invalid scanner photo path.")
+    if os.path.isfile(target):
+        os.remove(target)
+        return True
+    return False

@@ -20,8 +20,8 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
 from PIL import Image
 import pytesseract
-from storage import BACKUP_DIR, DB_FILE, create_backup, load_state as load_sqlite_state
-from storage import restore_backup, save_state as save_sqlite_state
+from storage import BACKUP_DIR, DB_FILE, create_backup, delete_scanner_photo, load_state as load_sqlite_state
+from storage import restore_backup, save_scanner_photo, save_state as save_sqlite_state
 from app_logic import FULL_DAY_RATES, TIER_TABLE, calculate_labor_pay, get_partial_rate
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -70,7 +70,8 @@ PERSISTENT_KEYS = [
     "remaining_money",
     "view",
     "receipt_archive",
-    "project"
+    "project",
+    "scanner_photos",
 ]
 
 def load_state():
@@ -252,6 +253,8 @@ if "payroll_expenses" not in st.session_state:
     st.session_state.payroll_expenses = []
 if "receipt_archive" not in st.session_state:
     st.session_state.receipt_archive = []
+if "scanner_photos" not in st.session_state:
+    st.session_state.scanner_photos = []
 if "project" not in st.session_state:
     st.session_state.project = {
         "name": "Ailyn House Project", "client": "", "address": "", "manager": "",
@@ -282,6 +285,10 @@ if "editing_labor_index" not in st.session_state:
     st.session_state.editing_labor_index = None
 if "editing_payroll_expense_index" not in st.session_state:
     st.session_state.editing_payroll_expense_index = None
+if "scanner_input_version" not in st.session_state:
+    st.session_state.scanner_input_version = 0
+if "scanner_actions_open" not in st.session_state:
+    st.session_state.scanner_actions_open = False
 if not os.path.exists(EXCEL_FILE):
     write_excel(st.session_state)
 if not os.path.exists(MATERIALS_EXCEL_FILE) or not os.path.exists(LABOR_EXCEL_FILE):
@@ -725,6 +732,9 @@ def clear_all():
     st.session_state.budget_history = []
     st.session_state.remaining_money = 0.0
     st.session_state.receipt_archive = []
+    for photo in st.session_state.get("scanner_photos", []):
+        delete_scanner_photo(photo.get("file", ""))
+    st.session_state.scanner_photos = []
     for report_type in ("construction", "payroll"):
         for report_path in list_saved_reports(report_type):
             if os.path.exists(report_path):
@@ -1411,10 +1421,13 @@ with st.sidebar:
     )
 
     st.subheader("Photo Scanner")
-    scanned_photo = st.camera_input("Take a photo to scan its text", key="sidebar_photo_scanner")
+    scanner_key = f"sidebar_photo_scanner_{st.session_state.scanner_input_version}"
+    scanned_photo = st.camera_input("Take a photo to scan its text", key=scanner_key)
     if scanned_photo:
         photo_hash = hashlib.sha256(scanned_photo.getvalue()).hexdigest()
         if st.session_state.get("scanned_photo_hash") != photo_hash:
+            st.session_state.scanned_photo_bytes = scanned_photo.getvalue()
+            st.session_state.scanned_photo_mime = scanned_photo.type or "image/jpeg"
             try:
                 st.session_state.scanned_photo_text = scan_photo_text(scanned_photo)
                 st.session_state.scanned_photo_hash = photo_hash
@@ -1424,6 +1437,60 @@ with st.sidebar:
             except (OSError, ValueError):
                 st.session_state.scanned_photo_text = "The photo could not be read. Try taking it again."
                 st.session_state.scanned_photo_hash = photo_hash
+            st.session_state.scanner_actions_open = False
+    if st.session_state.get("scanned_photo_bytes"):
+        st.image(st.session_state.scanned_photo_bytes, caption="Captured photo", use_container_width=True)
+        if st.button("OPEN PHOTO ACTIONS", use_container_width=True, key="open_scanner_actions"):
+            st.session_state.scanner_actions_open = True
+        if st.session_state.get("scanner_actions_open"):
+            with st.container(border=True):
+                st.caption("Photo actions")
+                action_col1, action_col2, action_col3 = st.columns(3)
+                with action_col1:
+                    if st.button("RETAKE", use_container_width=True, key="retake_scanner_photo"):
+                        st.session_state.scanned_photo_bytes = None
+                        st.session_state.scanned_photo_hash = None
+                        st.session_state.scanned_photo_text = ""
+                        st.session_state.scanner_actions_open = False
+                        st.session_state.scanner_input_version += 1
+                        st.rerun()
+                with action_col2:
+                    if st.button("DELETE", use_container_width=True, key="delete_scanner_photo"):
+                        photo_hash = st.session_state.get("scanned_photo_hash")
+                        kept_photos = []
+                        for photo in st.session_state.scanner_photos:
+                            if photo.get("hash") == photo_hash:
+                                delete_scanner_photo(photo.get("file", ""))
+                            else:
+                                kept_photos.append(photo)
+                        st.session_state.scanner_photos = kept_photos
+                        persist_state()
+                        st.session_state.scanned_photo_bytes = None
+                        st.session_state.scanned_photo_hash = None
+                        st.session_state.scanned_photo_text = ""
+                        st.session_state.scanner_actions_open = False
+                        st.session_state.scanner_input_version += 1
+                        st.rerun()
+                with action_col3:
+                    if st.button("SAVE FILE", use_container_width=True, key="save_scanner_photo"):
+                        photo_hash = st.session_state.get("scanned_photo_hash")
+                        if not any(photo.get("hash") == photo_hash for photo in st.session_state.scanner_photos):
+                            photo_id = str(uuid.uuid4())
+                            relative_path = save_scanner_photo(
+                                st.session_state.scanned_photo_bytes,
+                                st.session_state.get("scanned_photo_mime", "image/jpeg"),
+                                photo_id,
+                            )
+                            st.session_state.scanner_photos.append({
+                                "id": photo_id,
+                                "hash": photo_hash,
+                                "file": relative_path,
+                                "saved_at": manila_now().isoformat(),
+                            })
+                            persist_state()
+                            st.success("Photo saved to the project archive.")
+                        else:
+                            st.info("This photo is already saved.")
         scanned_text = st.session_state.get("scanned_photo_text", "")
         if scanned_text:
             st.text_area("Scanned text", value=scanned_text, height=160,

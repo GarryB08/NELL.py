@@ -45,3 +45,14 @@ def test_sqlite_save_and_reset(monkeypatch, tmp_path):
     assert storage.load_state()["records"] == []
     backup = storage.create_backup()
     assert sqlite3.connect(backup).execute("SELECT 1").fetchone() == (1,)
+
+
+def test_scanner_photo_save_and_delete(monkeypatch, tmp_path):
+    monkeypatch.setattr(storage, "APP_DIR", str(tmp_path))
+    monkeypatch.setattr(storage, "SCANNER_PHOTO_DIR", str(tmp_path / "scanner"))
+
+    relative_path = storage.save_scanner_photo(b"photo-bytes", "image/jpeg", "photo-1")
+    assert relative_path == "scanner/photo-1.jpg"
+    assert (tmp_path / "scanner" / "photo-1.jpg").read_bytes() == b"photo-bytes"
+    assert storage.delete_scanner_photo(relative_path) is True
+    assert not (tmp_path / "scanner" / "photo-1.jpg").exists()
