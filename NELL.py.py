@@ -904,22 +904,18 @@ def photo_camera_dialog():
     }
     </style>
     """, unsafe_allow_html=True)
-    photo_source = st.radio(
-        "PHOTO SOURCE",
-        ["iPhone Camera", "Webcam / Upload"],
-        horizontal=True,
-        key="photo_source_mode",
-    )
+    photo_source = st.radio("PHOTO SOURCE", ["Camera", "Upload photo"], horizontal=True, key="photo_source_mode")
     photo_category = st.selectbox(
         "WORK CATEGORY",
         ["General", "Before", "After", "Framing", "Electrical", "Plumbing", "Painting", "Inspection"],
         key="camera_photo_category",
     )
-    if photo_source == "iPhone Camera":
-        st.caption("Choose Take Photo to use the rear camera. Flash is controlled in the iPhone camera screen.")
-        photo = st.file_uploader("Choose Take Photo", type=["jpg", "jpeg", "png"], key=f"iphone_photo_scanner_{st.session_state.scanner_input_version}")
+    if photo_source == "Camera":
+        st.caption("Tap the camera button. On iPhone, allow camera access and use the rear-camera switch if needed.")
+        photo = st.camera_input("TAKE PHOTO", key=f"modal_photo_scanner_{st.session_state.scanner_input_version}")
     else:
-        photo = st.camera_input("Take project photo", key=f"modal_photo_scanner_{st.session_state.scanner_input_version}")
+        st.caption("Choose a JPEG or PNG photo from your phone.")
+        photo = st.file_uploader("UPLOAD PHOTO", type=["jpg", "jpeg", "png"], key=f"upload_photo_scanner_{st.session_state.scanner_input_version}")
     if photo:
         photo_hash = hashlib.sha256(photo.getvalue()).hexdigest()
         if st.session_state.get("scanned_photo_hash") != photo_hash:
