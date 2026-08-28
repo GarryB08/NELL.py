@@ -111,6 +111,7 @@ PERSISTENT_KEYS = [
     "dark_mode",
     "client_notes",
     "app_settings",
+    "messages",
 ]
 
 def load_state():
@@ -313,7 +314,7 @@ if st.session_state.view not in {
     "home", "payroll_dashboard", "planner_input", "planner_output", "material",
     "expense", "excess", "ledger", "add_labor", "add_payroll_expense",
     "payroll_remaining", "payroll_ledger", "export", "payroll_export",
-    "receipt_archive", "photo_scanner", "project_tools", "settings", "update",
+    "receipt_archive", "photo_scanner", "project_tools", "settings", "communications", "client_portal", "update",
 }:
     st.session_state.view = "home"
 if "selected_role" not in st.session_state:
@@ -336,6 +337,8 @@ if "scanner_camera_mode" not in st.session_state:
     st.session_state.scanner_camera_mode = "Back camera"
 if "client_notes" not in st.session_state:
     st.session_state.client_notes = []
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 if "app_settings" not in st.session_state:
     st.session_state.app_settings = {
         "display_name": "",
@@ -344,6 +347,7 @@ if "app_settings" not in st.session_state:
         "email_notifications": True,
         "budget_alerts": True,
         "date_format": "%Y-%m-%d",
+        "meeting_url": "",
     }
 else:
     st.session_state.app_settings = {
@@ -353,6 +357,7 @@ else:
         "email_notifications": True,
         "budget_alerts": True,
         "date_format": "%Y-%m-%d",
+        "meeting_url": "",
         **st.session_state.app_settings,
     }
 if "dark_mode" not in st.session_state:
@@ -424,6 +429,7 @@ def settings_dialog():
     with st.form("quick_settings_form"):
         display_name = st.text_input("Display name", value=settings.get("display_name", ""))
         email = st.text_input("Email", value=settings.get("email", ""))
+        meeting_url = st.text_input("Secure voice/video meeting link", value=settings.get("meeting_url", ""), placeholder="https://meet.google.com/...", help="Use a link from Google Meet, Zoom, or Microsoft Teams.")
         dark_mode = st.checkbox("Dark mode", value=bool(st.session_state.dark_mode))
         budget_alerts = st.checkbox("Budget alerts", value=bool(settings.get("budget_alerts", True)))
         email_notifications = st.checkbox("Email notifications", value=bool(settings.get("email_notifications", True)))
@@ -431,7 +437,7 @@ def settings_dialog():
             if email and ("@" not in email or "." not in email.rsplit("@", 1)[-1]):
                 st.error("Enter a valid email address.")
             else:
-                settings.update({"display_name": display_name.strip(), "email": email.strip(), "budget_alerts": budget_alerts, "email_notifications": email_notifications})
+                settings.update({"display_name": display_name.strip(), "email": email.strip(), "meeting_url": meeting_url.strip(), "budget_alerts": budget_alerts, "email_notifications": email_notifications})
                 st.session_state.dark_mode = dark_mode
                 persist_state()
                 st.success("Settings saved.")
@@ -856,6 +862,7 @@ def clear_all():
     st.session_state.remaining_money = 0.0
     st.session_state.receipt_archive = []
     st.session_state.client_notes = []
+    st.session_state.messages = []
     for photo in st.session_state.get("scanner_photos", []):
         delete_scanner_photo(photo.get("file", ""))
     st.session_state.scanner_photos = []
@@ -897,30 +904,22 @@ def photo_camera_dialog():
     }
     </style>
     """, unsafe_allow_html=True)
-    flash_mode = st.radio(
-        "FLASHLIGHT",
-        ["Auto", "On", "Off"],
+    photo_source = st.radio(
+        "PHOTO SOURCE",
+        ["iPhone Camera", "Webcam / Upload"],
         horizontal=True,
-        index=["Auto", "On", "Off"].index(st.session_state.scanner_flash_mode),
-        key="camera_flash_mode",
+        key="photo_source_mode",
     )
-    st.session_state.scanner_flash_mode = flash_mode
-    st.caption(f"Flash: {flash_mode.upper()}")
-    camera_mode = st.radio(
-        "CAMERA",
-        ["Back camera", "Front camera"],
-        horizontal=True,
-        index=["Back camera", "Front camera"].index(st.session_state.scanner_camera_mode),
-        key="camera_lens_mode",
-    )
-    st.session_state.scanner_camera_mode = camera_mode
-    st.caption(f"{camera_mode} selected. If your phone opens the other lens, tap the camera switch icon.")
     photo_category = st.selectbox(
         "WORK CATEGORY",
         ["General", "Before", "After", "Framing", "Electrical", "Plumbing", "Painting", "Inspection"],
         key="camera_photo_category",
     )
-    photo = st.camera_input(f"Take project photo with {camera_mode.lower()}", key=f"modal_photo_scanner_{st.session_state.scanner_input_version}")
+    if photo_source == "iPhone Camera":
+        st.caption("Choose Take Photo to use the rear camera. Flash is controlled in the iPhone camera screen.")
+        photo = st.file_uploader("Choose Take Photo", type=["jpg", "jpeg", "png"], key=f"iphone_photo_scanner_{st.session_state.scanner_input_version}")
+    else:
+        photo = st.camera_input("Take project photo", key=f"modal_photo_scanner_{st.session_state.scanner_input_version}")
     if photo:
         photo_hash = hashlib.sha256(photo.getvalue()).hexdigest()
         if st.session_state.get("scanned_photo_hash") != photo_hash:
@@ -997,6 +996,27 @@ def photo_camera_dialog():
                         f"PHP {(scanned_fields['price'] * scanned_fields['qty'] + scanned_fields['delivery']):,.2f}",
                     ],
                 })
+                receipt_hash = st.session_state.get("scanned_photo_hash")
+                receipt_already_saved = any(record.get("source_photo_hash") == receipt_hash for record in st.session_state.records)
+                if receipt_already_saved:
+                    st.info("This scanned receipt is already saved in the Excel ledger.")
+                elif st.button("SAVE RECEIPT TO EXCEL", use_container_width=True, key="save_scanned_receipt_excel"):
+                    if not scanned_fields["name"]:
+                        st.warning("The receipt item name was not detected. Enter it in Material Entry before saving.")
+                    elif scanned_fields["price"] <= 0:
+                        st.warning("The receipt total was not detected. Enter the amount in Material Entry before saving.")
+                    else:
+                        saved = add_tx(
+                            scanned_fields["name"],
+                            scanned_fields["price"],
+                            scanned_fields["qty"],
+                            scanned_fields["delivery"],
+                            "material",
+                            "CLIENT RECEIPT SCAN",
+                            details={"source_photo_hash": receipt_hash, "ocr_text": scanned_text},
+                        )
+                        if saved:
+                            st.success("Receipt saved to the Excel ledger.")
             with st.expander("View scanned text", expanded=False):
                 st.text_area("Recognized text", value=scanned_text, height=120, key="modal_scanned_text", disabled=True, label_visibility="collapsed")
             if not scanned_text.startswith("OCR is unavailable") and not scanned_text.startswith("The photo could not be read") and st.button("USE SCAN IN MATERIAL ENTRY", use_container_width=True, key="modal_use_scanned_material"):
@@ -1764,6 +1784,10 @@ with st.sidebar:
         set_view("project_tools")
     if st.button("⚙️   Settings   ›", use_container_width=True, key="side_settings"):
         settings_dialog()
+    if st.button("💬   Messages & Calls   ›", use_container_width=True, key="side_messages"):
+        set_view("communications")
+    if st.button("👤   Client Portal   ›", use_container_width=True, key="side_client_portal"):
+        set_view("client_portal")
 
     st.subheader("Financial Operations")
     if st.button("🧱   Material Entry   ›", use_container_width=True, key="side_material"):
@@ -2168,6 +2192,8 @@ elif view == "ledger":
     else:
         for r in visible_records:
             if st.session_state.editing_record_id == r["id"]:
+                save_record = False
+                cancel_record = False
                 with st.form(key=f"edit_record_form_{r['id']}"):
                     edited_name = st.text_input("Name", value=r.get("name", ""))
                     edited_amount = st.number_input(
@@ -2622,6 +2648,142 @@ elif view == "receipt_archive":
                     st.success(f"Deleted: {report_path.name}")
                     st.rerun()
 
+elif view == "client_portal":
+    project = st.session_state.project
+    budget = float(st.session_state.budget or 0)
+    spent = float(get_total() or 0)
+    balance = float(get_balance() or 0)
+    completed_tasks = sum(task.get("status") == "Completed" for task in st.session_state.planner_tasks)
+    total_tasks = len(st.session_state.planner_tasks)
+    progress = int(completed_tasks / total_tasks * 100) if total_tasks else 0
+    st.markdown("## CLIENT PORTAL")
+    st.caption(f"{project.get('name', 'Ailyn House Project')} | {project.get('status', 'Active')} | Client view")
+    portal_metrics = st.columns(4)
+    with portal_metrics[0]:
+        st.metric("PROJECT PROGRESS", f"{progress}%")
+    with portal_metrics[1]:
+        st.metric("BUDGET", f"PHP {budget:,.0f}")
+    with portal_metrics[2]:
+        st.metric("SPENT", f"PHP {spent:,.0f}")
+    with portal_metrics[3]:
+        st.metric("BALANCE", f"PHP {balance:,.0f}")
+    st.progress(progress / 100, text=f"{completed_tasks} of {total_tasks} scheduled tasks completed")
+    overview_col, updates_col = st.columns([1.1, 0.9])
+    with overview_col:
+        st.markdown("### PROJECT DETAILS")
+        st.dataframe([{
+            "Client": project.get("client") or "Not set",
+            "Site": project.get("address") or "Not set",
+            "Target": project.get("target_date") or "Not set",
+            "Manager": project.get("manager") or "Not set",
+        }], use_container_width=True, hide_index=True)
+        st.markdown("### RECENT PROJECT PHOTOS")
+        client_photos = st.session_state.get("scanner_photos", [])[:6]
+        photo_columns = st.columns(3)
+        for index, photo in enumerate(client_photos):
+            photo_path = os.path.join(APP_DIR, photo.get("file", ""))
+            if os.path.isfile(photo_path):
+                with photo_columns[index % 3]:
+                    st.image(photo_path, use_container_width=True)
+                    st.caption(f"{photo.get('tag', 'General')} | {photo.get('saved_at', '')[:10]}")
+        if not client_photos:
+            st.info("Project photos will appear here after they are saved.")
+    with updates_col:
+        st.markdown("### SCHEDULE")
+        upcoming_tasks = sorted(st.session_state.planner_tasks, key=lambda task: task.get("date_obj", ""), reverse=False)[:8]
+        if upcoming_tasks:
+            st.dataframe([{"Date": task.get("date_obj", ""), "Work": task.get("description", task.get("name", "")), "Status": task.get("status", "Planned")} for task in upcoming_tasks], use_container_width=True, hide_index=True)
+        else:
+            st.info("No schedule updates yet.")
+        st.markdown("### CLIENT UPDATES")
+        client_notes = [note for note in st.session_state.client_notes if note.get("folder") in {"Client Approval", "Photo Comments"}]
+        if client_notes:
+            for note in client_notes[:6]:
+                st.markdown(f"**{note.get('folder', 'Update')}**  \n{note.get('text', '')}")
+                st.caption(note.get("created_at", "").replace("T", " ")[:16])
+        else:
+            st.info("No client updates yet.")
+    action_col, message_col = st.columns(2)
+    with action_col:
+        if st.button("OPEN MESSAGES & CALLS", use_container_width=True, key="portal_communications"):
+            set_view("communications")
+    with message_col:
+        if st.button("BACK TO DASHBOARD", use_container_width=True, key="portal_dashboard"):
+            set_view("home")
+
+elif view == "communications":
+    st.markdown("## MESSAGES & CALLS")
+    st.caption("Keep project communication and client meetings in one place.")
+    message_tab, radio_tab, calls_tab = st.tabs(["MESSAGES", "PROJECT RADIO", "VOICE & VIDEO CALLS"])
+    with message_tab:
+        message_sender = st.text_input("Your name", value=st.session_state.app_settings.get("display_name", "") or "Project team", key="message_sender")
+        message_text = st.text_area("Message", placeholder="Write an update for the client...", height=90, key="message_text")
+        if st.button("SEND MESSAGE", use_container_width=True, key="send_message"):
+            if message_text.strip():
+                st.session_state.messages.insert(0, {"id": str(uuid.uuid4()), "sender": message_sender.strip() or "Project team", "text": message_text.strip(), "sent_at": manila_now().isoformat()})
+                persist_state()
+                st.rerun()
+            st.warning("Write a message before sending.")
+        if st.session_state.messages:
+            st.markdown("### Conversation")
+            for message in st.session_state.messages[:30]:
+                sent_at = message.get("sent_at", "").replace("T", " ")[:16]
+                st.markdown(f"**{message.get('sender', 'Project team')}**  \n{message.get('text', '')}")
+                st.caption(sent_at)
+                st.divider()
+        else:
+            st.info("No messages yet. Send the first project update.")
+    with radio_tab:
+        st.markdown("### Project radio")
+        st.caption("Use channels for quick site updates. Voice clips can be recorded on your phone and uploaded here.")
+        radio_channel = st.selectbox("Channel", ["General", "Site Team", "Safety", "Client Updates"], key="radio_channel")
+        radio_sender = st.text_input("Call sign", value=st.session_state.app_settings.get("display_name", "") or "Project team", key="radio_sender")
+        if st.button("PUSH TO TALK", use_container_width=True, key="radio_push_to_talk"):
+            st.session_state.radio_transmitting = not st.session_state.get("radio_transmitting", False)
+        if st.session_state.get("radio_transmitting"):
+            st.success("TRANSMITTING")
+        else:
+            st.info("Radio ready")
+        radio_text = st.text_input("Broadcast text", placeholder="Site update or urgent message", key="radio_text")
+        voice_clip = st.file_uploader("Voice clip (optional)", type=["mp3", "wav", "m4a", "ogg"], key="radio_voice_clip")
+        if st.button("BROADCAST", use_container_width=True, key="broadcast_radio"):
+            if radio_text.strip() or voice_clip:
+                radio_message = {"id": str(uuid.uuid4()), "kind": "radio", "channel": radio_channel, "sender": radio_sender.strip() or "Project team", "text": radio_text.strip(), "sent_at": manila_now().isoformat()}
+                if voice_clip:
+                    radio_message["audio"] = base64.b64encode(voice_clip.getvalue()).decode("ascii")
+                    radio_message["audio_type"] = voice_clip.type or "audio/mpeg"
+                st.session_state.messages.insert(0, radio_message)
+                st.session_state.radio_transmitting = False
+                persist_state()
+                st.rerun()
+            st.warning("Add text or a voice clip before broadcasting.")
+        radio_messages = [message for message in st.session_state.messages if message.get("kind") == "radio" and message.get("channel") == radio_channel]
+        if radio_messages:
+            st.markdown("### Channel activity")
+            for message in radio_messages[:20]:
+                st.markdown(f"**{message.get('sender', 'Project team')}** | {message.get('sent_at', '').replace('T', ' ')[:16]}  \n{message.get('text', '')}")
+                if message.get("audio"):
+                    st.audio(base64.b64decode(message["audio"]), format=message.get("audio_type", "audio/mpeg"))
+        else:
+            st.info("No broadcasts in this channel yet.")
+    with calls_tab:
+        meeting_url = st.session_state.app_settings.get("meeting_url", "")
+        st.markdown("### Client meeting room")
+        if meeting_url.startswith("https://"):
+            st.success("Secure meeting link is ready.")
+            call_video, call_voice = st.columns(2)
+            with call_video:
+                st.link_button("START VIDEO CALL", meeting_url, use_container_width=True)
+            with call_voice:
+                st.link_button("START VOICE CALL", meeting_url, use_container_width=True)
+            st.caption("Voice and video are provided by your secure meeting service.")
+        else:
+            st.info("Add an HTTPS Google Meet, Zoom, or Microsoft Teams link in Settings to enable calls.")
+            if st.button("OPEN SETTINGS", use_container_width=True, key="communications_open_settings"):
+                settings_dialog()
+    if st.button("BACK TO DASHBOARD", key="communications_back"):
+        set_view("home")
+
 elif view == "settings":
     settings = st.session_state.app_settings
     st.markdown("## SETTINGS")
@@ -2631,11 +2793,12 @@ elif view == "settings":
         with st.form("account_profile_form"):
             display_name = st.text_input("Display name", value=settings.get("display_name", ""), placeholder="Your name")
             email = st.text_input("Email address", value=settings.get("email", ""), placeholder="name@example.com")
+            meeting_url = st.text_input("Secure voice/video meeting link", value=settings.get("meeting_url", ""), placeholder="https://meet.google.com/...")
             if st.form_submit_button("SAVE PROFILE", use_container_width=True):
                 if email and ("@" not in email or "." not in email.rsplit("@", 1)[-1]):
                     st.error("Enter a valid email address.")
                 else:
-                    settings.update({"display_name": display_name.strip(), "email": email.strip()})
+                    settings.update({"display_name": display_name.strip(), "email": email.strip(), "meeting_url": meeting_url.strip()})
                     persist_state()
                     st.success("Profile saved.")
     with preference_tab:
