@@ -332,6 +332,8 @@ if "scanner_open" not in st.session_state:
     st.session_state.scanner_open = False
 if "scanner_flash_mode" not in st.session_state:
     st.session_state.scanner_flash_mode = "Auto"
+if "scanner_camera_mode" not in st.session_state:
+    st.session_state.scanner_camera_mode = "Back camera"
 if "client_notes" not in st.session_state:
     st.session_state.client_notes = []
 if "app_settings" not in st.session_state:
@@ -879,6 +881,20 @@ def photo_camera_dialog():
     div[role="dialog"] h2 { color: #f4fff7; font-size: 1.35rem; letter-spacing: .01em; }
     div[role="dialog"] [data-testid="stRadio"] label p { font-size: 12px; font-weight: 700; }
     div[role="dialog"] [data-testid="stCaptionContainer"] p { color: #9fb0a6; font-size: 10px; }
+    div[role="dialog"] [data-testid="stCameraInput"] { width: 100%; }
+    div[role="dialog"] [data-testid="stCameraInput"] video,
+    div[role="dialog"] [data-testid="stCameraInput"] img { width: 100% !important; max-height: 52vh; object-fit: cover; border-radius: 14px; }
+    div[role="dialog"] button { min-height: 44px !important; font-size: 12px !important; }
+    @media (max-width: 600px) {
+        div[role="dialog"] { width: calc(100vw - 20px) !important; max-width: calc(100vw - 20px) !important; margin: 10px !important; padding: .8rem .7rem .7rem; }
+        div[role="dialog"] h2 { font-size: 1.15rem; }
+        div[role="dialog"] [data-testid="stRadio"] > div { gap: 4px !important; }
+        div[role="dialog"] [data-testid="stRadio"] label { padding-right: 4px !important; }
+        div[role="dialog"] [data-testid="stRadio"] label p { font-size: 11px; }
+        div[role="dialog"] [data-testid="stCameraInput"] video,
+        div[role="dialog"] [data-testid="stCameraInput"] img { max-height: 45vh; }
+        div[role="dialog"] [data-testid="stDataFrame"] { max-width: 100%; overflow-x: auto; }
+    }
     </style>
     """, unsafe_allow_html=True)
     flash_mode = st.radio(
@@ -890,12 +906,21 @@ def photo_camera_dialog():
     )
     st.session_state.scanner_flash_mode = flash_mode
     st.caption(f"Flash: {flash_mode.upper()}")
+    camera_mode = st.radio(
+        "CAMERA",
+        ["Back camera", "Front camera"],
+        horizontal=True,
+        index=["Back camera", "Front camera"].index(st.session_state.scanner_camera_mode),
+        key="camera_lens_mode",
+    )
+    st.session_state.scanner_camera_mode = camera_mode
+    st.caption(f"{camera_mode} selected. If your phone opens the other lens, tap the camera switch icon.")
     photo_category = st.selectbox(
         "WORK CATEGORY",
         ["General", "Before", "After", "Framing", "Electrical", "Plumbing", "Painting", "Inspection"],
         key="camera_photo_category",
     )
-    photo = st.camera_input("Take project photo", key=f"modal_photo_scanner_{st.session_state.scanner_input_version}")
+    photo = st.camera_input(f"Take project photo with {camera_mode.lower()}", key=f"modal_photo_scanner_{st.session_state.scanner_input_version}")
     if photo:
         photo_hash = hashlib.sha256(photo.getvalue()).hexdigest()
         if st.session_state.get("scanned_photo_hash") != photo_hash:
