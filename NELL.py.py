@@ -18,9 +18,13 @@ import streamlit as st
 import json
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
-from PIL import Image
-import pytesseract
-from storage import BACKUP_DIR, DB_FILE, create_backup, delete_scanner_photo, load_state as load_sqlite_state
+from PIL import Image, ImageOps
+try:
+    import pytesseract
+except ModuleNotFoundError:
+    pytesseract = None
+TESSERACT_NOT_FOUND_ERROR = getattr(pytesseract, "TesseractNotFoundError", RuntimeError)
+from storage import BACKUP_DIR, DB_FILE, create_backup, delete_scanner_photo, history_count, load_state as load_sqlite_state
 from storage import restore_backup, save_scanner_photo, save_state as save_sqlite_state
 from app_logic import FULL_DAY_RATES, TIER_TABLE, calculate_labor_pay, get_partial_rate
 
@@ -38,6 +42,8 @@ def manila_now():
 
 def scan_photo_text(photo):
     """Read text from a camera photo using the local OCR engine."""
+    if pytesseract is None:
+        raise RuntimeError("OCR is unavailable. Install the pytesseract package to scan text.")
     image = Image.open(BytesIO(photo.getvalue()))
     return pytesseract.image_to_string(image).strip()
 
@@ -59,6 +65,36 @@ def parse_scanned_receipt(text):
     return {"name": name[:120], "price": price, "qty": quantity, "delivery": delivery}
 
 
+def normalize_photo_bytes(photo_bytes, mime_type="image/jpeg"):
+    """Apply camera EXIF orientation and return display-ready image bytes."""
+    image = ImageOps.exif_transpose(Image.open(BytesIO(photo_bytes))).convert("RGB")
+    output = BytesIO()
+    image.save(output, format="JPEG", quality=90, optimize=True)
+    return output.getvalue(), "image/jpeg"
+
+
+def searchable_records(state):
+    records = []
+    for category, key in (("Financial", "records"), ("Labor", "labor_records"), ("Payroll", "payroll_expenses")):
+        for record in state.get(key, []):
+            row_category = "Expense" if category == "Financial" and record.get("type") == "expense" else "Material" if category == "Financial" else category
+            records.append({"category": row_category, **record})
+    return records
+
+
+def find_duplicate_records(records):
+    groups = {}
+    for record in records:
+        signature = (
+            record.get("type", record.get("category", "")),
+            str(record.get("name", record.get("item", record.get("description", "")))).strip().lower(),
+            round(float(record.get("amount", record.get("price", record.get("net", 0))) or 0), 2),
+            record.get("date", record.get("month", "")),
+        )
+        groups.setdefault(signature, []).append(record)
+    return [group for group in groups.values() if len(group) > 1]
+
+
 # --- PERSISTENCE HELPERS
 PERSISTENT_KEYS = [
     "records",
@@ -72,6 +108,9 @@ PERSISTENT_KEYS = [
     "receipt_archive",
     "project",
     "scanner_photos",
+    "dark_mode",
+    "client_notes",
+    "app_settings",
 ]
 
 def load_state():
@@ -274,7 +313,7 @@ if st.session_state.view not in {
     "home", "payroll_dashboard", "planner_input", "planner_output", "material",
     "expense", "excess", "ledger", "add_labor", "add_payroll_expense",
     "payroll_remaining", "payroll_ledger", "export", "payroll_export",
-    "receipt_archive", "update",
+    "receipt_archive", "photo_scanner", "project_tools", "settings", "update",
 }:
     st.session_state.view = "home"
 if "selected_role" not in st.session_state:
@@ -289,6 +328,33 @@ if "scanner_input_version" not in st.session_state:
     st.session_state.scanner_input_version = 0
 if "scanner_actions_open" not in st.session_state:
     st.session_state.scanner_actions_open = False
+if "scanner_open" not in st.session_state:
+    st.session_state.scanner_open = False
+if "scanner_flash_mode" not in st.session_state:
+    st.session_state.scanner_flash_mode = "Auto"
+if "client_notes" not in st.session_state:
+    st.session_state.client_notes = []
+if "app_settings" not in st.session_state:
+    st.session_state.app_settings = {
+        "display_name": "",
+        "email": "",
+        "client_mode": False,
+        "email_notifications": True,
+        "budget_alerts": True,
+        "date_format": "%Y-%m-%d",
+    }
+else:
+    st.session_state.app_settings = {
+        "display_name": "",
+        "email": "",
+        "client_mode": False,
+        "email_notifications": True,
+        "budget_alerts": True,
+        "date_format": "%Y-%m-%d",
+        **st.session_state.app_settings,
+    }
+if "dark_mode" not in st.session_state:
+    st.session_state.dark_mode = False
 if not os.path.exists(EXCEL_FILE):
     write_excel(st.session_state)
 if not os.path.exists(MATERIALS_EXCEL_FILE) or not os.path.exists(LABOR_EXCEL_FILE):
@@ -317,6 +383,61 @@ def project_settings_dialog():
                 st.session_state.project = {"name": name.strip(), "client": client.strip(), "address": address.strip(), "manager": manager.strip(), "status": status, "target_date": target_date.isoformat()}
                 persist_state()
                 st.success("Project details saved.")
+
+
+@st.dialog("Notes")
+def notes_dialog():
+    st.caption("Project notes, approvals, and photo comments")
+    folders = ["Site Notes", "Client Approval", "Photo Comments", "Change Requests"]
+    folders += [folder for folder in sorted({note.get("folder", "Site Notes") for note in st.session_state.client_notes}) if folder not in folders]
+    folder = st.selectbox("Folder", folders, key="popup_note_folder")
+    new_folder = st.text_input("New folder", key="popup_new_note_folder", placeholder="Optional folder name")
+    text = st.text_area("Note", key="popup_note_text", height=80, placeholder="Write a note for the project...")
+    if st.button("ADD NOTE", use_container_width=True, key="popup_add_note"):
+        if text.strip():
+            st.session_state.client_notes.insert(0, {"id": str(uuid.uuid4()), "folder": new_folder.strip() or folder, "text": text.strip(), "created_at": manila_now().isoformat()})
+            persist_state()
+            st.rerun()
+        st.warning("Write a note before saving.")
+    if st.session_state.client_notes:
+        st.markdown("#### RECENT NOTES")
+        st.dataframe([
+            {"Folder": note.get("folder", "Site Notes"), "Date": note.get("created_at", "").replace("T", " ")[:16], "Note": note.get("text", "")}
+            for note in st.session_state.client_notes[:8]
+        ], use_container_width=True, hide_index=True)
+        note_to_delete = st.selectbox("Delete note", ["Choose a note"] + [f"{note.get('created_at', '')[:16]} | {note.get('text', '')[:45]}" for note in st.session_state.client_notes[:8]], key="popup_delete_note_select")
+        if note_to_delete != "Choose a note" and st.button("DELETE SELECTED NOTE", use_container_width=True, key="popup_delete_note"):
+            selected_index = [f"{note.get('created_at', '')[:16]} | {note.get('text', '')[:45]}" for note in st.session_state.client_notes[:8]].index(note_to_delete)
+            st.session_state.client_notes.pop(selected_index)
+            persist_state()
+            st.rerun()
+    else:
+        st.info("No notes yet.")
+
+
+@st.dialog("Settings")
+def settings_dialog():
+    settings = st.session_state.app_settings
+    st.caption("Quick account and project preferences")
+    with st.form("quick_settings_form"):
+        display_name = st.text_input("Display name", value=settings.get("display_name", ""))
+        email = st.text_input("Email", value=settings.get("email", ""))
+        dark_mode = st.checkbox("Dark mode", value=bool(st.session_state.dark_mode))
+        budget_alerts = st.checkbox("Budget alerts", value=bool(settings.get("budget_alerts", True)))
+        email_notifications = st.checkbox("Email notifications", value=bool(settings.get("email_notifications", True)))
+        if st.form_submit_button("SAVE SETTINGS", use_container_width=True):
+            if email and ("@" not in email or "." not in email.rsplit("@", 1)[-1]):
+                st.error("Enter a valid email address.")
+            else:
+                settings.update({"display_name": display_name.strip(), "email": email.strip(), "budget_alerts": budget_alerts, "email_notifications": email_notifications})
+                st.session_state.dark_mode = dark_mode
+                persist_state()
+                st.success("Settings saved.")
+    st.markdown("#### ACCOUNT ACCESS")
+    st.success("Workspace password enabled.") if LOGIN_PASSWORD else st.info("Workspace password is disabled.")
+    if LOGIN_PASSWORD and st.button("SIGN OUT", use_container_width=True, key="popup_sign_out"):
+        st.session_state.authenticated = False
+        st.rerun()
 
 
 def total_materials():
@@ -732,6 +853,7 @@ def clear_all():
     st.session_state.budget_history = []
     st.session_state.remaining_money = 0.0
     st.session_state.receipt_archive = []
+    st.session_state.client_notes = []
     for photo in st.session_state.get("scanner_photos", []):
         delete_scanner_photo(photo.get("file", ""))
     st.session_state.scanner_photos = []
@@ -746,6 +868,122 @@ def clear_all():
 
 def persist_state():
     save_state(st.session_state)
+
+
+@st.dialog("Take Photo")
+def photo_camera_dialog():
+    st.markdown("""
+    <style>
+    div[role="dialog"] { background: #080b0c; border: 1px solid #33423d; border-radius: 24px; padding: 1rem 1rem .85rem; }
+    div[role="dialog"] [data-testid="stVerticalBlock"] { gap: 0.55rem; }
+    div[role="dialog"] h2 { color: #f4fff7; font-size: 1.35rem; letter-spacing: .01em; }
+    div[role="dialog"] [data-testid="stRadio"] label p { font-size: 12px; font-weight: 700; }
+    div[role="dialog"] [data-testid="stCaptionContainer"] p { color: #9fb0a6; font-size: 10px; }
+    </style>
+    """, unsafe_allow_html=True)
+    flash_mode = st.radio(
+        "FLASHLIGHT",
+        ["Auto", "On", "Off"],
+        horizontal=True,
+        index=["Auto", "On", "Off"].index(st.session_state.scanner_flash_mode),
+        key="camera_flash_mode",
+    )
+    st.session_state.scanner_flash_mode = flash_mode
+    st.caption(f"Flash: {flash_mode.upper()}")
+    photo_category = st.selectbox(
+        "WORK CATEGORY",
+        ["General", "Before", "After", "Framing", "Electrical", "Plumbing", "Painting", "Inspection"],
+        key="camera_photo_category",
+    )
+    photo = st.camera_input("Take project photo", key=f"modal_photo_scanner_{st.session_state.scanner_input_version}")
+    if photo:
+        photo_hash = hashlib.sha256(photo.getvalue()).hexdigest()
+        if st.session_state.get("scanned_photo_hash") != photo_hash:
+            st.session_state.scanned_photo_bytes = photo.getvalue()
+            st.session_state.scanned_photo_mime = photo.type or "image/jpeg"
+            try:
+                st.session_state.scanned_photo_text = scan_photo_text(photo)
+            except TESSERACT_NOT_FOUND_ERROR:
+                st.session_state.scanned_photo_text = "OCR is unavailable. Install Tesseract OCR on the server."
+            except RuntimeError as error:
+                st.session_state.scanned_photo_text = str(error)
+            except (OSError, ValueError):
+                st.session_state.scanned_photo_text = "The photo could not be read. Try taking it again."
+            st.session_state.scanned_photo_hash = photo_hash
+
+    if st.session_state.get("scanned_photo_bytes"):
+        view_col, delete_col = st.columns(2)
+        with view_col:
+            if st.button("◀ VIEW PHOTO", use_container_width=True, key="modal_view_photo"):
+                st.session_state.show_scanned_photo = True
+        with delete_col:
+            if st.button("DELETE ▶", use_container_width=True, key="modal_delete_photo"):
+                photo_hash = st.session_state.get("scanned_photo_hash")
+                kept_photos = []
+                for saved_photo in st.session_state.scanner_photos:
+                    if saved_photo.get("hash") == photo_hash:
+                        delete_scanner_photo(saved_photo.get("file", ""))
+                    else:
+                        kept_photos.append(saved_photo)
+                st.session_state.scanner_photos = kept_photos
+                persist_state()
+                st.session_state.scanned_photo_bytes = None
+                st.session_state.scanned_photo_hash = None
+                st.session_state.scanned_photo_text = ""
+                st.session_state.scanner_input_version += 1
+                st.rerun()
+        if st.session_state.get("show_scanned_photo"):
+            st.image(st.session_state.scanned_photo_bytes, caption="Captured photo", use_container_width=True)
+        save_col, retake_col = st.columns(2)
+        with save_col:
+            if st.button("SAVE FILE", use_container_width=True, key="modal_save_photo"):
+                photo_hash = st.session_state.get("scanned_photo_hash")
+                if not any(photo.get("hash") == photo_hash for photo in st.session_state.scanner_photos):
+                    photo_id = str(uuid.uuid4())
+                    relative_path = save_scanner_photo(st.session_state.scanned_photo_bytes, st.session_state.get("scanned_photo_mime", "image/jpeg"), photo_id)
+                    st.session_state.scanner_photos.append({"id": photo_id, "hash": photo_hash, "file": relative_path, "tag": photo_category, "saved_at": manila_now().isoformat()})
+                    persist_state()
+                    st.success("Photo saved to the project archive.")
+                else:
+                    st.info("This photo is already saved.")
+        with retake_col:
+            if st.button("RETAKE", use_container_width=True, key="modal_retake_photo"):
+                st.session_state.scanned_photo_bytes = None
+                st.session_state.scanned_photo_hash = None
+                st.session_state.scanned_photo_text = ""
+                st.session_state.show_scanned_photo = False
+                st.session_state.scanner_input_version += 1
+                st.rerun()
+        scanned_text = st.session_state.get("scanned_photo_text", "")
+        if scanned_text:
+            if scanned_text.startswith("OCR is unavailable") or scanned_text.startswith("The photo could not be read"):
+                st.warning(scanned_text)
+            else:
+                scanned_fields = parse_scanned_receipt(scanned_text)
+                st.success("PHOTO SCANNED AND ENCODED")
+                st.markdown("#### DETECTED RECEIPT DETAILS")
+                st.table({
+                    "Field": ["Item", "Quantity", "Unit price", "Delivery", "Total"],
+                    "Encoded value": [
+                        scanned_fields["name"] or "Not detected",
+                        scanned_fields["qty"],
+                        f"PHP {scanned_fields['price']:,.2f}",
+                        f"PHP {scanned_fields['delivery']:,.2f}",
+                        f"PHP {(scanned_fields['price'] * scanned_fields['qty'] + scanned_fields['delivery']):,.2f}",
+                    ],
+                })
+            with st.expander("View scanned text", expanded=False):
+                st.text_area("Recognized text", value=scanned_text, height=120, key="modal_scanned_text", disabled=True, label_visibility="collapsed")
+            if not scanned_text.startswith("OCR is unavailable") and not scanned_text.startswith("The photo could not be read") and st.button("USE SCAN IN MATERIAL ENTRY", use_container_width=True, key="modal_use_scanned_material"):
+                st.session_state.material_name = scanned_fields["name"]
+                st.session_state.material_price = scanned_fields["price"] or None
+                st.session_state.material_qty = scanned_fields["qty"]
+                st.session_state.material_delivery = scanned_fields["delivery"] or None
+                set_view("material")
+    if st.button("CLOSE CAMERA", use_container_width=True, key="close_photo_dialog"):
+        st.session_state.scanner_open = False
+        st.session_state.show_scanned_photo = False
+        st.rerun()
 
 
 def install_update(uploaded_file, signature):
@@ -1402,6 +1640,48 @@ section[data-testid="stSidebar"] [data-testid="stSidebarCollapseButton"],
 </style>
 """, unsafe_allow_html=True)
 
+if st.session_state.dark_mode:
+    st.markdown("""
+    <style>
+    .stApp, [data-testid="stAppViewContainer"] { background: #101614 !important; color: #edf7ef !important; }
+    [data-testid="stHeader"] { background: #101614 !important; }
+    [data-testid="stMarkdownContainer"], label, p, h1, h2, h3, h4 { color: #edf7ef !important; }
+    [data-baseweb="input"], [data-baseweb="select"] > div, textarea { background: #1b2923 !important; color: #edf7ef !important; }
+    </style>
+    """, unsafe_allow_html=True)
+
+st.markdown("""
+<style>
+.photo-scanner-title { color: #f4fff7; font-family: 'Outfit', sans-serif; font-size: 15px; font-weight: 900; letter-spacing: .08em; margin: 14px 0 3px; }
+.photo-scanner-subtitle { color: #9fb0a6; font-size: 11px; line-height: 1.4; margin-bottom: 10px; }
+
+/* Final dashboard presentation layer. The project background and sidebar brand remain unchanged. */
+.block-container { color: #f7f5ee !important; }
+.block-container h1, .block-container h2, .block-container h3 { font-family: 'Outfit', sans-serif !important; letter-spacing: .015em !important; }
+.dashboard-heading { margin-bottom: 8px !important; }
+.dashboard-heading-title { font-size: 31px !important; letter-spacing: .045em !important; text-shadow: 0 2px 18px rgba(0,0,0,.34); }
+.dashboard-heading-sub { color: #8fe0bb !important; letter-spacing: .24em !important; }
+.dashboard-welcome { color: #d4e5dc !important; max-width: 760px !important; line-height: 1.6 !important; }
+.dashboard-welcome b { color: #ffae8f !important; }
+.block-container [data-testid="stMetric"] { min-height: 104px !important; padding: 17px 18px !important; border-radius: 16px !important; background: rgba(12, 38, 29, .82) !important; border: 1px solid rgba(143, 224, 187, .22) !important; box-shadow: 0 12px 28px rgba(0,0,0,.22), inset 0 1px 0 rgba(255,255,255,.09) !important; }
+.block-container [data-testid="stMetric"] label { color: #9ed7bd !important; font-size: 9px !important; letter-spacing: .16em !important; }
+.block-container [data-testid="stMetricValue"] { color: #fffaf2 !important; font-family: 'Outfit', sans-serif !important; font-size: 26px !important; }
+.dash-section { border-radius: 16px !important; background: rgba(10, 30, 24, .78) !important; border-color: rgba(143, 224, 187, .18) !important; box-shadow: 0 16px 34px rgba(0,0,0,.24) !important; }
+.section-title { color: #fffaf2 !important; font-size: 15px !important; letter-spacing: .075em !important; }
+.section-head span { color: #9ed7bd !important; }
+.tx-row { border-bottom-color: rgba(211, 238, 222, .10) !important; }
+.tx-name { color: #fffaf2 !important; font-family: 'Outfit', sans-serif !important; }
+.tx-type, .tx-date, .schedule-muted { color: #9db9aa !important; }
+.tx-right { color: #ffae8f !important; }
+.schedule-title { color: #fffaf2 !important; font-size: 15px !important; letter-spacing: .055em !important; }
+@media (max-width: 600px) {
+    .dashboard-heading-title { font-size: 22px !important; }
+    .dashboard-heading-sub { letter-spacing: .14em !important; }
+    .block-container [data-testid="stMetric"] { min-height: 88px !important; }
+}
+</style>
+""", unsafe_allow_html=True)
+
 with st.sidebar:
     st.markdown(f"""
     <div class="sidebar-brand">
@@ -1420,95 +1700,16 @@ with st.sidebar:
         unsafe_allow_html=True
     )
 
-    st.subheader("Photo Scanner")
-    scanner_key = f"sidebar_photo_scanner_{st.session_state.scanner_input_version}"
-    scanned_photo = st.camera_input("Take a photo to scan its text", key=scanner_key)
-    if scanned_photo:
-        photo_hash = hashlib.sha256(scanned_photo.getvalue()).hexdigest()
-        if st.session_state.get("scanned_photo_hash") != photo_hash:
-            st.session_state.scanned_photo_bytes = scanned_photo.getvalue()
-            st.session_state.scanned_photo_mime = scanned_photo.type or "image/jpeg"
-            try:
-                st.session_state.scanned_photo_text = scan_photo_text(scanned_photo)
-                st.session_state.scanned_photo_hash = photo_hash
-            except pytesseract.TesseractNotFoundError:
-                st.session_state.scanned_photo_text = "OCR is unavailable. Install Tesseract OCR on the server."
-                st.session_state.scanned_photo_hash = photo_hash
-            except (OSError, ValueError):
-                st.session_state.scanned_photo_text = "The photo could not be read. Try taking it again."
-                st.session_state.scanned_photo_hash = photo_hash
-            st.session_state.scanner_actions_open = False
-    if st.session_state.get("scanned_photo_bytes"):
-        st.image(st.session_state.scanned_photo_bytes, caption="Captured photo", use_container_width=True)
-        if st.button("OPEN PHOTO ACTIONS", use_container_width=True, key="open_scanner_actions"):
-            st.session_state.scanner_actions_open = True
-        if st.session_state.get("scanner_actions_open"):
-            with st.container(border=True):
-                st.caption("Photo actions")
-                action_col1, action_col2, action_col3 = st.columns(3)
-                with action_col1:
-                    if st.button("RETAKE", use_container_width=True, key="retake_scanner_photo"):
-                        st.session_state.scanned_photo_bytes = None
-                        st.session_state.scanned_photo_hash = None
-                        st.session_state.scanned_photo_text = ""
-                        st.session_state.scanner_actions_open = False
-                        st.session_state.scanner_input_version += 1
-                        st.rerun()
-                with action_col2:
-                    if st.button("DELETE", use_container_width=True, key="delete_scanner_photo"):
-                        photo_hash = st.session_state.get("scanned_photo_hash")
-                        kept_photos = []
-                        for photo in st.session_state.scanner_photos:
-                            if photo.get("hash") == photo_hash:
-                                delete_scanner_photo(photo.get("file", ""))
-                            else:
-                                kept_photos.append(photo)
-                        st.session_state.scanner_photos = kept_photos
-                        persist_state()
-                        st.session_state.scanned_photo_bytes = None
-                        st.session_state.scanned_photo_hash = None
-                        st.session_state.scanned_photo_text = ""
-                        st.session_state.scanner_actions_open = False
-                        st.session_state.scanner_input_version += 1
-                        st.rerun()
-                with action_col3:
-                    if st.button("SAVE FILE", use_container_width=True, key="save_scanner_photo"):
-                        photo_hash = st.session_state.get("scanned_photo_hash")
-                        if not any(photo.get("hash") == photo_hash for photo in st.session_state.scanner_photos):
-                            photo_id = str(uuid.uuid4())
-                            relative_path = save_scanner_photo(
-                                st.session_state.scanned_photo_bytes,
-                                st.session_state.get("scanned_photo_mime", "image/jpeg"),
-                                photo_id,
-                            )
-                            st.session_state.scanner_photos.append({
-                                "id": photo_id,
-                                "hash": photo_hash,
-                                "file": relative_path,
-                                "saved_at": manila_now().isoformat(),
-                            })
-                            persist_state()
-                            st.success("Photo saved to the project archive.")
-                        else:
-                            st.info("This photo is already saved.")
-        scanned_text = st.session_state.get("scanned_photo_text", "")
-        if scanned_text:
-            st.text_area("Scanned text", value=scanned_text, height=160,
-                         key="sidebar_scanned_text", disabled=True)
-            scanned_fields = parse_scanned_receipt(scanned_text)
-            st.caption(
-                f"Detected: {scanned_fields['name'] or 'item not found'} | "
-                f"Qty {scanned_fields['qty']} | PHP {scanned_fields['price']:,.2f}"
-            )
-            if st.button("USE SCAN IN MATERIAL ENTRY", use_container_width=True,
-                         key="use_scanned_material"):
-                st.session_state.material_name = scanned_fields["name"]
-                st.session_state.material_price = scanned_fields["price"] or None
-                st.session_state.material_qty = scanned_fields["qty"]
-                st.session_state.material_delivery = scanned_fields["delivery"] or None
-                set_view("material")
-        else:
-            st.info("No text was detected in the photo.")
+    st.markdown(
+        "<div class='photo-scanner-title'>PHOTO SCANNER</div>"
+        "<div class='photo-scanner-subtitle'>Capture receipts and project progress</div>",
+        unsafe_allow_html=True,
+    )
+    if st.button("📷 TAKE PHOTO", use_container_width=True, key="take_photo_sidebar"):
+        set_view("photo_scanner")
+
+    if st.button("📝 NOTES", use_container_width=True, key="sidebar_notes_popup"):
+        notes_dialog()
 
     st.subheader("Executive Overview")
     if st.button("📊   Dashboard   ›", use_container_width=True, key="side_dashboard"):
@@ -1534,6 +1735,10 @@ with st.sidebar:
         set_view("planner_input")
     if st.button("📅   Schedule & Progress   ›", use_container_width=True, key="side_schedule"):
         set_view("planner_output")
+    if st.button("🧰   Project Tools   ›", use_container_width=True, key="side_project_tools"):
+        set_view("project_tools")
+    if st.button("⚙️   Settings   ›", use_container_width=True, key="side_settings"):
+        settings_dialog()
 
     st.subheader("Financial Operations")
     if st.button("🧱   Material Entry   ›", use_container_width=True, key="side_material"):
@@ -2391,6 +2596,187 @@ elif view == "receipt_archive":
                     delete_report_file(report_path)
                     st.success(f"Deleted: {report_path.name}")
                     st.rerun()
+
+elif view == "settings":
+    settings = st.session_state.app_settings
+    st.markdown("## SETTINGS")
+    st.caption("Manage your account, project preferences, notifications, and security.")
+    profile_tab, preference_tab, security_tab = st.tabs(["PROFILE", "PREFERENCES", "SECURITY"])
+    with profile_tab:
+        with st.form("account_profile_form"):
+            display_name = st.text_input("Display name", value=settings.get("display_name", ""), placeholder="Your name")
+            email = st.text_input("Email address", value=settings.get("email", ""), placeholder="name@example.com")
+            if st.form_submit_button("SAVE PROFILE", use_container_width=True):
+                if email and ("@" not in email or "." not in email.rsplit("@", 1)[-1]):
+                    st.error("Enter a valid email address.")
+                else:
+                    settings.update({"display_name": display_name.strip(), "email": email.strip()})
+                    persist_state()
+                    st.success("Profile saved.")
+    with preference_tab:
+        with st.form("app_preferences_form"):
+            dark_mode = st.checkbox("Dark mode", value=bool(st.session_state.dark_mode))
+            client_mode = st.checkbox("Client view mode", value=bool(settings.get("client_mode", False)), help="Use this preference when preparing a client-facing project view.")
+            email_notifications = st.checkbox("Email notifications", value=bool(settings.get("email_notifications", True)))
+            budget_alerts = st.checkbox("Budget alerts", value=bool(settings.get("budget_alerts", True)))
+            date_format = st.selectbox("Date format", ["%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y"], index=["%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y"].index(settings.get("date_format", "%Y-%m-%d")))
+            if st.form_submit_button("SAVE PREFERENCES", use_container_width=True):
+                st.session_state.dark_mode = dark_mode
+                settings.update({"client_mode": client_mode, "email_notifications": email_notifications, "budget_alerts": budget_alerts, "date_format": date_format})
+                persist_state()
+                st.success("Preferences saved.")
+                st.rerun()
+    with security_tab:
+        st.markdown("### Account access")
+        if LOGIN_PASSWORD:
+            st.success("Workspace password login is enabled.")
+            if st.button("SIGN OUT", use_container_width=True, key="settings_sign_out"):
+                st.session_state.authenticated = False
+                st.rerun()
+        else:
+            st.info("Password login is disabled. Set AILYN_LOGIN_PASSWORD to protect this workspace.")
+        st.markdown("### Social login readiness")
+        google_ready = bool(os.getenv("GOOGLE_CLIENT_ID"))
+        facebook_ready = bool(os.getenv("FACEBOOK_APP_ID"))
+        st.write(f"Google login: {'Configured' if google_ready else 'Needs OAuth configuration'}")
+        st.write(f"Facebook login: {'Configured' if facebook_ready else 'Needs OAuth configuration'}")
+        st.caption("Social login requires provider credentials, redirect URLs, and HTTPS. Add those through your deployment secrets; never save client secrets in app data.")
+        st.markdown("### Data protection")
+        st.write(f"Database backups available: {history_count() > 0}")
+        if st.button("CREATE BACKUP", use_container_width=True, key="settings_backup"):
+            backup_path = create_backup()
+            with open(backup_path, "rb") as backup_file:
+                st.download_button("DOWNLOAD BACKUP", backup_file.read(), file_name=os.path.basename(backup_path), mime="application/octet-stream", use_container_width=True, key="settings_download_backup")
+
+elif view == "photo_scanner":
+    st.markdown("## PHOTO STUDIO")
+    st.caption("Capture a receipt or project update. The app will read and organize the photo for you.")
+    studio_capture, studio_status = st.columns([1.25, 0.75])
+    with studio_capture:
+        st.markdown("### Camera")
+        st.markdown("Use your device camera to create a clear project record.")
+        if st.button("📷 OPEN CAMERA", use_container_width=True, key="open_photo_studio"):
+            st.session_state.scanner_open = True
+            st.rerun()
+        if st.session_state.scanner_open:
+            photo_camera_dialog()
+    with studio_status:
+        st.markdown("### Studio status")
+        st.metric("Saved photos", len(st.session_state.get("scanner_photos", [])))
+        if st.session_state.get("scanned_photo_bytes"):
+            st.success("Photo ready for review")
+            st.caption("Review the scan, save the file, or retake the photo from the camera window.")
+        else:
+            st.info("No photo captured yet")
+        if st.button("OPEN PHOTO GALLERY", use_container_width=True, key="studio_gallery"):
+            set_view("project_tools")
+    if st.button("BACK TO DASHBOARD", key="studio_back"):
+        set_view("home")
+
+elif view == "project_tools":
+    st.subheader("PROJECT TOOLS")
+    st.caption("Organize project evidence, find records quickly, and prepare focused reports.")
+    tools_gallery, tools_search, tools_cleanup = st.tabs(["PHOTO GALLERY", "SEARCH & REPORTS", "DATA CLEANUP"])
+
+    with tools_gallery:
+        uploaded_photos = st.file_uploader("Add project photos", type=["jpg", "jpeg", "png", "webp"], accept_multiple_files=True, key="project_photo_uploads")
+        upload_tag = st.selectbox("Photo category", ["General", "Before", "After", "Framing", "Electrical", "Plumbing", "Painting", "Inspection"], key="project_photo_tag")
+        if uploaded_photos and st.button("SAVE ALL PHOTOS", use_container_width=True, key="save_project_photos"):
+            existing_hashes = {photo.get("hash") for photo in st.session_state.scanner_photos}
+            saved_count = 0
+            for uploaded in uploaded_photos:
+                photo_bytes, photo_mime = normalize_photo_bytes(uploaded.getvalue(), uploaded.type or "image/jpeg")
+                photo_hash = hashlib.sha256(photo_bytes).hexdigest()
+                if photo_hash in existing_hashes:
+                    continue
+                photo_id = str(uuid.uuid4())
+                relative_path = save_scanner_photo(photo_bytes, photo_mime, photo_id)
+                st.session_state.scanner_photos.append({"id": photo_id, "hash": photo_hash, "file": relative_path, "tag": upload_tag, "saved_at": manila_now().isoformat()})
+                existing_hashes.add(photo_hash)
+                saved_count += 1
+            persist_state()
+            st.success(f"Saved {saved_count} new photo(s).")
+        photos = st.session_state.get("scanner_photos", [])
+        if not photos:
+            st.info("No saved project photos yet.")
+        else:
+            selected_tag = st.selectbox("Filter photos", ["All"] + sorted({photo.get("tag", "General") for photo in photos}), key="gallery_filter")
+            visible_photos = [photo for photo in photos if selected_tag == "All" or photo.get("tag", "General") == selected_tag]
+            gallery_columns = st.columns(4)
+            for index, photo in enumerate(visible_photos):
+                photo_path = os.path.abspath(os.path.join(APP_DIR, photo.get("file", "")))
+                if not os.path.isfile(photo_path):
+                    continue
+                with gallery_columns[index % 4]:
+                    with open(photo_path, "rb") as image_file:
+                        image_bytes = image_file.read()
+                    st.image(image_bytes, use_container_width=True)
+                    st.caption(f"{photo.get('tag', 'General')} | {photo.get('saved_at', '')[:10]}")
+                    st.download_button("DOWNLOAD", image_bytes, file_name=os.path.basename(photo_path), key=f"download_photo_{photo['id']}", use_container_width=True)
+            if len(visible_photos) >= 2:
+                st.markdown("#### BEFORE / AFTER COMPARISON")
+                photo_options = {f"{photo.get('tag', 'General')} | {photo.get('saved_at', '')[:10]} | {photo['id'][:8]}": photo for photo in visible_photos}
+                compare_left, compare_right = st.columns(2)
+                with compare_left:
+                    left_label = st.selectbox("Before photo", list(photo_options), key="compare_left")
+                with compare_right:
+                    right_label = st.selectbox("After photo", list(photo_options), index=min(1, len(photo_options) - 1), key="compare_right")
+                comparison_columns = st.columns(2)
+                for column, label in zip(comparison_columns, (left_label, right_label)):
+                    comparison_path = os.path.join(APP_DIR, photo_options[label].get("file", ""))
+                    if os.path.isfile(comparison_path):
+                        with column:
+                            st.image(comparison_path, use_container_width=True)
+
+    with tools_search:
+        query = st.text_input("Search materials, labor, payroll, and tasks", key="global_search").strip().lower()
+        all_records = searchable_records(st.session_state)
+        all_records += [{"category": "Task", **task} for task in st.session_state.get("planner_tasks", [])]
+        results = [record for record in all_records if not query or query in " ".join(str(value) for value in record.values()).lower()]
+        st.metric("Matching records", len(results))
+        if results:
+            st.dataframe(results, use_container_width=True, hide_index=True)
+        else:
+            st.info("No matching records.")
+        st.markdown("#### CUSTOM REPORT")
+        report_type = st.selectbox("Report data", ["All records", "Materials only", "Expenses only"], key="custom_report_type")
+        report_records = [record for record in all_records if report_type == "All records" or record.get("category") == report_type.removesuffix(" only")]
+        report_records = [{
+            "type": "material" if record.get("category") == "Material" else "expense",
+            "date": record.get("date", record.get("month", "")),
+            "qty": record.get("qty", 1),
+            "name": record.get("name", record.get("item", record.get("description", ""))),
+            "price": record.get("price", record.get("amount", record.get("net", 0))),
+            "delivery": record.get("delivery", 0),
+            "amount": record.get("amount", record.get("price", record.get("net", 0))),
+        } for record in report_records if record.get("category") != "Task"]
+        report_html = build_html_report(report_records, st.session_state.budget, custom_title="CUSTOM PROJECT REPORT")
+        st.download_button("DOWNLOAD CUSTOM REPORT", report_html, file_name="custom_project_report.html", mime="text/html", use_container_width=True)
+
+    with tools_cleanup:
+        duplicate_groups = find_duplicate_records(searchable_records(st.session_state))
+        st.metric("Duplicate groups", len(duplicate_groups))
+        for group in duplicate_groups:
+            st.warning("Duplicate: " + " | ".join(str(item.get("name", item.get("item", item.get("description", "record")))) for item in group))
+        if duplicate_groups and st.button("REMOVE DUPLICATE RECORDS", use_container_width=True, key="remove_duplicates"):
+            seen = set()
+            for key in ("records", "labor_records", "payroll_expenses"):
+                kept = []
+                for record in st.session_state.get(key, []):
+                    signature = (record.get("type", key), str(record.get("name", record.get("item", record.get("description", "")))).strip().lower(), round(float(record.get("amount", record.get("price", record.get("net", 0))) or 0), 2), record.get("date", record.get("month", "")))
+                    if signature not in seen:
+                        seen.add(signature)
+                        kept.append(record)
+                st.session_state[key] = kept
+            persist_state()
+            st.success("Duplicate records removed; the first copy was kept.")
+            st.rerun()
+        st.markdown("#### DISPLAY")
+        dark_mode = st.toggle("Dark mode", value=st.session_state.dark_mode, key="dark_mode_toggle")
+        if dark_mode != st.session_state.dark_mode:
+            st.session_state.dark_mode = dark_mode
+            persist_state()
+            st.rerun()
 
 elif view == "update":
     st.markdown("## Upgrade Center")

@@ -39,8 +39,10 @@ def test_sqlite_save_and_reset(monkeypatch, tmp_path):
     monkeypatch.setattr(storage, "BACKUP_DIR", str(tmp_path / "backups"))
     state = storage.load_state()
     state["records"] = [{"id": "receipt-1", "amount": 99}]
+    state["client_notes"] = [{"id": "note-1", "folder": "Client Approval", "text": "Approved", "created_at": "2026-08-27T10:00:00+08:00"}]
     storage.save_state(state)
     assert storage.load_state()["records"][0]["id"] == "receipt-1"
+    assert storage.load_state()["client_notes"][0]["folder"] == "Client Approval"
     storage.save_state({**state, "records": []})
     assert storage.load_state()["records"] == []
     backup = storage.create_backup()
