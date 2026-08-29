@@ -262,11 +262,110 @@ ADMIN_PASSWORD = os.getenv("AILYN_ADMIN_PASSWORD", "")
 UPDATE_SIGNING_KEY = os.getenv("AILYN_UPDATE_SIGNING_KEY", "")
 LOGIN_PASSWORD = os.getenv("AILYN_LOGIN_PASSWORD", "")
 
+# ================================================================
+# OWN APP LOGO / FAVICON
+# The app uses its embedded Ailyn House logo, so no external logo
+# website or CDN is required. Replace AILYN_LOGO_DATA above with
+# your own PNG/JPG data URI if you want a different logo.
+# ================================================================
+try:
+    _logo_b64 = AILYN_LOGO_DATA.split(",", 1)[1]
+    APP_LOGO_IMAGE = Image.open(BytesIO(base64.b64decode(_logo_b64))).convert("RGBA")
+except Exception:
+    APP_LOGO_IMAGE = None
+
+# ================================================================
+# CUSTOM HOME-SCREEN / PWA SUPPORT
+# ================================================================
+# Streamlit itself does not provide a native manifest.json editor.
+# These endpoints expose the app's PWA metadata when the app is
+# hosted behind a normal web server/proxy that routes these paths.
+# The browser can then use the supplied 192x192 and 512x512 icons.
+# ================================================================
+
+PWA_APP_NAME = APP_NAME
+PWA_SHORT_NAME = "Ailyn Planner"
+PWA_THEME_COLOR = "#071b11"
+
+def _pwa_manifest():
+    return {
+        "name": PWA_APP_NAME,
+        "short_name": PWA_SHORT_NAME,
+        "start_url": "./",
+        "scope": "./",
+        "display": "standalone",
+        "orientation": "portrait-primary",
+        "background_color": PWA_THEME_COLOR,
+        "theme_color": PWA_THEME_COLOR,
+        "description": "Ailyn House project planner",
+        "icons": [
+            {
+                "src": "logo-192.png",
+                "sizes": "192x192",
+                "type": "image/png",
+                "purpose": "any maskable"
+            },
+            {
+                "src": "logo-512.png",
+                "sizes": "512x512",
+                "type": "image/png",
+                "purpose": "any maskable"
+            }
+        ]
+    }
+
+def _pwa_manifest_json():
+    return json.dumps(_pwa_manifest(), separators=(",", ":"))
+
+def _pwa_install_metadata():
+    # The meta/link tags below are injected into the app HTML.
+    # They are harmless if the deployment proxy does not expose
+    # the manifest/icon paths, and become active when those files
+    # are served by the deployment.
+    return f"""
+    <link rel="manifest" href="./manifest.json">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="{html.escape(PWA_SHORT_NAME)}">
+    <meta name="theme-color" content="{PWA_THEME_COLOR}">
+    <link rel="apple-touch-icon" href="./logo-192.png">
+    """
+
+
+
+def render_pwa_install_info():
+    st.markdown(
+        """
+        <div style="
+            padding:14px 16px;
+            border:1px solid rgba(114,247,176,.22);
+            border-radius:14px;
+            background:rgba(114,247,176,.06);
+            margin:10px 0;
+        ">
+            <b>📱 ADD TO PHONE HOME SCREEN</b><br>
+            <span style="opacity:.8;font-size:13px;">
+            Open this app in your phone browser and choose
+            <b>Add to Home screen</b>. The custom app icon is supplied
+            by the PWA manifest when the deployment serves the icon files.
+            </span>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
 st.set_page_config(
     page_title=APP_NAME,
-    page_icon="🅰️",
+    page_icon=APP_LOGO_IMAGE if APP_LOGO_IMAGE is not None else "🏠",
     layout="wide",
 )
+
+# CUSTOM PWA BRANDING ACTIVE
+# Browser favicon is configured by st.set_page_config(page_icon=...).
+# The manifest/apple-touch-icon metadata is available for deployments
+# that expose manifest.json and the icon assets.
+
 
 if LOGIN_PASSWORD and not st.session_state.get("authenticated"):
     st.title("Ailyn House Project")
@@ -1361,14 +1460,6 @@ input,textarea{color:#fff!important;-webkit-text-fill-color:#fff!important}input
 @media(max-width:600px){.headbar-card{display:block}.headbar-title{font-size:21px!important;gap:10px}.headbar-title img{width:52px;height:52px}.headbar-subtitle{margin-left:62px;font-size:8px}.headbar-time{margin-top:12px;display:inline-block}.hero-row{align-items:flex-start}.hero-logo{width:60px;height:60px}.hero-title{font-size:25px}.hero-sub{font-size:9px;letter-spacing:.14em}.dash-section{padding:16px}.tx-row{gap:8px}.tx-right{font-size:11px}.open-planner{width:100%;text-align:center}.sidebar-brand{padding:14px}}
 @media(prefers-reduced-motion:reduce){*,*:before,*:after{animation:none!important;transition:none!important}}
 
-    /* Planner full-month calendar cells */
-    [data-testid="stHorizontalBlock"] [data-testid="stButton"] button {
-        min-height: 58px;
-        border-radius: 12px;
-        font-weight: 900;
-        white-space: pre-line;
-    }
-
     /* UHD 4K rendering helpers */
 img{image-rendering:auto;-webkit-font-smoothing:antialiased;text-rendering:geometricPrecision}
 html,body,[class*="css"],button,input,textarea,select{ -webkit-font-smoothing:antialiased!important; -moz-osx-font-smoothing:grayscale!important; text-rendering:geometricPrecision!important; }
@@ -1986,174 +2077,86 @@ elif view == "payroll_dashboard":
 
 elif view == "planner_input":
     st.subheader("📅 PLANNER INPUT - ADD NEW WORK TASK")
-    st.caption("Choose a date from the monthly calendar, then enter the work details and optional photo proofs.")
+    st.caption("Select the exact day from the monthly calendar, then enter the work details.")
 
-    # ------------------------------------------------------------------
-    # FULL MONTHLY CALENDAR
-    # Click a day to select it. Existing task dates are marked with •.
-    # ------------------------------------------------------------------
+    # ================================================================
+    # ACCURATE MONTHLY CALENDAR
+    # Uses Python's calendar.monthrange/monthcalendar with Sunday as
+    # the first column. Every cell is a real date in the displayed month.
+    # ================================================================
     import calendar as _calendar
     from datetime import date as _date, timedelta as _timedelta
 
-    if "planner_calendar_month" not in st.session_state:
+    if "planner_calendar_year" not in st.session_state or "planner_calendar_month_num" not in st.session_state:
         _today = manila_now().date()
-        st.session_state.planner_calendar_month = _today.replace(day=1)
+        st.session_state.planner_calendar_year = _today.year
+        st.session_state.planner_calendar_month_num = _today.month
 
     if "planner_selected_date" not in st.session_state:
         st.session_state.planner_selected_date = manila_now().date()
 
-    calendar_month = st.session_state.planner_calendar_month
-    calendar_year = calendar_month.year
-    calendar_month_num = calendar_month.month
+    cal_year = int(st.session_state.planner_calendar_year)
+    cal_month = int(st.session_state.planner_calendar_month_num)
 
-    # Month navigation
-    nav_left, nav_title, nav_right = st.columns([1, 6, 1])
-    with nav_left:
+    # Existing saved task dates
+    task_dates = {}
+    for task in st.session_state.get("planner_tasks", []):
+        try:
+            task_date = _date.fromisoformat(str(task.get("date_obj", "")))
+            task_dates.setdefault(task_date, []).append(task)
+        except (TypeError, ValueError):
+            pass
+
+    # ------------------------------------------------
+    # Month navigation — arithmetic is date-safe.
+    # ------------------------------------------------
+    nav_prev, nav_title, nav_next = st.columns([1, 6, 1])
+
+    with nav_prev:
         if st.button("‹", key="planner_prev_month", use_container_width=True):
-            first = calendar_month
-            prev_last = first - _timedelta(days=1)
-            st.session_state.planner_calendar_month = prev_last.replace(day=1)
+            if cal_month == 1:
+                cal_year -= 1
+                cal_month = 12
+            else:
+                cal_month -= 1
+            st.session_state.planner_calendar_year = cal_year
+            st.session_state.planner_calendar_month_num = cal_month
             st.rerun()
 
     with nav_title:
         st.markdown(
-            f"<div class='planner-month-title'>"
-            f"{_calendar.month_name[calendar_month_num]} {calendar_year}"
-            f"</div>",
+            f"<div class='planner-month-title'>{_calendar.month_name[cal_month]} {cal_year}</div>",
             unsafe_allow_html=True,
         )
 
-    with nav_right:
+    with nav_next:
         if st.button("›", key="planner_next_month", use_container_width=True):
-            first = calendar_month
-            days_in_month = _calendar.monthrange(calendar_year, calendar_month_num)[1]
-            next_first = first + _timedelta(days=days_in_month)
-            st.session_state.planner_calendar_month = next_first.replace(day=1)
+            if cal_month == 12:
+                cal_year += 1
+                cal_month = 1
+            else:
+                cal_month += 1
+            st.session_state.planner_calendar_year = cal_year
+            st.session_state.planner_calendar_month_num = cal_month
             st.rerun()
 
-    # Today button
-    today_col1, today_col2 = st.columns([1, 5])
-    with today_col1:
-        if st.button("TODAY", key="planner_today", use_container_width=True):
-            today = manila_now().date()
-            st.session_state.planner_calendar_month = today.replace(day=1)
-            st.session_state.planner_selected_date = today
-            st.rerun()
+    today = manila_now().date()
 
-    # Build task-date lookup
-    task_dates = {}
-    for task in st.session_state.get("planner_tasks", []):
-        raw_date = task.get("date_obj", "")
-        try:
-            task_date = _date.fromisoformat(raw_date)
-            task_dates.setdefault(task_date, []).append(task)
-        except (TypeError, ValueError):
-            continue
+    if st.button("TODAY", key="planner_today", use_container_width=True):
+        st.session_state.planner_calendar_year = today.year
+        st.session_state.planner_calendar_month_num = today.month
+        st.session_state.planner_selected_date = today
+        st.rerun()
 
-    # Calendar CSS
-    st.markdown("""
-    <style>
-    .planner-calendar {
-        width: 100%;
-        border: 1px solid rgba(163,255,194,.16);
-        border-radius: 18px;
-        overflow: hidden;
-        background: rgba(5,29,17,.55);
-        margin: 8px 0 18px 0;
-    }
-    .planner-week-header {
-        display: grid;
-        grid-template-columns: repeat(7, 1fr);
-        background: rgba(114,247,176,.08);
-        border-bottom: 1px solid rgba(163,255,194,.12);
-    }
-    .planner-week-day {
-        padding: 10px 4px;
-        text-align: center;
-        font-size: 11px;
-        font-weight: 900;
-        color: #a8dcb8;
-        letter-spacing: .08em;
-    }
-    .planner-selected-info {
-        border: 1px solid rgba(114,247,176,.25);
-        background: rgba(114,247,176,.07);
-        border-radius: 13px;
-        padding: 10px 14px;
-        margin-bottom: 14px;
-        color: #eaffef;
-        font-weight: 800;
-    }
-    .planner-task-dot {
-        font-size: 10px;
-        color: #72f7b0;
-        font-weight: 900;
-        display: block;
-        min-height: 12px;
-    }
-    @media(max-width:600px) {
-        .planner-calendar {
-            border-radius: 13px;
-        }
-        .planner-week-day {
-            font-size: 9px;
-            padding: 8px 2px;
-        }
-    }
-    </style>
-    """, unsafe_allow_html=True)
-
-    # Weekday header
-    st.markdown(
-        '<div class="planner-calendar"><div class="planner-week-header">'
-        + "".join(
-            f'<div class="planner-week-day">{day}</div>'
-            for day in ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"]
-        )
-        + '</div></div>',
-        unsafe_allow_html=True,
-    )
-
-    # Streamlit buttons are used for every calendar cell so the dates are
-    # genuinely clickable/selectable, while CSS makes them look like a
-    # calendar grid.
-    weeks = _calendar.monthcalendar(calendar_year, calendar_month_num)
-
-    for week_index, week in enumerate(weeks):
-        cols = st.columns(7, gap="small")
-        for day_index, day_number in enumerate(week):
-            with cols[day_index]:
-                if day_number == 0:
-                    st.markdown(
-                        "<div style='height:64px;'></div>",
-                        unsafe_allow_html=True,
-                    )
-                    continue
-
-                cell_date = _date(calendar_year, calendar_month_num, day_number)
-                has_tasks = cell_date in task_dates
-                is_selected = cell_date == st.session_state.planner_selected_date
-                is_today = cell_date == manila_now().date()
-
-                if is_selected:
-                    label_prefix = "🟢 "
-                elif is_today:
-                    label_prefix = "● "
-                else:
-                    label_prefix = ""
-
-                task_marker = "•" if has_tasks else " "
-                button_label = f"{label_prefix}{day_number}\n{task_marker}"
-
-                if st.button(
-                    button_label,
-                    key=f"planner_day_{calendar_year}_{calendar_month_num}_{day_number}",
-                    use_container_width=True,
-                ):
-                    st.session_state.planner_selected_date = cell_date
-                    st.rerun()
-
-    selected_date = st.session_state.planner_selected_date
+    # Normalize selected date so stale session-state values cannot create
+    # an invalid calendar selection.
+    try:
+        selected_date = st.session_state.planner_selected_date
+        if not isinstance(selected_date, _date):
+            selected_date = _date.fromisoformat(str(selected_date))
+    except (TypeError, ValueError):
+        selected_date = today
+        st.session_state.planner_selected_date = today
 
     st.markdown(
         f"<div class='planner-selected-info'>"
@@ -2162,7 +2165,140 @@ elif view == "planner_input":
         unsafe_allow_html=True,
     )
 
-    # Existing task entry fields remain below the calendar.
+    # Calendar layout.
+    # Calendar(..., firstweekday=SUNDAY) returns complete Sunday-first weeks.
+    sunday_first_calendar = _calendar.Calendar(firstweekday=_calendar.SUNDAY)
+    month_weeks = sunday_first_calendar.monthdayscalendar(cal_year, cal_month)
+
+    # Integrity checks prevent silent off-by-one errors.
+    expected_days = _calendar.monthrange(cal_year, cal_month)[1]
+    rendered_days = [d for week in month_weeks for d in week if d]
+    if rendered_days != list(range(1, expected_days + 1)):
+        raise RuntimeError(
+            f"Planner calendar error for {cal_year}-{cal_month:02d}: "
+            f"rendered days do not match 1..{expected_days}."
+        )
+    if any(len(week) != 7 for week in month_weeks):
+        raise RuntimeError(
+            f"Planner calendar error for {cal_year}-{cal_month:02d}: "
+            "a calendar week does not contain exactly 7 columns."
+        )
+
+    st.markdown("""
+    <style>
+    .planner-calendar-wrap {
+        border: 1px solid rgba(163,255,194,.16);
+        border-radius: 16px;
+        overflow: hidden;
+        background: rgba(5,29,17,.55);
+        margin-bottom: 16px;
+    }
+    .planner-week-header {
+        display: grid;
+        grid-template-columns: repeat(7, minmax(0, 1fr));
+        background: rgba(114,247,176,.08);
+        border-bottom: 1px solid rgba(163,255,194,.12);
+    }
+    .planner-week-header div {
+        text-align: center;
+        padding: 10px 2px;
+        font-size: 10px;
+        font-weight: 900;
+        color: #a8dcb8;
+    }
+    .planner-empty-cell {
+        height: 66px;
+    }
+    .planner-day-cell {
+        min-height: 66px;
+        padding: 3px;
+    }
+    .planner-day-number {
+        font-size: 15px;
+        font-weight: 900;
+        line-height: 1;
+    }
+    .planner-day-dot {
+        font-size: 13px;
+        line-height: 1;
+        color: #72f7b0;
+    }
+    @media(max-width:600px) {
+        .planner-week-header div {
+            font-size: 8px;
+            padding: 8px 1px;
+        }
+        .planner-empty-cell,
+        .planner-day-cell {
+            min-height: 54px;
+            height: 54px;
+        }
+        .planner-day-number {
+            font-size: 13px;
+        }
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # Header is separate from the date buttons so the actual date grid
+    # always has exactly seven columns.
+    st.markdown(
+        "<div class='planner-calendar-wrap'>"
+        "<div class='planner-week-header'>"
+        "<div>SUN</div><div>MON</div><div>TUE</div><div>WED</div>"
+        "<div>THU</div><div>FRI</div><div>SAT</div>"
+        "</div></div>",
+        unsafe_allow_html=True,
+    )
+
+    # IMPORTANT: do not use a flat list of dates here.
+    # Render each real calendar week as exactly seven Streamlit columns.
+    for week_idx, week in enumerate(month_weeks):
+        cols = st.columns(7, gap="small")
+
+        for weekday_idx, day_num in enumerate(week):
+            with cols[weekday_idx]:
+                if day_num == 0:
+                    st.markdown(
+                        "<div class='planner-empty-cell'></div>",
+                        unsafe_allow_html=True,
+                    )
+                    continue
+
+                cell_date = _date(cal_year, cal_month, day_num)
+                is_selected = cell_date == selected_date
+                is_today = cell_date == today
+                has_task = cell_date in task_dates
+
+                # Keep the button label simple and deterministic.
+                if is_today and has_task:
+                    label = f"🟢 {day_num}\n•"
+                elif is_today:
+                    label = f"🟢 {day_num}"
+                elif has_task:
+                    label = f"{day_num}\n•"
+                else:
+                    label = str(day_num)
+
+                if st.button(
+                    label,
+                    key=f"planner_calendar_{cal_year}_{cal_month}_{week_idx}_{weekday_idx}_{day_num}",
+                    use_container_width=True,
+                ):
+                    st.session_state.planner_selected_date = cell_date
+                    st.rerun()
+
+    # Show the selected day and any existing tasks on that day.
+    selected_tasks = task_dates.get(selected_date, [])
+    if selected_tasks:
+        st.markdown("#### 📌 TASKS ALREADY SCHEDULED FOR THIS DATE")
+        for task in selected_tasks:
+            st.info(
+                f"{task.get('name', 'WORK TASK')} — "
+                f"{task.get('phase', 'Phase')} — "
+                f"{task.get('status', 'Not Started')}"
+            )
+
     with st.form(key="planner_input_form", clear_on_submit=True):
         work_description = st.text_area(
             "Work Description / Task Details",
@@ -2170,13 +2306,20 @@ elif view == "planner_input":
         )
         phase = st.selectbox(
             "Construction Phase",
-            ["Site Prep", "Foundation", "Framing & Masonry", "Roofing",
-             "Plumbing & Electrical", "Finishing", "Inspection"]
+            [
+                "Site Prep",
+                "Foundation",
+                "Framing & Masonry",
+                "Roofing",
+                "Plumbing & Electrical",
+                "Finishing",
+                "Inspection",
+            ],
         )
         uploaded_files = st.file_uploader(
             "Upload Work Proof Photos (Optional)",
             type=["jpg", "jpeg", "png"],
-            accept_multiple_files=True
+            accept_multiple_files=True,
         )
         submitted = st.form_submit_button(
             "💾 SAVE TASK TO PERMANENT STORAGE"
@@ -2185,6 +2328,7 @@ elif view == "planner_input":
         if submitted:
             if work_description.strip():
                 photos_base64 = []
+
                 if uploaded_files:
                     for file in uploaded_files:
                         bytes_data = file.read()
@@ -2194,20 +2338,22 @@ elif view == "planner_input":
                             f"data:{mime_type};base64,{b64_str}"
                         )
 
+                # Save the exact selected calendar date.
                 st.session_state.planner_tasks.append({
                     "id": str(time.time()),
                     "day": selected_date.strftime("%d"),
                     "month": selected_date.strftime("%B"),
                     "year": selected_date.strftime("%Y"),
-                    "date_obj": selected_date.strftime("%Y-%m-%d"),
+                    "date_obj": selected_date.isoformat(),
                     "name": work_description.upper(),
                     "phase": phase,
                     "status": "Not Started",
-                    "photos": photos_base64
+                    "photos": photos_base64,
                 })
+
                 persist_state()
                 st.success(
-                    f"Task saved for {selected_date.strftime('%B %d, %Y')}!"
+                    f"Task saved for {selected_date.strftime('%A, %B %d, %Y')}!"
                 )
                 st.rerun()
             else:
@@ -2217,89 +2363,303 @@ elif view == "planner_input":
     if st.button("🏠 RETURN TO HOME", use_container_width=True):
         set_view("home")
 
+
 elif view == "planner_output":
-    st.subheader("📋 PLANNER OUTPUT - WORK SCHEDULE CALENDAR")
-    tasks = st.session_state.planner_tasks
-    if not tasks:
-        st.info("No work scheduled yet.")
+    st.subheader("📆 PLANNER OUTPUT - FULL MONTH CALENDAR")
+    st.caption("Full monthly project calendar with scheduled work tasks. Download it as a PNG image.")
+
+    import calendar as _calendar
+    from datetime import date as _date
+
+    # Use the same exact Sunday-first Gregorian calculation as Planner Input.
+    if "planner_output_year" not in st.session_state or "planner_output_month" not in st.session_state:
+        _today = manila_now().date()
+        st.session_state.planner_output_year = _today.year
+        st.session_state.planner_output_month = _today.month
+
+    output_year = int(st.session_state.planner_output_year)
+    output_month = int(st.session_state.planner_output_month)
+
+    nav_prev, nav_title, nav_next = st.columns([1, 6, 1])
+    with nav_prev:
+        if st.button("‹", key="planner_output_prev_month", use_container_width=True):
+            if output_month == 1:
+                output_year -= 1
+                output_month = 12
+            else:
+                output_month -= 1
+            st.session_state.planner_output_year = output_year
+            st.session_state.planner_output_month = output_month
+            st.rerun()
+
+    with nav_title:
+        st.markdown(
+            f"<div class='planner-month-title'>{_calendar.month_name[output_month]} {output_year}</div>",
+            unsafe_allow_html=True,
+        )
+
+    with nav_next:
+        if st.button("›", key="planner_output_next_month", use_container_width=True):
+            if output_month == 12:
+                output_year += 1
+                output_month = 1
+            else:
+                output_month += 1
+            st.session_state.planner_output_year = output_year
+            st.session_state.planner_output_month = output_month
+            st.rerun()
+
+    if st.button("TODAY", key="planner_output_today", use_container_width=True):
+        today = manila_now().date()
+        st.session_state.planner_output_year = today.year
+        st.session_state.planner_output_month = today.month
+        st.rerun()
+
+    output_calendar = _calendar.Calendar(
+        firstweekday=_calendar.SUNDAY
+    ).monthdayscalendar(output_year, output_month)
+
+    # Build task lookup using the exact stored ISO date.
+    output_tasks = {}
+    for task in st.session_state.get("planner_tasks", []):
+        try:
+            task_date = _date.fromisoformat(str(task.get("date_obj", "")))
+            output_tasks.setdefault(task_date, []).append(task)
+        except (TypeError, ValueError):
+            continue
+
+    # ---------------------------------------------------------------
+    # Full calendar HTML used for BOTH on-screen display and PNG export.
+    # This avoids downloading only the visible Streamlit widgets.
+    # ---------------------------------------------------------------
+    import html as _html
+
+    today = manila_now().date()
+    month_name = _calendar.month_name[output_month]
+
+    rows_html = ""
+    for week in output_calendar:
+        rows_html += "<tr>"
+        for day_num in week:
+            if day_num == 0:
+                rows_html += "<td class='empty'></td>"
+                continue
+
+            cell_date = _date(output_year, output_month, day_num)
+            tasks = output_tasks.get(cell_date, [])
+            is_today = cell_date == today
+
+            task_html = ""
+            for task in tasks:
+                status = task.get("status", "Not Started")
+                phase = task.get("phase", "")
+                name = _html.escape(str(task.get("name", "WORK TASK")))
+                phase = _html.escape(str(phase))
+                status = _html.escape(str(status))
+
+                task_html += (
+                    f"<div class='task'>"
+                    f"<b>{name}</b>"
+                    f"<span>{phase}</span>"
+                    f"<small>{status}</small>"
+                    f"</div>"
+                )
+
+            today_class = " today" if is_today else ""
+            rows_html += (
+                f"<td class='day{today_class}'>"
+                f"<div class='day-number'>{day_num}</div>"
+                f"{task_html}"
+                f"</td>"
+            )
+        rows_html += "</tr>"
+
+    full_calendar_html = f"""
+    <div id="planner-export-calendar" class="export-calendar">
+      <div class="export-header">
+        <div class="export-brand">PROJECT WORK PLANNER</div>
+        <div class="export-title">{_html.escape(month_name)} {output_year}</div>
+        <div class="export-subtitle">FULL MONTH WORK SCHEDULE</div>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>SUNDAY</th>
+            <th>MONDAY</th>
+            <th>TUESDAY</th>
+            <th>WEDNESDAY</th>
+            <th>THURSDAY</th>
+            <th>FRIDAY</th>
+            <th>SATURDAY</th>
+          </tr>
+        </thead>
+        <tbody>{rows_html}</tbody>
+      </table>
+      <div class="export-footer">
+        Generated {today.strftime("%B %d, %Y")} • Scheduled tasks: {sum(len(v) for v in output_tasks.values())}
+      </div>
+    </div>
+    """
+
+    st.markdown("""
+    <style>
+    .export-calendar {
+        width: 100%;
+        box-sizing: border-box;
+        background: #071b11;
+        color: #effff3;
+        border: 1px solid #28543b;
+        border-radius: 18px;
+        overflow: hidden;
+        font-family: Arial, Helvetica, sans-serif;
+    }
+    .export-header {
+        padding: 22px 24px 18px;
+        text-align: center;
+        border-bottom: 1px solid #28543b;
+    }
+    .export-brand {
+        font-size: 12px;
+        font-weight: 900;
+        letter-spacing: .16em;
+        color: #72f7b0;
+    }
+    .export-title {
+        font-size: 30px;
+        font-weight: 900;
+        margin-top: 5px;
+    }
+    .export-subtitle {
+        font-size: 11px;
+        letter-spacing: .12em;
+        color: #9bc8a9;
+        margin-top: 4px;
+    }
+    .export-calendar table {
+        width: 100%;
+        border-collapse: collapse;
+        table-layout: fixed;
+    }
+    .export-calendar th {
+        height: 38px;
+        padding: 5px;
+        text-align: center;
+        font-size: 10px;
+        letter-spacing: .08em;
+        color: #9bc8a9;
+        background: #0c2718;
+        border: 1px solid #28543b;
+    }
+    .export-calendar td {
+        vertical-align: top;
+        border: 1px solid #28543b;
+    }
+    .export-calendar td.day {
+        height: 115px;
+        padding: 7px;
+        background: #071b11;
+    }
+    .export-calendar td.empty {
+        height: 115px;
+        background: #04120b;
+    }
+    .day-number {
+        font-size: 17px;
+        font-weight: 900;
+        margin-bottom: 6px;
+    }
+    .today .day-number {
+        display: inline-block;
+        padding: 4px 8px;
+        border-radius: 999px;
+        background: #72f7b0;
+        color: #06150c;
+    }
+    .task {
+        margin-top: 5px;
+        padding: 6px;
+        border-left: 3px solid #72f7b0;
+        background: #0d2b1b;
+        border-radius: 5px;
+        overflow: hidden;
+    }
+    .task b {
+        display: block;
+        font-size: 10px;
+        line-height: 1.2;
+    }
+    .task span,
+    .task small {
+        display: block;
+        margin-top: 2px;
+        font-size: 8px;
+        color: #a9cbb3;
+    }
+    .export-footer {
+        padding: 10px 16px;
+        font-size: 9px;
+        color: #83a78e;
+        text-align: right;
+        border-top: 1px solid #28543b;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    st.components.v1.html(
+        f"""
+        <!doctype html>
+        <html>
+        <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+        </head>
+        <body style="margin:0;background:transparent;">
+          {full_calendar_html}
+          <div style="padding:12px 0;text-align:center;">
+            <button id="downloadPlannerCalendar"
+              style="border:0;border-radius:10px;padding:11px 18px;
+                     font-weight:900;cursor:pointer;background:#72f7b0;color:#06150c;">
+              ⬇ DOWNLOAD FULL CALENDAR IMAGE
+            </button>
+          </div>
+          <script>
+            document.getElementById("downloadPlannerCalendar").addEventListener("click", async function () {{
+              const calendar = document.getElementById("planner-export-calendar");
+              const canvas = await html2canvas(calendar, {{
+                scale: 2,
+                useCORS: true,
+                backgroundColor: "#071b11",
+                logging: false
+              }});
+              const link = document.createElement("a");
+              link.download = "planner-calendar-{output_year}-{output_month:02d}.png";
+              link.href = canvas.toDataURL("image/png");
+              link.click();
+            }});
+          </script>
+        </body>
+        </html>
+        """,
+        height=760,
+        scrolling=False,
+    )
+
+    st.markdown("### 📋 SCHEDULED TASKS")
+    if output_tasks:
+        visible = []
+        for task_date in sorted(output_tasks):
+            for task in output_tasks[task_date]:
+                visible.append({
+                    "Date": task_date.strftime("%B %d, %Y"),
+                    "Work": task.get("name", ""),
+                    "Phase": task.get("phase", ""),
+                    "Status": task.get("status", "Not Started"),
+                })
+        st.dataframe(visible, use_container_width=True, hide_index=True)
     else:
-        sorted_tasks = sorted(tasks, key=lambda x: x.get('date_obj', ''))
-        cards_html = '<div class="cal-grid">'
-        for t in sorted_tasks:
-            badge_class = "badge-completed" if t['status'] == "Completed" else "badge-inprogress" if t[
-                                                                                                         'status'] == "In Progress" else "badge-notstarted"
-            photos_thumbs = ""
-            if t.get("photos"):
-                photos_thumbs = '<div class="card-photos">'
-                for p in t["photos"]:
-                    photos_thumbs += f'<img src="{p}" class="card-photo-thumb" />'
-                photos_thumbs += '</div>'
-            cards_html += f"""
-            <div class="cal-card">
-              <div class="cal-date-badge">📅 {t.get("month", "")} {t.get("day", "")}, {t.get("year", "")}</div>
-              <div class="cal-task-title">{t["name"]}</div>
-              <div class="cal-phase">🛠️ Phase: {t["phase"]}</div>
-              <div class="cal-status-tag {badge_class}">{t["status"]}</div>
-              {photos_thumbs}
-            </div>
-            """
-        cards_html += '</div>'
-        st.markdown(cards_html, unsafe_allow_html=True)
-        st.markdown("<div class='sidebar-gap'></div>", unsafe_allow_html=True)
-        st.subheader("⚙️ Task Management & Photo Inspector")
+        st.info("No scheduled tasks yet.")
 
-        for t in list(sorted_tasks):
-            with st.expander(f"📌 {t.get('month')} {t.get('day')}, {t.get('year')} - {t['name']} ({t['status']})",
-                             expanded=False):
-                col1, col2 = st.columns([2, 1])
-                with col1:
-                    new_status = st.selectbox("Update Status", ["Not Started", "In Progress", "Completed"],
-                                              index=["Not Started", "In Progress", "Completed"].index(t["status"]),
-                                              key=f"st_{t['id']}")
-                    if new_status != t["status"]:
-                        t["status"] = new_status
-                        persist_state()
-                        st.rerun()
-                with col2:
-                    if st.button("❌ Delete Task", key=f"del_{t['id']}", use_container_width=True):
-                        st.session_state.planner_tasks = [x for x in st.session_state.planner_tasks if
-                                                          x["id"] != t["id"]]
-                        persist_state()
-                        st.rerun()
-
-                st.markdown("#### 📸 Work Gallery for this Day")
-                if t.get("photos"):
-                    img_cols = st.columns(4)
-                    for idx, photo_b64 in enumerate(list(t["photos"])):
-                        with img_cols[idx % 4]:
-                            st.image(photo_b64, use_container_width=True)
-                            if st.button("🗑️ Remove Photo", key=f"del_img_{t['id']}_{idx}", use_container_width=True):
-                                t["photos"].pop(idx)
-                                persist_state()
-                                st.rerun()
-                else:
-                    st.info("No photo proof attached for this work day yet.")
-
-                st.markdown("##### Add More Photos")
-                with st.form(key=f"upload_form_{t['id']}", clear_on_submit=True):
-                    new_photos = st.file_uploader("Upload Additional Photos", type=["jpg", "jpeg", "png"],
-                                                  accept_multiple_files=True, key=f"up_{t['id']}")
-                    add_photos_btn = st.form_submit_button("📤 UPLOAD PHOTOS")
-                    if add_photos_btn and new_photos:
-                        if "photos" not in t or t["photos"] is None:
-                            t["photos"] = []
-                        for f in new_photos:
-                            bytes_data = f.read()
-                            b64_str = base64.b64encode(bytes_data).decode('utf-8')
-                            mime_type = f.type or "image/png"
-                            t["photos"].append(f"data:{mime_type};base64,{b64_str}")
-                        persist_state()
-                        st.success("Photos added successfully!")
-                        st.rerun()
-
-    st.divider()
-    if st.button("🏠 RETURN TO HOME", use_container_width=True):
-        set_view("home")
 
 elif view == "material":
     st.subheader("➕ ADD MATERIAL")
@@ -3185,43 +3545,3 @@ elif view == "update":
 
 else:
     st.info("Welcome to Ailyn Project Management System. Use the command sidebar to navigate.")
-hide_streamlit_style = """
-            <style>
-            #MainMenu {visibility: hidden;}
-            footer {visibility: hidden;}
-            </style>
-            """
-st.markdown(hide_streamlit_style, unsafe_allow_html=True) 
-try:
-    _logo_b64 = AILYN_LOGO_DATA.split(",", 1)[1]
-    APP_LOGO_IMAGE = Image.open(
-        BytesIO(base64.b64decode(_logo_b64))
-    ).convert("RGBA")
-except Exception:
-    APP_LOGO_IMAGE = None
-
-st.set_page_config(
-    page_title=APP_NAME,
-    page_icon=APP_LOGO_IMAGE if APP_LOGO_IMAGE is not None else "🏠",
-    layout="wide",
-)
-{
-  "name": "Ailyn House Planner",
-  "short_name": "Ailyn Planner",
-  "start_url": "/",
-  "display": "standalone",
-  "background_color": "#071b11",
-  "theme_color": "#071b11",
-  "icons": [
-    {
-      "src": "/logo-192.png",
-      "sizes": "192x192",
-      "type": "image/png"
-    },
-    {
-      "src": "/logo-512.png",
-      "sizes": "512x512",
-      "type": "image/png"
-    }
-  ]
-}
