@@ -3192,3 +3192,16 @@ hide_streamlit_style = """
             </style>
             """
 st.markdown(hide_streamlit_style, unsafe_allow_html=True) 
+try:
+    _logo_b64 = AILYN_LOGO_DATA.split(",", 1)[1]
+    APP_LOGO_IMAGE = Image.open(
+        BytesIO(base64.b64decode(_logo_b64))
+    ).convert("RGBA")
+except Exception:
+    APP_LOGO_IMAGE = None
+
+st.set_page_config(
+    page_title=APP_NAME,
+    page_icon=APP_LOGO_IMAGE if APP_LOGO_IMAGE is not None else "🏠",
+    layout="wide",
+)
