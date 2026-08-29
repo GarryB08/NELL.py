@@ -3185,3 +3185,10 @@ elif view == "update":
 
 else:
     st.info("Welcome to Ailyn Project Management System. Use the command sidebar to navigate.")
+hide_streamlit_style = """
+            <style>
+            #MainMenu {visibility: hidden;}
+            footer {visibility: hidden;}
+            </style>
+            """
+st.markdown(hide_streamlit_style, unsafe_allow_html=True) 
