@@ -973,6 +973,10 @@ def clear_all():
         for report_path in list_saved_reports(report_type):
             if os.path.exists(report_path):
                 os.remove(report_path)
+    if os.path.isdir(BACKUP_DIR):
+        for backup_name in os.listdir(BACKUP_DIR):
+            if backup_name.startswith("NELL.py.py.") and backup_name.endswith(".bak"):
+                os.remove(os.path.join(BACKUP_DIR, backup_name))
     st.session_state.view = "home"
     st.session_state.selected_role = "Labor"
     st.session_state.editing_record_id = None
