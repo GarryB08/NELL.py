@@ -379,6 +379,17 @@ st.set_page_config(
     layout="wide",
 )
 
+google_auth = st.secrets.get("auth", {})
+google_auth_ready = bool(
+    google_auth.get("client_id")
+    and google_auth.get("client_secret")
+    and google_auth.get("server_metadata_url")
+)
+
+if hasattr(st, "user") and st.user.is_logged_in:
+    st.session_state.authenticated = True
+    st.session_state.authenticated_user = st.user.get("name", st.user.get("email", "Google user"))
+
 # CUSTOM PWA BRANDING ACTIVE
 # Browser favicon is configured by st.set_page_config(page_icon=...).
 # The manifest/apple-touch-icon metadata is available for deployments
@@ -420,10 +431,11 @@ if not st.session_state.get("authenticated"):
                 st.session_state.authenticated_user = username.strip() or "Workspace"
                 st.rerun()
             st.error("Incorrect username or password.")
-        if os.getenv("GOOGLE_CLIENT_ID"):
-            st.button("CONTINUE WITH GOOGLE", use_container_width=True, disabled=True, help="Google OAuth still needs a configured callback route.")
+        if google_auth_ready:
+            if st.button("CONTINUE WITH GOOGLE", use_container_width=True):
+                st.login()
         else:
-            st.caption("Google sign-in can be enabled later with OAuth credentials. iOS Face ID is handled by the browser or device password manager.")
+            st.caption("Configure Google OAuth to enable Google sign-in. Google passkeys can use Face ID on supported iPhones.")
     with account_tab:
         with st.form("create_account_form", clear_on_submit=True):
             new_username = st.text_input("Username", placeholder="Choose a username", key="new_auth_username")

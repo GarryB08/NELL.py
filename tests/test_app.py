@@ -63,6 +63,20 @@ def test_sqlite_save_and_reset(monkeypatch, tmp_path):
     assert sqlite3.connect(backup).execute("SELECT 1").fetchone() == (1,)
 
 
+def test_sqlite_persists_all_accounts(monkeypatch, tmp_path):
+    database = tmp_path / "accounts.db"
+    monkeypatch.setattr(storage, "DB_FILE", str(database))
+    monkeypatch.setattr(storage, "LEGACY_STATE_FILE", str(tmp_path / "missing.json"))
+    monkeypatch.setattr(storage, "BACKUP_DIR", str(tmp_path / "backups"))
+    state = storage.load_state()
+    state["auth_users"] = [
+        {"username": "owner", "salt": "salt-1", "password_hash": "hash-1"},
+        {"username": "staff", "salt": "salt-2", "password_hash": "hash-2"},
+    ]
+    storage.save_state(state)
+    assert storage.load_state()["auth_users"] == state["auth_users"]
+
+
 def test_scanner_photo_save_and_delete(monkeypatch, tmp_path):
     monkeypatch.setattr(storage, "APP_DIR", str(tmp_path))
     monkeypatch.setattr(storage, "SCANNER_PHOTO_DIR", str(tmp_path / "scanner"))
