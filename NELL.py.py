@@ -952,7 +952,27 @@ function saveAsImage() {{
 
 
 def clear_all():
-    """Reset the working screen without deleting the saved project ledger."""
+    """Reset the app while retaining material and labor overview history."""
+    st.session_state.records = [
+        record for record in st.session_state.records
+        if record.get("type") == "material"
+    ]
+    st.session_state.labor_records = list(st.session_state.labor_records)
+    st.session_state.payroll_expenses = []
+    st.session_state.planner_tasks = []
+    st.session_state.budget = 0.0
+    st.session_state.budget_history = []
+    st.session_state.remaining_money = 0.0
+    st.session_state.receipt_archive = []
+    st.session_state.client_notes = []
+    st.session_state.messages = []
+    for photo in st.session_state.get("scanner_photos", []):
+        delete_scanner_photo(photo.get("file", ""))
+    st.session_state.scanner_photos = []
+    for report_type in ("construction", "payroll"):
+        for report_path in list_saved_reports(report_type):
+            if os.path.exists(report_path):
+                os.remove(report_path)
     st.session_state.view = "home"
     st.session_state.selected_role = "Labor"
     st.session_state.editing_record_id = None
@@ -1822,17 +1842,6 @@ with st.sidebar:
         f"{manila_now().strftime('%I:%M %p  |  %b %d')}</div>",
         unsafe_allow_html=True
     )
-
-    st.markdown(
-        "<div class='photo-scanner-title'>PHOTO SCANNER</div>"
-        "<div class='photo-scanner-subtitle'>Capture receipts and project progress</div>",
-        unsafe_allow_html=True,
-    )
-    if st.button("📷 TAKE PHOTO", use_container_width=True, key="take_photo_sidebar"):
-        set_view("photo_scanner")
-
-    if st.button("📝 NOTES", use_container_width=True, key="sidebar_notes_popup"):
-        notes_dialog()
 
     st.subheader("Executive Overview")
     if st.button("📊   Dashboard   ›", use_container_width=True, key="side_dashboard"):
