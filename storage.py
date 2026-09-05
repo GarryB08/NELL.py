@@ -14,6 +14,7 @@ SCANNER_PHOTO_DIR = os.path.join(APP_DIR, "archive", "scanner_photos")
 PERSISTENT_KEYS = (
     "records", "labor_records", "payroll_expenses", "planner_tasks", "budget",
     "budget_history", "remaining_money", "view", "receipt_archive", "project", "scanner_photos", "dark_mode", "client_notes", "app_settings", "messages",
+    "auth_users",
 )
 
 
@@ -31,6 +32,7 @@ def _empty_state():
         "view": "home", "receipt_archive": [], "scanner_photos": [], "dark_mode": False, "client_notes": [],
         "app_settings": {"display_name": "", "email": "", "client_mode": False, "email_notifications": True, "budget_alerts": True, "date_format": "%Y-%m-%d", "meeting_url": ""},
         "messages": [],
+        "auth_users": [],
         "project": {"name": "Ailyn House Project", "client": "", "address": "", "manager": "", "status": "Active", "target_date": ""},
     }
 

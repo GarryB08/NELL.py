@@ -9,6 +9,7 @@ import shutil
 import tempfile
 import hashlib
 import hmac
+import secrets
 import uuid
 import re
 from datetime import datetime
@@ -112,6 +113,7 @@ PERSISTENT_KEYS = [
     "client_notes",
     "app_settings",
     "messages",
+    "auth_users",
 ]
 
 def load_state():
@@ -262,6 +264,22 @@ ADMIN_PASSWORD = os.getenv("AILYN_ADMIN_PASSWORD", "")
 UPDATE_SIGNING_KEY = os.getenv("AILYN_UPDATE_SIGNING_KEY", "")
 LOGIN_PASSWORD = os.getenv("AILYN_LOGIN_PASSWORD", "")
 
+
+def hash_account_password(password, salt=None):
+    salt = salt or secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 240000).hex()
+    return salt, digest
+
+
+def verify_account_password(password, account):
+    _, digest = hash_account_password(password, account.get("salt", ""))
+    return hmac.compare_digest(digest, account.get("password_hash", ""))
+
+
+def authenticate_account(username, password, accounts):
+    account = next((item for item in accounts if item.get("username", "").lower() == username.strip().lower()), None)
+    return account is not None and verify_account_password(password, account)
+
 # ================================================================
 # OWN APP LOGO / FAVICON
 # The app uses its embedded Ailyn House logo, so no external logo
@@ -367,15 +385,68 @@ st.set_page_config(
 # that expose manifest.json and the icon assets.
 
 
-if LOGIN_PASSWORD and not st.session_state.get("authenticated"):
-    st.title("Ailyn House Project")
-    st.caption("Sign in to access this project workspace.")
-    login_password = st.text_input("Workspace password", type="password")
-    if st.button("SIGN IN", use_container_width=True):
-        if hmac.compare_digest(login_password, LOGIN_PASSWORD):
-            st.session_state.authenticated = True
-            st.rerun()
-        st.error("Invalid workspace password.")
+if not st.session_state.get("authenticated"):
+    auth_state = load_state()
+    accounts = auth_state.get("auth_users", [])
+    st.markdown(f"""
+    <style>
+    .stApp {{ background: url("https://images.unsplash.com/photo-1600585154340-be6161a56a0c") center/cover fixed !important; }}
+    .stApp:before {{ content:""; position:fixed; inset:0; background:linear-gradient(135deg,rgba(3,30,18,.78),rgba(10,85,45,.72)); pointer-events:none; }}
+    .auth-shell {{ position:relative; z-index:1; max-width:560px; margin:5vh auto 0; padding:42px 34px 34px; border:1px solid rgba(200,255,224,.32); border-radius:24px; background:rgba(6,27,18,.82); box-shadow:0 28px 80px rgba(0,0,0,.42), inset 0 1px 0 rgba(255,255,255,.12); text-align:center; }}
+    .auth-logo {{ width:92px; height:92px; object-fit:contain; margin-bottom:12px; filter:drop-shadow(0 10px 20px rgba(0,0,0,.35)); }}
+    .auth-title {{ color:#f5fff8; font-family:'Outfit',sans-serif; font-size:30px; font-weight:900; letter-spacing:.08em; margin:0; }}
+    .auth-subtitle {{ color:#a9c9b5; font-size:15px; margin:8px 0 28px; }}
+    .auth-note {{ color:#a9c9b5; font-size:12px; margin-top:18px; }}
+    [data-testid="stForm"] {{ border:0 !important; padding:0 !important; background:transparent !important; }}
+    @media (max-width:600px) {{ .auth-shell {{ margin:2vh 10px 0; padding:32px 20px 26px; }} .auth-title {{ font-size:23px; }} }}
+    </style>
+    <div class="auth-shell">
+      <img class="auth-logo" src="{AILYN_LOGO_DATA}" alt="Ailyn House logo">
+      <h1 class="auth-title">AILYN HOUSE PROJECT</h1>
+      <div class="auth-subtitle">Project Management System</div>
+    </div>
+    """, unsafe_allow_html=True)
+    sign_in_tab, account_tab = st.tabs(["SIGN IN", "CREATE ACCOUNT"])
+    with sign_in_tab:
+        with st.form("sign_in_form", clear_on_submit=False):
+            username = st.text_input("Username", placeholder="Enter your username", key="auth_username")
+            login_password = st.text_input("Password", type="password", placeholder="Enter your password", key="auth_password")
+            remember = st.checkbox("Remember this session", value=True, key="auth_remember")
+            submitted = st.form_submit_button("↪  LOGIN", use_container_width=True)
+        if submitted:
+            legacy_valid = bool(LOGIN_PASSWORD and hmac.compare_digest(login_password, LOGIN_PASSWORD))
+            if authenticate_account(username, login_password, accounts) or (legacy_valid and not accounts):
+                st.session_state.authenticated = True
+                st.session_state.authenticated_user = username.strip() or "Workspace"
+                st.rerun()
+            st.error("Incorrect username or password.")
+        if os.getenv("GOOGLE_CLIENT_ID"):
+            st.button("CONTINUE WITH GOOGLE", use_container_width=True, disabled=True, help="Google OAuth still needs a configured callback route.")
+        else:
+            st.caption("Google sign-in can be enabled later with OAuth credentials. iOS Face ID is handled by the browser or device password manager.")
+    with account_tab:
+        with st.form("create_account_form", clear_on_submit=True):
+            new_username = st.text_input("Username", placeholder="Choose a username", key="new_auth_username")
+            new_password = st.text_input("Password", type="password", placeholder="At least 8 characters", key="new_auth_password")
+            confirm_password = st.text_input("Confirm password", type="password", placeholder="Repeat your password", key="new_auth_confirm")
+            create_account = st.form_submit_button("CREATE ACCOUNT", use_container_width=True)
+        if create_account:
+            normalized_username = new_username.strip()
+            existing = {item.get("username", "").lower() for item in accounts}
+            if len(normalized_username) < 3:
+                st.error("Username must be at least 3 characters.")
+            elif normalized_username.lower() in existing:
+                st.error("That username already exists.")
+            elif len(new_password) < 8:
+                st.error("Password must be at least 8 characters.")
+            elif new_password != confirm_password:
+                st.error("Passwords do not match.")
+            else:
+                salt, password_hash = hash_account_password(new_password)
+                accounts.append({"username": normalized_username, "salt": salt, "password_hash": password_hash, "created_at": manila_now().isoformat()})
+                auth_state["auth_users"] = accounts
+                save_state(auth_state)
+                st.success("Account created. Return to Sign In to enter the app.")
     st.stop()
 
 # Load persisted state safely
@@ -413,7 +484,7 @@ if st.session_state.view not in {
     "home", "payroll_dashboard", "planner_input", "planner_output", "material",
     "expense", "excess", "ledger", "add_labor", "add_payroll_expense",
     "payroll_remaining", "payroll_ledger", "export", "payroll_export",
-    "receipt_archive", "photo_scanner", "project_tools", "settings", "communications", "client_portal", "update",
+    "receipt_archive",
 }:
     st.session_state.view = "home"
 if "selected_role" not in st.session_state:
@@ -424,41 +495,6 @@ if "editing_labor_index" not in st.session_state:
     st.session_state.editing_labor_index = None
 if "editing_payroll_expense_index" not in st.session_state:
     st.session_state.editing_payroll_expense_index = None
-if "scanner_input_version" not in st.session_state:
-    st.session_state.scanner_input_version = 0
-if "scanner_actions_open" not in st.session_state:
-    st.session_state.scanner_actions_open = False
-if "scanner_open" not in st.session_state:
-    st.session_state.scanner_open = False
-if "scanner_flash_mode" not in st.session_state:
-    st.session_state.scanner_flash_mode = "Auto"
-if "scanner_camera_mode" not in st.session_state:
-    st.session_state.scanner_camera_mode = "Back camera"
-if "client_notes" not in st.session_state:
-    st.session_state.client_notes = []
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "app_settings" not in st.session_state:
-    st.session_state.app_settings = {
-        "display_name": "",
-        "email": "",
-        "client_mode": False,
-        "email_notifications": True,
-        "budget_alerts": True,
-        "date_format": "%Y-%m-%d",
-        "meeting_url": "",
-    }
-else:
-    st.session_state.app_settings = {
-        "display_name": "",
-        "email": "",
-        "client_mode": False,
-        "email_notifications": True,
-        "budget_alerts": True,
-        "date_format": "%Y-%m-%d",
-        "meeting_url": "",
-        **st.session_state.app_settings,
-    }
 if "dark_mode" not in st.session_state:
     st.session_state.dark_mode = False
 if not os.path.exists(EXCEL_FILE):
@@ -489,62 +525,6 @@ def project_settings_dialog():
                 st.session_state.project = {"name": name.strip(), "client": client.strip(), "address": address.strip(), "manager": manager.strip(), "status": status, "target_date": target_date.isoformat()}
                 persist_state()
                 st.success("Project details saved.")
-
-
-@st.dialog("Notes")
-def notes_dialog():
-    st.caption("Project notes, approvals, and photo comments")
-    folders = ["Site Notes", "Client Approval", "Photo Comments", "Change Requests"]
-    folders += [folder for folder in sorted({note.get("folder", "Site Notes") for note in st.session_state.client_notes}) if folder not in folders]
-    folder = st.selectbox("Folder", folders, key="popup_note_folder")
-    new_folder = st.text_input("New folder", key="popup_new_note_folder", placeholder="Optional folder name")
-    text = st.text_area("Note", key="popup_note_text", height=80, placeholder="Write a note for the project...")
-    if st.button("ADD NOTE", use_container_width=True, key="popup_add_note"):
-        if text.strip():
-            st.session_state.client_notes.insert(0, {"id": str(uuid.uuid4()), "folder": new_folder.strip() or folder, "text": text.strip(), "created_at": manila_now().isoformat()})
-            persist_state()
-            st.rerun()
-        st.warning("Write a note before saving.")
-    if st.session_state.client_notes:
-        st.markdown("#### RECENT NOTES")
-        st.dataframe([
-            {"Folder": note.get("folder", "Site Notes"), "Date": note.get("created_at", "").replace("T", " ")[:16], "Note": note.get("text", "")}
-            for note in st.session_state.client_notes[:8]
-        ], use_container_width=True, hide_index=True)
-        note_to_delete = st.selectbox("Delete note", ["Choose a note"] + [f"{note.get('created_at', '')[:16]} | {note.get('text', '')[:45]}" for note in st.session_state.client_notes[:8]], key="popup_delete_note_select")
-        if note_to_delete != "Choose a note" and st.button("DELETE SELECTED NOTE", use_container_width=True, key="popup_delete_note"):
-            selected_index = [f"{note.get('created_at', '')[:16]} | {note.get('text', '')[:45]}" for note in st.session_state.client_notes[:8]].index(note_to_delete)
-            st.session_state.client_notes.pop(selected_index)
-            persist_state()
-            st.rerun()
-    else:
-        st.info("No notes yet.")
-
-
-@st.dialog("Settings")
-def settings_dialog():
-    settings = st.session_state.app_settings
-    st.caption("Quick account and project preferences")
-    with st.form("quick_settings_form"):
-        display_name = st.text_input("Display name", value=settings.get("display_name", ""))
-        email = st.text_input("Email", value=settings.get("email", ""))
-        meeting_url = st.text_input("Secure voice/video meeting link", value=settings.get("meeting_url", ""), placeholder="https://meet.google.com/...", help="Use a link from Google Meet, Zoom, or Microsoft Teams.")
-        dark_mode = st.checkbox("Dark mode", value=bool(st.session_state.dark_mode))
-        budget_alerts = st.checkbox("Budget alerts", value=bool(settings.get("budget_alerts", True)))
-        email_notifications = st.checkbox("Email notifications", value=bool(settings.get("email_notifications", True)))
-        if st.form_submit_button("SAVE SETTINGS", use_container_width=True):
-            if email and ("@" not in email or "." not in email.rsplit("@", 1)[-1]):
-                st.error("Enter a valid email address.")
-            else:
-                settings.update({"display_name": display_name.strip(), "email": email.strip(), "meeting_url": meeting_url.strip(), "budget_alerts": budget_alerts, "email_notifications": email_notifications})
-                st.session_state.dark_mode = dark_mode
-                persist_state()
-                st.success("Settings saved.")
-    st.markdown("#### ACCOUNT ACCESS")
-    st.success("Workspace password enabled.") if LOGIN_PASSWORD else st.info("Workspace password is disabled.")
-    if LOGIN_PASSWORD and st.button("SIGN OUT", use_container_width=True, key="popup_sign_out"):
-        st.session_state.authenticated = False
-        st.rerun()
 
 
 def total_materials():
@@ -960,8 +940,8 @@ def clear_all():
     st.session_state.budget_history = []
     st.session_state.remaining_money = 0.0
     st.session_state.receipt_archive = []
-    st.session_state.client_notes = []
-    st.session_state.messages = []
+    st.session_state.pop("client_notes", None)
+    st.session_state.pop("messages", None)
     for photo in st.session_state.get("scanner_photos", []):
         delete_scanner_photo(photo.get("file", ""))
     st.session_state.scanner_photos = []
@@ -1119,41 +1099,6 @@ def photo_camera_dialog():
         st.session_state.scanner_open = False
         st.session_state.show_scanned_photo = False
         st.rerun()
-
-
-def install_update(uploaded_file, signature):
-    """Validate and atomically install an uploaded app upgrade after a backup."""
-    source = uploaded_file.getvalue()
-    if not source:
-        raise ValueError("The uploaded upgrade file is empty.")
-    try:
-        ast.parse(source.decode("utf-8"), filename=uploaded_file.name)
-    except (UnicodeDecodeError, SyntaxError) as error:
-        raise ValueError(f"The upgrade was rejected: {error}") from None
-    if not UPDATE_SIGNING_KEY:
-        raise ValueError("Updates are disabled until AILYN_UPDATE_SIGNING_KEY is configured.")
-    expected_signature = hmac.new(
-        UPDATE_SIGNING_KEY.encode("utf-8"), source, hashlib.sha256
-    ).hexdigest()
-    if not hmac.compare_digest(expected_signature, signature.strip()):
-        raise ValueError("The upgrade signature is invalid.")
-
-    backup_dir = os.path.join(APP_DIR, "backups")
-    os.makedirs(backup_dir, exist_ok=True)
-    backup_path = os.path.join(backup_dir, f"NELL.py.py.{int(time.time())}.bak")
-    temporary_path = None
-    try:
-        shutil.copy2(__file__, backup_path)
-        with tempfile.NamedTemporaryFile("wb", delete=False, dir=APP_DIR,
-                                         prefix=".nell-upgrade-") as temporary:
-            temporary.write(source)
-            temporary_path = temporary.name
-        os.replace(temporary_path, __file__)
-    except OSError as error:
-        if temporary_path and os.path.exists(temporary_path):
-            os.remove(temporary_path)
-        raise ValueError(f"The upgrade could not be installed: {error}") from None
-    return backup_path
 
 
 def record_budget_change(action, amount, previous_budget):
@@ -1836,17 +1781,6 @@ with st.sidebar:
         unsafe_allow_html=True
     )
 
-    st.markdown(
-        "<div class='photo-scanner-title'>PHOTO SCANNER</div>"
-        "<div class='photo-scanner-subtitle'>Capture receipts and project progress</div>",
-        unsafe_allow_html=True,
-    )
-    if st.button("📷 TAKE PHOTO", use_container_width=True, key="take_photo_sidebar"):
-        set_view("photo_scanner")
-
-    if st.button("📝 NOTES", use_container_width=True, key="sidebar_notes_popup"):
-        notes_dialog()
-
     st.subheader("Executive Overview")
     if st.button("📊   Dashboard   ›", use_container_width=True, key="side_dashboard"):
         set_view("home")
@@ -1871,14 +1805,6 @@ with st.sidebar:
         set_view("planner_input")
     if st.button("📅   Schedule & Progress   ›", use_container_width=True, key="side_schedule"):
         set_view("planner_output")
-    if st.button("🧰   Project Tools   ›", use_container_width=True, key="side_project_tools"):
-        set_view("project_tools")
-    if st.button("⚙️   Settings   ›", use_container_width=True, key="side_settings"):
-        settings_dialog()
-    if st.button("💬   Messages & Calls   ›", use_container_width=True, key="side_messages"):
-        set_view("communications")
-    if st.button("👤   Client Portal   ›", use_container_width=True, key="side_client_portal"):
-        set_view("client_portal")
 
     st.subheader("Financial Operations")
     if st.button("🧱   Material Entry   ›", use_container_width=True, key="side_material"):
@@ -1907,10 +1833,6 @@ with st.sidebar:
         set_view("payroll_export")
     if st.button("🗃️   Receipts Archive   ›", use_container_width=True, key="side_archive"):
         set_view("receipt_archive")
-
-    st.subheader("Administrator")
-    if st.button("🔐   Admin Console   ›", use_container_width=True, key="side_admin"):
-        set_view("update")
 
 view = st.session_state.view
 
