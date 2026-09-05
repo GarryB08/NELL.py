@@ -397,8 +397,6 @@ if hasattr(st, "user") and st.user.is_logged_in:
 
 
 if not st.session_state.get("authenticated"):
-    auth_state = load_state()
-    accounts = auth_state.get("auth_users", [])
     st.markdown(f"""
     <style>
     .stApp {{ background: url("https://images.unsplash.com/photo-1600585154340-be6161a56a0c") center/cover fixed !important; }}
@@ -417,48 +415,20 @@ if not st.session_state.get("authenticated"):
       <div class="auth-subtitle">Project Management System</div>
     </div>
     """, unsafe_allow_html=True)
-    sign_in_tab, account_tab = st.tabs(["SIGN IN", "CREATE ACCOUNT"])
-    with sign_in_tab:
-        with st.form("sign_in_form", clear_on_submit=False):
-            username = st.text_input("Username", placeholder="Enter your username", key="auth_username")
-            login_password = st.text_input("Password", type="password", placeholder="Enter your password", key="auth_password")
-            remember = st.checkbox("Remember this session", value=True, key="auth_remember")
-            submitted = st.form_submit_button("↪  LOGIN", use_container_width=True)
-        if submitted:
-            legacy_valid = bool(LOGIN_PASSWORD and hmac.compare_digest(login_password, LOGIN_PASSWORD))
-            if authenticate_account(username, login_password, accounts) or (legacy_valid and not accounts):
-                st.session_state.authenticated = True
-                st.session_state.authenticated_user = username.strip() or "Workspace"
-                st.rerun()
-            st.error("Incorrect username or password.")
-        if google_auth_ready:
-            if st.button("CONTINUE WITH GOOGLE", use_container_width=True):
-                st.login()
-        else:
-            st.caption("Configure Google OAuth to enable Google sign-in. Google passkeys can use Face ID on supported iPhones.")
-    with account_tab:
-        with st.form("create_account_form", clear_on_submit=True):
-            new_username = st.text_input("Username", placeholder="Choose a username", key="new_auth_username")
-            new_password = st.text_input("Password", type="password", placeholder="At least 8 characters", key="new_auth_password")
-            confirm_password = st.text_input("Confirm password", type="password", placeholder="Repeat your password", key="new_auth_confirm")
-            create_account = st.form_submit_button("CREATE ACCOUNT", use_container_width=True)
-        if create_account:
-            normalized_username = new_username.strip()
-            existing = {item.get("username", "").lower() for item in accounts}
-            if len(normalized_username) < 3:
-                st.error("Username must be at least 3 characters.")
-            elif normalized_username.lower() in existing:
-                st.error("That username already exists.")
-            elif len(new_password) < 8:
-                st.error("Password must be at least 8 characters.")
-            elif new_password != confirm_password:
-                st.error("Passwords do not match.")
-            else:
-                salt, password_hash = hash_account_password(new_password)
-                accounts.append({"username": normalized_username, "salt": salt, "password_hash": password_hash, "created_at": manila_now().isoformat()})
-                auth_state["auth_users"] = accounts
-                save_state(auth_state)
-                st.success("Account created. Return to Sign In to enter the app.")
+    with st.form("sign_in_form", clear_on_submit=False):
+        username = st.text_input("Username", placeholder="Enter your name", key="auth_username")
+        submitted = st.form_submit_button("↪  ENTER APP", use_container_width=True)
+    if submitted:
+        if username.strip():
+            st.session_state.authenticated = True
+            st.session_state.authenticated_user = username.strip()
+            st.rerun()
+        st.error("Enter a name to continue.")
+    if google_auth_ready:
+        if st.button("CONTINUE WITH GOOGLE", use_container_width=True):
+            st.login()
+    else:
+        st.caption("Enter your name and press Enter to continue. Google passkeys can use Face ID when Google sign-in is configured.")
     st.stop()
 
 # Load persisted state safely
