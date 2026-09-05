@@ -24,6 +24,18 @@ def test_monthly_totals_separate_payroll():
     assert totals == {"materials": 1200.0, "construction": 0.0, "labor": 500.0, "payroll": 100.0, "total": 1800.0}
 
 
+def test_weekly_payroll_totals_group_workers_and_salary():
+    rows = app_logic.weekly_payroll_totals([
+        {"recorded_at": "2026-08-03T08:00:00+08:00", "net": 500},
+        {"recorded_at": "2026-08-05T08:00:00+08:00", "net": 650},
+        {"recorded_at": "2026-08-10T08:00:00+08:00", "net": 800},
+    ])
+    assert rows == [
+        {"Week": "2026-W32", "Workers": 2, "Total salary": 1150.0},
+        {"Week": "2026-W33", "Workers": 1, "Total salary": 800.0},
+    ]
+
+
 def test_excel_exports_have_expected_sheets():
     assert load_workbook("ailyn_project_ledger.xlsx", read_only=True).sheetnames == [
         "Transactions", "Payroll", "Monthly Summary", "Receipt Archive"

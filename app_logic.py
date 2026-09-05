@@ -1,5 +1,7 @@
 """Pure business rules used by the Ailyn House app and its tests."""
 
+from datetime import datetime
+
 TIER_TABLE = {
     0.1: {"Labor": 0.00, "Skill": 0.00, "Forman": 0.00},
     0.2: {"Labor": 62.50, "Skill": 81.25, "Forman": 100.00},
@@ -24,6 +26,36 @@ def calculate_labor_pay(worked_days, role):
     full_pay = full_days * FULL_DAY_RATES.get(role, 0.0)
     partial_pay = get_partial_rate(partial_days, role)
     return full_pay + partial_pay, full_pay, partial_pay
+
+
+def _record_date(record):
+    recorded_at = record.get("recorded_at")
+    if recorded_at:
+        try:
+            return datetime.fromisoformat(recorded_at).date()
+        except ValueError:
+            pass
+    for date_format in ("%b %d, %Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(record.get("date", ""), date_format).date()
+        except ValueError:
+            continue
+    return None
+
+
+def weekly_payroll_totals(records):
+    """Return chart rows containing worker count and net salary per ISO week."""
+    weeks = {}
+    for record in records:
+        record_date = _record_date(record)
+        if record_date is None:
+            continue
+        year, week, _ = record_date.isocalendar()
+        week_key = f"{year}-W{week:02d}"
+        row = weeks.setdefault(week_key, {"Week": week_key, "Workers": 0, "Total salary": 0.0})
+        row["Workers"] += 1
+        row["Total salary"] += float(record.get("net", 0) or 0)
+    return [weeks[key] for key in sorted(weeks)]
 
 
 def monthly_totals(records, labor_records, payroll_expenses, month):
