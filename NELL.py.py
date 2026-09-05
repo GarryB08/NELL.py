@@ -416,19 +416,17 @@ if not st.session_state.get("authenticated"):
     </div>
     """, unsafe_allow_html=True)
     with st.form("sign_in_form", clear_on_submit=False):
-        username = st.text_input("Username", placeholder="Enter your name", key="auth_username")
+        username = st.text_input("Name (optional)", placeholder="Leave blank to continue as Guest", key="auth_username")
         submitted = st.form_submit_button("↪  ENTER APP", use_container_width=True)
     if submitted:
-        if username.strip():
-            st.session_state.authenticated = True
-            st.session_state.authenticated_user = username.strip()
-            st.rerun()
-        st.error("Enter a name to continue.")
+        st.session_state.authenticated = True
+        st.session_state.authenticated_user = username.strip() or "Guest"
+        st.rerun()
     if google_auth_ready:
         if st.button("CONTINUE WITH GOOGLE", use_container_width=True):
             st.login()
     else:
-        st.caption("Enter your name and press Enter to continue. Google passkeys can use Face ID when Google sign-in is configured.")
+        st.caption("Anyone can leave the name blank and press Enter to continue. Google passkeys can use Face ID when configured.")
     st.stop()
 
 # Load persisted state safely
@@ -3234,8 +3232,6 @@ elif view == "communications":
             st.caption("Voice and video are provided by your secure meeting service.")
         else:
             st.info("Add an HTTPS Google Meet, Zoom, or Microsoft Teams link in Settings to enable calls.")
-            if st.button("OPEN SETTINGS", use_container_width=True, key="communications_open_settings"):
-                settings_dialog()
     if st.button("BACK TO DASHBOARD", key="communications_back"):
         set_view("home")
 
@@ -3433,9 +3429,7 @@ elif view == "update":
         try:
             if not ADMIN_PASSWORD or not hmac.compare_digest(admin_password, ADMIN_PASSWORD):
                 raise ValueError("Administrator authentication failed.")
-            backup_path = install_update(uploaded_upgrade, signature)
-            st.success(f"Upgrade installed. Backup created at {os.path.basename(backup_path)}.")
-            st.warning("Restart the Streamlit app to load the new version.")
+            st.error("Signed upgrades are not available in this build.")
         except ValueError as error:
             st.error(str(error))
     st.divider()
