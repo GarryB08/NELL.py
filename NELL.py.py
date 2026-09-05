@@ -386,9 +386,10 @@ google_auth_ready = bool(
     and google_auth.get("server_metadata_url")
 )
 
-if hasattr(st, "user") and st.user.is_logged_in:
+google_user = st.user.to_dict() if google_auth_ready else {}
+if google_user.get("is_logged_in", False):
     st.session_state.authenticated = True
-    st.session_state.authenticated_user = st.user.get("name", st.user.get("email", "Google user"))
+    st.session_state.authenticated_user = google_user.get("name") or google_user.get("email") or "Google user"
 
 # CUSTOM PWA BRANDING ACTIVE
 # Browser favicon is configured by st.set_page_config(page_icon=...).
