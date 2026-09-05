@@ -26,7 +26,7 @@ except ModuleNotFoundError:
 TESSERACT_NOT_FOUND_ERROR = getattr(pytesseract, "TesseractNotFoundError", RuntimeError)
 from storage import BACKUP_DIR, DB_FILE, create_backup, delete_scanner_photo, history_count, load_state as load_sqlite_state
 from storage import restore_backup, save_scanner_photo, save_state as save_sqlite_state
-from app_logic import FULL_DAY_RATES, TIER_TABLE, calculate_labor_pay, get_partial_rate, weekly_payroll_totals
+from app_logic import FULL_DAY_RATES, TIER_TABLE, calculate_labor_pay, get_partial_rate
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(APP_DIR, "app_state.json")
@@ -952,12 +952,8 @@ function saveAsImage() {{
 
 
 def clear_all():
-    """Reset the app while retaining material and labor overview history."""
-    st.session_state.records = [
-        record for record in st.session_state.records
-        if record.get("type") == "material"
-    ]
-    st.session_state.labor_records = list(st.session_state.labor_records)
+    st.session_state.records = []
+    st.session_state.labor_records = []
     st.session_state.payroll_expenses = []
     st.session_state.planner_tasks = []
     st.session_state.budget = 0.0
@@ -973,15 +969,8 @@ def clear_all():
         for report_path in list_saved_reports(report_type):
             if os.path.exists(report_path):
                 os.remove(report_path)
-    if os.path.isdir(BACKUP_DIR):
-        for backup_name in os.listdir(BACKUP_DIR):
-            if backup_name.startswith("NELL.py.py.") and backup_name.endswith(".bak"):
-                os.remove(os.path.join(BACKUP_DIR, backup_name))
     st.session_state.view = "home"
     st.session_state.selected_role = "Labor"
-    st.session_state.editing_record_id = None
-    st.session_state.editing_labor_index = None
-    st.session_state.editing_payroll_expense_index = None
     save_state(st.session_state)
 
 
@@ -1847,6 +1836,17 @@ with st.sidebar:
         unsafe_allow_html=True
     )
 
+    st.markdown(
+        "<div class='photo-scanner-title'>PHOTO SCANNER</div>"
+        "<div class='photo-scanner-subtitle'>Capture receipts and project progress</div>",
+        unsafe_allow_html=True,
+    )
+    if st.button("📷 TAKE PHOTO", use_container_width=True, key="take_photo_sidebar"):
+        set_view("photo_scanner")
+
+    if st.button("📝 NOTES", use_container_width=True, key="sidebar_notes_popup"):
+        notes_dialog()
+
     st.subheader("Executive Overview")
     if st.button("📊   Dashboard   ›", use_container_width=True, key="side_dashboard"):
         set_view("home")
@@ -1984,8 +1984,6 @@ if view == "home":
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
-        if st.button("OPEN SAVED EXPENSE LEDGER", use_container_width=True, key="home_open_expense_ledger"):
-            set_view("ledger")
     with right:
         tx = list(reversed(st.session_state.records))[:5]
         tx_html = ""
@@ -2065,14 +2063,6 @@ elif view == "payroll_dashboard":
             payroll_ledger_dialog()
         if st.button("CREATE PAYROLL REPORT", use_container_width=True):
             payroll_report_dialog()
-
-    st.subheader("Weekly payroll overview")
-    weekly_rows = weekly_payroll_totals(st.session_state.labor_records)
-    if weekly_rows:
-        st.dataframe(weekly_rows, use_container_width=True, hide_index=True)
-        st.bar_chart(weekly_rows, x="Week", y=["Workers", "Total salary"], use_container_width=True)
-    else:
-        st.info("Weekly payroll chart will appear after the first labor account is saved.")
 
     st.subheader("Latest labor accounts")
     if st.session_state.labor_records:
@@ -2673,9 +2663,8 @@ elif view == "planner_output":
 
 elif view == "material":
     st.subheader("➕ ADD MATERIAL")
-    st.caption("Every saved purchase is permanently written to the ledger with its date, description, quantity, unit price, delivery, and total.")
     with st.form(key="material_form", clear_on_submit=True):
-        name = st.text_input("Description", key="material_name")
+        name = st.text_input("Material Name", key="material_name")
         price = st.number_input("Price", min_value=0.01, value=None, placeholder="0.00", key="material_price")
         qty = st.number_input("Qty", min_value=1, value=None, placeholder="1", key="material_qty")
         delivery = st.number_input("Delivery", min_value=0.0, value=None, placeholder="0.00", key="material_delivery")
@@ -2742,29 +2731,6 @@ elif view == "excess":
 
 elif view == "ledger":
     st.subheader("📖 CONSTRUCTION LEDGER")
-    material_records = [record for record in st.session_state.records if record.get("type") == "material"]
-    if material_records:
-        st.markdown("### Material purchase overview")
-        st.dataframe([
-            {
-                "Date": record.get("date", ""),
-                "Description": record.get("name", ""),
-                "Qty": int(record.get("qty", 1)),
-                "Unit price": f"PHP {float(record.get('price', 0)):,.2f}",
-                "Delivery": f"PHP {float(record.get('delivery', 0)):,.2f}",
-                "Total": f"PHP {float(record.get('amount', 0)):,.2f}",
-            }
-            for record in reversed(material_records)
-        ], use_container_width=True, hide_index=True)
-        material_chart = {}
-        for record in material_records:
-            date_key = month_key(record)
-            material_chart[date_key] = material_chart.get(date_key, 0.0) + float(record.get("amount", 0))
-        st.caption("Saved material purchases by month")
-        st.bar_chart(material_chart, use_container_width=True)
-    if st.button("RESET MATERIAL OVERVIEW", use_container_width=True, key="reset_material_overview"):
-        st.session_state.pop("construction_ledger_search", None)
-        st.rerun()
     ledger_query = st.text_input("Search construction entries", key="construction_ledger_search").strip().lower()
     visible_records = [
         record for record in st.session_state.records
@@ -2931,9 +2897,6 @@ elif view == "payroll_remaining":
 
 elif view == "payroll_ledger":
     st.subheader("📋 LABOR & PAYROLL LEDGER")
-    if st.button("RESET PAYROLL OVERVIEW", use_container_width=True, key="reset_payroll_overview"):
-        st.session_state.pop("payroll_ledger_search", None)
-        st.rerun()
     payroll_query = st.text_input("Search payroll entries", key="payroll_ledger_search").strip().lower()
     visible_labor = [record for record in st.session_state.labor_records if not payroll_query or payroll_query in str(record).lower()]
     visible_payroll_expenses = [record for record in st.session_state.payroll_expenses if not payroll_query or payroll_query in str(record).lower()]
