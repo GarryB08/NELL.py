@@ -27,7 +27,7 @@ except ModuleNotFoundError:
 TESSERACT_NOT_FOUND_ERROR = getattr(pytesseract, "TesseractNotFoundError", RuntimeError)
 from storage import BACKUP_DIR, DB_FILE, create_backup, delete_scanner_photo, history_count, load_state as load_sqlite_state
 from storage import restore_backup, save_scanner_photo, save_state as save_sqlite_state
-from app_logic import FULL_DAY_RATES, TIER_TABLE, calculate_labor_pay, get_partial_rate, monthly_trend_summary
+from app_logic import FULL_DAY_RATES, TIER_TABLE, budget_alert_status, calculate_labor_pay, get_partial_rate, monthly_trend_summary
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(APP_DIR, "app_state.json")
@@ -1968,34 +1968,82 @@ if view == "home":
         if task.get("date_obj", "") < manila_now().strftime("%Y-%m-%d")
         and task.get("status") != "Completed"
     ]
-    if balance < 0:
-        st.error(f"Budget warning: project is over budget by PHP {abs(balance):,.2f}.")
+    budget_alert = budget_alert_status(budget, used)
+    if budget_alert["severity"] == "danger":
+        st.error(budget_alert["message"])
+    elif budget_alert["severity"] == "warning":
+        st.warning(budget_alert["message"])
+    elif budget_alert["severity"] == "info":
+        st.info(budget_alert["message"])
     if overdue_tasks:
         st.warning(f"{len(overdue_tasks)} scheduled task(s) are overdue.")
 
     monthly_summary = get_monthly_summary()
     current_month_name = datetime.strptime(monthly_summary["month"], "%Y-%m").strftime("%b %Y")
     previous_month_name = datetime.strptime(monthly_summary["previous_month"], "%Y-%m").strftime("%b %Y")
+
+    budget_alert = budget_alert_status(budget, used)
+    if budget_alert["severity"] == "danger":
+        st.error(budget_alert["message"])
+    elif budget_alert["severity"] == "warning":
+        st.warning(budget_alert["message"])
+    elif budget_alert["severity"] == "info":
+        st.info(budget_alert["message"])
+
     if monthly_summary["delta_from_previous"] > 0:
         st.info(f"This month is PHP {monthly_summary['delta_from_previous']:,.2f} higher than {previous_month_name}.")
     elif monthly_summary["delta_from_previous"] < 0:
         st.success(f"This month is PHP {abs(monthly_summary['delta_from_previous']):,.2f} lower than {previous_month_name}.")
 
-    m1, m2, m3, m4 = st.columns(4)
-    with m1:
+    if overdue_tasks:
+        st.warning(f"{len(overdue_tasks)} scheduled task(s) are overdue.")
+
+    summary_col1, summary_col2, summary_col3, summary_col4, summary_col5 = st.columns(5)
+    with summary_col1:
         st.metric("TOTAL BUDGET", f"₱{budget:,.2f}")
-    with m2:
+    with summary_col2:
         st.metric("TOTAL EXPENSES", f"₱{used:,.2f}")
-    with m3:
+    with summary_col3:
         st.metric("REMAINING BALANCE", f"₱{balance:,.2f}")
-    with m4:
-        st.metric(
-            f"PROJECT SPENT THIS MONTH ({manila_now().strftime('%b %Y').upper()})",
-            f"₱{monthly_construction_spend():,.2f}",
-        )
+    with summary_col4:
+        st.metric(f"MONTH SPENT ({manila_now().strftime('%b %Y').upper()})", f"₱{monthly_construction_spend():,.2f}")
+    with summary_col5:
+        st.metric("UPCOMING TASKS", f"{len(upcoming_tasks)}")
+
+    action_col1, action_col2, action_col3, action_col4 = st.columns(4)
+    with action_col1:
+        if st.button("OPEN PLANNER", use_container_width=True):
+            set_view("planner_output")
+    with action_col2:
+        if st.button("ADD MATERIAL", use_container_width=True):
+            set_view("material")
+    with action_col3:
+        if st.button("VIEW LEDGER", use_container_width=True):
+            set_view("ledger")
+    with action_col4:
+        if st.button("PAYROLL DASHBOARD", use_container_width=True):
+            set_view("payroll_dashboard")
 
     st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
-    left, right = st.columns([1.05, 1])
+
+    st.markdown(f"""
+    <div class="dash-section">
+      <div class="section-head">
+        <div class="section-title" style="margin:0">CENTRALIZED PROJECT OVERVIEW</div>
+        <span style="font-size:11px;color:#7b867f;font-weight:700">{project.get('status', 'Active').upper()} • {project.get('client') or 'No client assigned'}</span>
+      </div>
+      <div class="legend">
+        <div class="legend-row"><span><i class="dot" style="background:#075c28"></i>Project</span><b>{project.get('name', 'Ailyn House Project')}</b></div>
+        <div class="legend-row"><span><i class="dot" style="background:#e0aa25"></i>Site</span><b>{project.get('address') or 'Not set'}</b></div>
+        <div class="legend-row"><span><i class="dot" style="background:#a78bfa"></i>Manager</span><b>{project.get('manager') or 'Not set'}</b></div>
+        <div class="legend-row"><span><i class="dot" style="background:#f26d6d"></i>Target</span><b>{project.get('target_date') or 'Not set'}</b></div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
+
+    left, center, right = st.columns([1.2, 1.1, 1.1])
     with left:
         st.markdown(f"""
         <div class="dash-section">
@@ -2007,9 +2055,37 @@ if view == "home":
               <div class="legend-row"><span><i class="dot" style="background:#e0aa25"></i>Expenses</span><b>₱{expenses:,.2f}</b></div>
               <div class="legend-row"><span><i class="dot" style="background:#e85d4a"></i>Excess</span><b>₱{excess:,.2f}</b></div>
             </div>
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with center:
+        trend_rows = monthly_trend_summary(st.session_state.records, st.session_state.labor_records, st.session_state.payroll_expenses, months=6)
+        st.markdown("""
+        <div class="dash-section">
+          <div class="section-head">
+            <div class="section-title" style="margin:0">MONTHLY TREND</div>
+            <span style="font-size:11px;color:#7b867f;font-weight:700">LAST 6 MONTHS</span>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+        if trend_rows:
+            st.dataframe(
+                trend_rows,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Month": st.column_config.TextColumn("Month"),
+                    "Materials": st.column_config.NumberColumn("Materials", format="₱%.2f"),
+                    "Construction": st.column_config.NumberColumn("Construction", format="₱%.2f"),
+                    "Labor": st.column_config.NumberColumn("Labor", format="₱%.2f"),
+                    "Payroll": st.column_config.NumberColumn("Payroll", format="₱%.2f"),
+                    "Total": st.column_config.NumberColumn("Total", format="₱%.2f"),
+                },
+            )
+        else:
+            st.info("No monthly activity yet.")
+
     with right:
         tx = list(reversed(st.session_state.records))[:5]
         tx_html = ""
@@ -2024,6 +2100,7 @@ if view == "home":
             unsafe_allow_html=True)
 
     st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
+
     st.markdown(f"""
     <div class="dash-section">
       <div class="section-head"><div class="section-title" style="margin:0">MONTHLY OVERVIEW</div><span style="font-size:11px;color:#7b867f;font-weight:700">{current_month_name}</span></div>
@@ -2036,37 +2113,33 @@ if view == "home":
       </div>
     </div>
     """, unsafe_allow_html=True)
+
     st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
 
-    trend_rows = monthly_trend_summary(st.session_state.records, st.session_state.labor_records, st.session_state.payroll_expenses, months=6)
-    if trend_rows:
-        st.dataframe(
-            trend_rows,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Month": st.column_config.TextColumn("Month"),
-                "Materials": st.column_config.NumberColumn("Materials", format="₱%.2f"),
-                "Construction": st.column_config.NumberColumn("Construction", format="₱%.2f"),
-                "Labor": st.column_config.NumberColumn("Labor", format="₱%.2f"),
-                "Payroll": st.column_config.NumberColumn("Payroll", format="₱%.2f"),
-                "Total": st.column_config.NumberColumn("Total", format="₱%.2f"),
-            },
-        )
-    st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
-    st.markdown(f"""
-    <div class="dash-section">
-      <div class="schedule">
-        <div class="schedule-icon">▦</div>
-        <div><div class="schedule-title">TODAY'S SCHEDULE</div><div style="font-weight:800;font-size:13px;margin-top:4px">{manila_now().strftime('%B %d, %Y (%A)')}</div><div class="schedule-muted">{len(today_tasks)} task(s) scheduled for today.</div></div>
-        <div style="width:1px;height:58px;background:#dfe8e1;margin:0 12px"></div>
-        <div><div class="schedule-title">UPCOMING TASKS</div><div style="font-weight:800;font-size:13px;margin-top:4px">{len(upcoming_tasks)} task(s) planned</div><div class="schedule-muted">Stay on track and manage your construction tasks.</div></div>
-        <div style="margin-left:auto"><div class="open-planner">▣ &nbsp; Open Planner</div></div>
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
-    if st.button("OPEN CONSTRUCTION PLANNER", use_container_width=True):
-        set_view("planner_output")
+    left, right = st.columns([1.3, 1])
+    with left:
+        st.markdown(f"""
+        <div class="dash-section">
+          <div class="schedule">
+            <div class="schedule-icon">▦</div>
+            <div><div class="schedule-title">TODAY'S SCHEDULE</div><div style="font-weight:800;font-size:13px;margin-top:4px">{manila_now().strftime('%B %d, %Y (%A)')}</div><div class="schedule-muted">{len(today_tasks)} task(s) scheduled for today.</div></div>
+            <div style="width:1px;height:58px;background:#dfe8e1;margin:0 12px"></div>
+            <div><div class="schedule-title">UPCOMING TASKS</div><div style="font-weight:800;font-size:13px;margin-top:4px">{len(upcoming_tasks)} task(s) planned</div><div class="schedule-muted">Stay on track and manage your construction tasks.</div></div>
+            <div style="margin-left:auto"><div class="open-planner">▣ &nbsp; Open Planner</div></div>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+    with right:
+        st.markdown(f"""
+        <div class="dash-section">
+          <div class="section-head"><div class="section-title" style="margin:0">TASK SUMMARY</div><span style="font-size:11px;color:#7b867f;font-weight:700">LIVE STATUS</span></div>
+          <div class="legend">
+            <div class="legend-row"><span><i class="dot" style="background:#075c28"></i>Today's tasks</span><b>{len(today_tasks)}</b></div>
+            <div class="legend-row"><span><i class="dot" style="background:#e0aa25"></i>Upcoming</span><b>{len(upcoming_tasks)}</b></div>
+            <div class="legend-row"><span><i class="dot" style="background:#e85d4a"></i>Overdue</span><b>{len(overdue_tasks)}</b></div>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
 
 elif view == "payroll_dashboard":
     payroll_labor = sum(float(record.get("net", 0)) for record in st.session_state.labor_records)
@@ -3571,29 +3644,6 @@ elif view == "project_tools":
             persist_state()
             st.rerun()
 
-elif view == "update":
-    st.markdown("## Upgrade Center")
-    st.caption("Administrator-only signed release installation. The current app is backed up first.")
-    admin_password = st.text_input("Administrator password", type="password", key="admin_update_password")
-    uploaded_upgrade = st.file_uploader("Choose signed Python upgrade", type=["py"], key="upgrade_file")
-    signature = st.text_input("Release SHA-256 HMAC signature", key="upgrade_signature")
-    confirm_upgrade = st.checkbox("I have reviewed this signed release and want to install it.")
-    if st.button("INSTALL SIGNED UPGRADE", use_container_width=True,
-                 disabled=not (admin_password and uploaded_upgrade and signature and confirm_upgrade)):
-        try:
-            if not ADMIN_PASSWORD or not hmac.compare_digest(admin_password, ADMIN_PASSWORD):
-                raise ValueError("Administrator authentication failed.")
-            st.error("Signed upgrades are not available in this build.")
-        except ValueError as error:
-            st.error(str(error))
-    st.divider()
-    st.subheader("Backups")
-    backup_dir = os.path.join(APP_DIR, "backups")
-    backup_names = sorted(os.listdir(backup_dir), reverse=True) if os.path.isdir(backup_dir) else []
-    if backup_names:
-        st.dataframe([{"Backup": name} for name in backup_names[:10]], use_container_width=True, hide_index=True)
-    else:
-        st.caption("No upgrades have been installed yet.")
 
 else:
     st.info("Welcome to Ailyn Project Management System. Use the command sidebar to navigate.")

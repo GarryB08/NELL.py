@@ -67,6 +67,45 @@ def monthly_totals(records, labor_records, payroll_expenses, month):
             "total": materials + construction + labor + payroll}
 
 
+def budget_alert_status(budget, spent):
+    """Return a structured budget alert for dashboards and alerts."""
+    budget = float(budget or 0)
+    spent = float(spent or 0)
+    remaining = budget - spent
+    used_ratio = (spent / budget) if budget else 0.0
+
+    if budget <= 0:
+        return {
+            "severity": "info",
+            "remaining": remaining,
+            "used_ratio": 0.0,
+            "message": "Set a project budget to enable budget monitoring.",
+        }
+
+    if spent > budget:
+        return {
+            "severity": "danger",
+            "remaining": remaining,
+            "used_ratio": used_ratio,
+            "message": f"Budget is over by PHP {abs(remaining):,.2f}.",
+        }
+
+    if used_ratio >= 0.8:
+        return {
+            "severity": "warning",
+            "remaining": remaining,
+            "used_ratio": used_ratio,
+            "message": f"Budget is {used_ratio * 100:.0f}% used. Consider reviewing upcoming spend.",
+        }
+
+    return {
+        "severity": "info",
+        "remaining": remaining,
+        "used_ratio": used_ratio,
+        "message": f"Budget is {used_ratio * 100:.0f}% used. Remaining: PHP {remaining:,.2f}.",
+    }
+
+
 def monthly_trend_summary(records, labor_records, payroll_expenses, months=6):
     """Return recent monthly totals for dashboard analytics in descending month order."""
     month_keys = sorted(

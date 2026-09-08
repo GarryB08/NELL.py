@@ -53,6 +53,21 @@ def test_monthly_trend_summary_builds_analytics_rows():
     ]
 
 
+def test_budget_alert_status_reports_overrun_and_warning_state():
+    assert app_logic.budget_alert_status(1000, 800) == {
+        "severity": "warning",
+        "remaining": 200.0,
+        "used_ratio": 0.8,
+        "message": "Budget is 80% used. Consider reviewing upcoming spend.",
+    }
+    assert app_logic.budget_alert_status(1000, 1100) == {
+        "severity": "danger",
+        "remaining": -100.0,
+        "used_ratio": 1.1,
+        "message": "Budget is over by PHP 100.00.",
+    }
+
+
 def test_excel_exports_have_expected_sheets():
     assert load_workbook("ailyn_project_ledger.xlsx", read_only=True).sheetnames == [
         "Transactions", "Payroll", "Monthly Summary", "Receipt Archive"
