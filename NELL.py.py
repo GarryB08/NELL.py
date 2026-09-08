@@ -2,6 +2,7 @@ import os
 import time
 import base64
 import ast
+import logging
 from io import BytesIO
 import operator
 import smtplib
@@ -35,6 +36,14 @@ EXCEL_FILE = os.path.join(APP_DIR, "ailyn_project_ledger.xlsx")
 MATERIALS_EXCEL_FILE = os.path.join(APP_DIR, "materials_ledger.xlsx")
 LABOR_EXCEL_FILE = os.path.join(APP_DIR, "labor_ledger.xlsx")
 PHILIPPINES_TZ = ZoneInfo("Asia/Manila")
+
+LOGGER = logging.getLogger("ailyn_house")
+if not LOGGER.handlers:
+    logger_handler = logging.FileHandler(os.path.join(APP_DIR, "ailyn_house.log"), encoding="utf-8")
+    logger_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    LOGGER.addHandler(logger_handler)
+LOGGER.setLevel(logging.INFO)
+LOGGER.propagate = False
 
 
 def manila_now():
@@ -478,6 +487,10 @@ if "editing_payroll_expense_index" not in st.session_state:
     st.session_state.editing_payroll_expense_index = None
 if "dark_mode" not in st.session_state:
     st.session_state.dark_mode = False
+if "audit_events" not in st.session_state:
+    st.session_state.audit_events = []
+if "current_user_role" not in st.session_state:
+    st.session_state.current_user_role = "manager"
 if not os.path.exists(EXCEL_FILE):
     write_excel(st.session_state)
 if not os.path.exists(MATERIALS_EXCEL_FILE) or not os.path.exists(LABOR_EXCEL_FILE):
@@ -500,10 +513,13 @@ def project_settings_dialog():
         status = st.selectbox("Project status", ["Planning", "Active", "On Hold", "Completed"], index=["Planning", "Active", "On Hold", "Completed"].index(project.get("status", "Active")))
         target_date = st.date_input("Target completion", value=datetime.fromisoformat(project["target_date"]).date() if project.get("target_date") else manila_now().date())
         if st.form_submit_button("SAVE PROJECT DETAILS", use_container_width=True):
-            if not name.strip():
+            if not user_can_edit({"manager", "admin"}):
+                st.warning("Only managers can edit project details.")
+            elif not name.strip():
                 st.error("Project name is required.")
             else:
                 st.session_state.project = {"name": name.strip(), "client": client.strip(), "address": address.strip(), "manager": manager.strip(), "status": status, "target_date": target_date.isoformat()}
+                add_audit_event("project_updated", {"project": st.session_state.project})
                 persist_state()
                 st.success("Project details saved.")
 
@@ -1009,6 +1025,9 @@ function saveAsImage() {{
 
 
 def clear_all():
+    if not user_can_edit({"manager", "admin"}):
+        st.warning("Only managers can clear the workspace data.")
+        return
     st.session_state.records = []
     st.session_state.labor_records = []
     st.session_state.payroll_expenses = []
@@ -1033,6 +1052,81 @@ def clear_all():
 
 def persist_state():
     save_state(st.session_state)
+
+
+def build_dashboard_summary_payload():
+    budget = float(st.session_state.get("budget", 0) or 0)
+    used = float(get_total() or 0)
+    balance = float(get_balance() or 0)
+    monthly_summary = get_monthly_summary()
+    return {
+        "project": st.session_state.get("project", {}).get("name", "Ailyn House Project"),
+        "budget": budget,
+        "used": used,
+        "balance": balance,
+        "remaining_month": monthly_summary.get("remaining", 0.0),
+        "current_month": monthly_summary.get("month", ""),
+        "previous_month_delta": monthly_summary.get("delta_from_previous", 0.0),
+        "tasks_today": len([t for t in st.session_state.get("planner_tasks", []) if t.get("date_obj") == manila_now().strftime("%Y-%m-%d")]),
+        "tasks_upcoming": len([t for t in st.session_state.get("planner_tasks", []) if t.get("date_obj", "") >= manila_now().strftime("%Y-%m-%d")]),
+    }
+
+
+def dashboard_summary_csv():
+    payload = build_dashboard_summary_payload()
+    lines = [
+        "Metric,Value",
+        f"Project,{payload['project']}",
+        f"Budget,{payload['budget']:.2f}",
+        f"Used,{payload['used']:.2f}",
+        f"Balance,{payload['balance']:.2f}",
+        f"Remaining this month,{payload['remaining_month']:.2f}",
+        f"Current month,{payload['current_month']}",
+        f"Month-over-month delta,{payload['previous_month_delta']:.2f}",
+        f"Tasks today,{payload['tasks_today']}",
+        f"Upcoming tasks,{payload['tasks_upcoming']}",
+    ]
+    return "\n".join(lines)
+
+
+def add_audit_event(event_type, details=None, actor=None):
+    entry = {
+        "id": str(uuid.uuid4()),
+        "timestamp": manila_now().isoformat(),
+        "event_type": event_type,
+        "actor": actor or st.session_state.get("authenticated_user", "System"),
+        "role": st.session_state.get("current_user_role", "manager"),
+        "details": details or {},
+    }
+    st.session_state.audit_events = [entry] + list(st.session_state.get("audit_events", []))
+    LOGGER.info("%s | %s | %s | %s", event_type, entry["actor"], entry["role"], json.dumps(details or {}, default=str))
+    persist_state()
+
+
+def user_can_edit(allowed_roles=None):
+    allowed_roles = allowed_roles or {"manager", "admin"}
+    return st.session_state.get("current_user_role", "manager") in allowed_roles
+
+
+def render_recent_activity(limit=8):
+    activity = st.session_state.get("audit_events", [])[:limit]
+    if not activity:
+        st.info("No recent activity yet.")
+        return
+    st.dataframe(
+        [
+            {
+                "Time": item.get("timestamp", "").replace("T", " ")[:16],
+                "Actor": item.get("actor", "System"),
+                "Role": item.get("role", "manager"),
+                "Event": item.get("event_type", ""),
+                "Details": json.dumps(item.get("details", {}), default=str),
+            }
+            for item in activity
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
 
 
 @st.dialog("Take Photo")
@@ -1179,6 +1273,9 @@ def photo_camera_dialog():
 
 
 def record_budget_change(action, amount, previous_budget):
+    if not user_can_edit({"manager", "admin"}):
+        st.warning("Only managers can edit the project budget.")
+        return
     st.session_state.budget_history.append({
         "date": manila_now().strftime("%b %d, %Y %I:%M %p"),
         "action": action,
@@ -1186,6 +1283,7 @@ def record_budget_change(action, amount, previous_budget):
         "previous": float(previous_budget),
         "total": float(st.session_state.budget),
     })
+    add_audit_event("budget_changed", {"action": action, "amount": float(amount), "previous_budget": float(previous_budget), "new_budget": float(st.session_state.budget)})
     persist_state()
 
 
@@ -1367,6 +1465,9 @@ def payroll_report_dialog():
 
 
 def add_tx(name, price, qty, delivery, ttype, sender, record_date=None, details=None):
+    if not user_can_edit({"manager", "staff"}):
+        st.warning("You do not have permission to add project records.")
+        return False
     try:
         validated = validate_transaction_input(name, price, qty, delivery, ttype)
     except ValueError as error:
@@ -1399,6 +1500,16 @@ def add_tx(name, price, qty, delivery, ttype, sender, record_date=None, details=
         "sender": sender,
         **(details or {}),
     })
+    add_audit_event(
+        "transaction_added",
+        {
+            "type": ttype,
+            "name": validated["name"],
+            "amount": float(validated["amount"]),
+            "date": date_label,
+            "sender": sender,
+        },
+    )
     persist_state()
     return True
 
@@ -1859,6 +1970,362 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+st.markdown("""
+<style>
+:root {
+  --brand-bg-1: #04180f;
+  --brand-bg-2: #0c2d1d;
+  --brand-panel-top: rgba(17, 77, 47, 0.9);
+  --brand-panel-mid: rgba(7, 35, 22, 0.92);
+  --brand-panel-bottom: rgba(4, 22, 13, 0.96);
+  --brand-glass: rgba(11, 43, 30, 0.64);
+  --brand-glass-strong: rgba(15, 53, 36, 0.82);
+  --brand-edge: rgba(172, 255, 205, 0.22);
+  --brand-edge-soft: rgba(172, 255, 205, 0.14);
+  --brand-accent: #72f7b0;
+  --brand-accent-2: #96e7ff;
+  --brand-warm: #ffb38a;
+  --brand-strong: #0ed472;
+  --brand-muted: #b5d9c4;
+  --brand-text: #f4fff6;
+  --brand-text-soft: #cfe6d7;
+  --brand-shadow: rgba(0, 0, 0, 0.38);
+}
+
+/* Global luxury shell */
+.stApp {
+  background:
+    linear-gradient(135deg, rgba(2, 20, 12, 0.76), rgba(7, 48, 30, 0.62)),
+    url("https://images.unsplash.com/photo-1600585154340-be6161a56a0c") center/cover fixed;
+}
+
+.block-container {
+  background: linear-gradient(180deg, rgba(4, 25, 16, 0.58), rgba(5, 19, 12, 0.55));
+  border: 1px solid var(--brand-edge);
+  border-radius: 28px;
+  backdrop-filter: blur(24px) saturate(145%);
+  -webkit-backdrop-filter: blur(24px) saturate(145%);
+  box-shadow: 0 30px 90px rgba(0, 0, 0, 0.38), inset 0 1px 0 rgba(255,255,255,0.08);
+}
+
+/* Global premium surfaces */
+[data-testid="stMetric"] {
+  background: linear-gradient(145deg, rgba(16, 72, 44, 0.78), rgba(6, 28, 18, 0.86)) !important;
+  border: 1px solid rgba(163, 255, 194, 0.18);
+  border-radius: 22px !important;
+  box-shadow: 0 14px 32px rgba(0,0,0,0.24), inset 0 1px 0 rgba(255,255,255,0.08);
+  min-height: 122px;
+}
+
+[data-testid="stMetric"] label {
+  letter-spacing: 0.16em !important;
+  font-size: 10px !important;
+  text-transform: uppercase;
+  color: var(--brand-muted) !important;
+}
+
+[data-testid="stMetricValue"] {
+  font-size: 28px !important;
+  color: var(--brand-text) !important;
+}
+
+/* Buttons and inputs */
+button, .stDownloadButton > button, .stFormSubmitButton > button {
+  background: linear-gradient(145deg, rgba(26, 101, 59, 0.9), rgba(5, 37, 22, 0.96)) !important;
+  border: 1px solid rgba(163, 255, 194, 0.2) !important;
+  border-radius: 16px !important;
+  box-shadow: 0 8px 0 rgba(2, 17, 10, 0.78), 0 14px 32px rgba(0,0,0,0.22), inset 0 1px 0 rgba(255,255,255,0.08) !important;
+  transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+}
+
+button:hover, .stDownloadButton > button:hover, .stFormSubmitButton > button:hover {
+  transform: translateY(-2px);
+  border-color: rgba(114, 247, 176, 0.54) !important;
+  box-shadow: 0 10px 0 rgba(2, 17, 10, 0.82), 0 20px 34px rgba(0,0,0,0.3), 0 0 24px rgba(114,247,176,0.12), inset 0 1px 0 rgba(255,255,255,0.12) !important;
+}
+
+input, textarea, div[data-baseweb="input"], div[data-baseweb="select"] > div {
+  border-radius: 15px !important;
+  background: rgba(7, 34, 22, 0.82) !important;
+  border: 1px solid rgba(163,255,194,0.18) !important;
+  color: var(--brand-text) !important;
+  box-shadow: inset 0 4px 15px rgba(0,0,0,0.18);
+}
+
+input:focus, textarea:focus, div[data-baseweb="input"]:focus-within, div[data-baseweb="select"] > div:focus-within {
+  border-color: rgba(114,247,176,0.82) !important;
+  box-shadow: 0 0 0 3px rgba(114,247,176,0.08), 0 0 18px rgba(114,247,176,0.12), inset 0 4px 15px rgba(0,0,0,0.18);
+}
+
+.stAlert {
+  background: rgba(7, 31, 21, 0.8) !important;
+  border: 1px solid rgba(163,255,194,0.18) !important;
+  border-radius: 18px !important;
+}
+
+/* Sidebar */
+section[data-testid="stSidebar"] {
+  background: linear-gradient(180deg, rgba(1, 13, 8, 0.94), rgba(3, 24, 14, 0.9)) !important;
+  border-right: 1px solid rgba(114,247,176,0.12) !important;
+  backdrop-filter: blur(22px) saturate(140%);
+  -webkit-backdrop-filter: blur(22px) saturate(140%);
+}
+
+section[data-testid="stSidebar"] > div {
+  padding: 20px 16px 26px !important;
+}
+
+section[data-testid="stSidebar"] button {
+  min-height: 52px !important;
+  margin: 7px 0 !important;
+  border-radius: 18px !important;
+  background: linear-gradient(145deg, rgba(19, 80, 49, 0.7), rgba(3, 31, 18, 0.75)) !important;
+  border: 1px solid rgba(114,247,176,0.16) !important;
+  box-shadow: 0 10px 22px rgba(0,0,0,0.16), inset 0 1px 0 rgba(255,255,255,0.06) !important;
+}
+
+section[data-testid="stSidebar"] button:hover {
+  transform: translateX(2px) translateY(-2px);
+  border-color: rgba(114,247,176,0.55) !important;
+}
+
+/* Dataframes */
+div[data-testid="stDataFrame"] {
+  background: rgba(7, 34, 22, 0.4) !important;
+  border-radius: 18px !important;
+  border: 1px solid rgba(163,255,194,0.18) !important;
+  overflow: hidden;
+}
+
+/* New dashboard architecture */
+.dashboard-intro {
+  position: relative;
+  overflow: hidden;
+  margin-bottom: 18px;
+  padding: 22px 24px;
+  border-radius: 26px;
+  background: linear-gradient(135deg, rgba(16, 70, 41, 0.82), rgba(4, 27, 16, 0.76));
+  border: 1px solid rgba(163,255,194,0.18);
+  box-shadow: 0 20px 42px rgba(0,0,0,0.28), inset 0 1px 0 rgba(255,255,255,0.08);
+}
+
+.dashboard-intro:before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(110deg, transparent 0%, rgba(255,255,255,0.08) 42%, transparent 54%);
+  transform: translateX(-120%);
+  animation: scan-glow 8s linear infinite;
+}
+
+.dashboard-intro-inner {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.dashboard-brand {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.dashboard-brand img {
+  width: 56px;
+  height: 56px;
+  object-fit: contain;
+}
+
+.dashboard-brand h1 {
+  margin: 0;
+  font-size: clamp(24px, 2vw, 36px);
+  font-weight: 900;
+  letter-spacing: 0.06em;
+  color: var(--brand-text);
+}
+
+.dashboard-brand small {
+  display: block;
+  margin-top: 4px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  font-size: 10px;
+  font-weight: 800;
+  color: var(--brand-accent);
+}
+
+.dashboard-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  justify-content: flex-end;
+}
+
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: 999px;
+  background: rgba(114,247,176,0.08);
+  border: 1px solid rgba(114,247,176,0.2);
+  color: var(--brand-text-soft);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.status-pill .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--brand-accent);
+  box-shadow: 0 0 14px rgba(114,247,176,0.6);
+}
+
+.workspace-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 18px;
+}
+
+.workspace-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 10px 14px;
+  border-radius: 14px;
+  background: rgba(8, 35, 23, 0.66);
+  border: 1px solid rgba(163,255,194,0.16);
+  color: var(--brand-text-soft);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.glass-panel {
+  position: relative;
+  overflow: hidden;
+  padding: 18px;
+  border-radius: 22px;
+  background: linear-gradient(145deg, rgba(10, 42, 26, 0.82), rgba(5, 25, 15, 0.7));
+  border: 1px solid rgba(163,255,194,0.18);
+  box-shadow: 0 16px 32px rgba(0,0,0,0.22), inset 0 1px 0 rgba(255,255,255,0.08);
+}
+
+.section-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.section-heading h3 {
+  margin: 0;
+  font-size: 12px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--brand-accent);
+}
+
+.section-heading span {
+  color: var(--brand-muted);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.highlight-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.highlight-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: rgba(255,255,255,0.02);
+  border: 1px solid rgba(163,255,194,0.1);
+}
+
+.highlight-row strong {
+  color: var(--brand-text);
+  font-size: 13px;
+}
+
+.highlight-row span {
+  color: var(--brand-text-soft);
+  font-size: 12px;
+}
+
+.alert-strip {
+  padding: 12px 14px;
+  border-radius: 14px;
+  margin-bottom: 16px;
+  font-size: 12px;
+  font-weight: 700;
+  border: 1px solid rgba(163,255,194,0.14);
+}
+
+.alert-strip.warning {
+  background: rgba(228, 171, 74, 0.1);
+  border-color: rgba(228, 171, 74, 0.3);
+  color: #ffe0a6;
+}
+
+.alert-strip.danger {
+  background: rgba(217, 93, 93, 0.12);
+  border-color: rgba(217, 93, 93, 0.32);
+  color: #ffc1b1;
+}
+
+.alert-strip.success {
+  background: rgba(76, 198, 122, 0.08);
+  border-color: rgba(76, 198, 122, 0.28);
+  color: #d6f6e0;
+}
+
+@keyframes scan-glow {
+  0%, 55% { transform: translateX(-120%); }
+  80%, 100% { transform: translateX(180%); }
+}
+
+@media (max-width: 900px) {
+  .block-container {
+    padding-left: 18px !important;
+    padding-right: 18px !important;
+  }
+}
+
+@media (max-width: 640px) {
+  .dashboard-intro {
+    padding: 18px 16px;
+  }
+
+  .dashboard-intro-inner {
+    align-items: flex-start;
+  }
+
+  .dashboard-meta {
+    justify-content: flex-start;
+  }
+}
+</style>
+""", unsafe_allow_html=True)
+
 with st.sidebar:
     st.markdown(f"""
     <div class="sidebar-brand">
@@ -1947,68 +2414,60 @@ if view == "home":
     today_tasks = [t for t in st.session_state.planner_tasks if t.get("date_obj") == today_key]
     upcoming_tasks = [t for t in st.session_state.planner_tasks if t.get("date_obj", "") >= today_key]
 
-    st.markdown(f"""
-    <div class="dashboard-heading">
-    <img src="{AILYN_LOGO_DATA}" alt="Ailyn Construction Logo">
-      <div>
-        <div class="dashboard-heading-title">AILYN HOUSE PROJECT</div>
-        <div class="dashboard-heading-sub">PROJECT MANAGEMENT SYSTEM</div>
-      </div>
-    </div>
-    <div class="dashboard-welcome">🛡️ &nbsp; Welcome back, <b>{st.session_state.project.get("name", "Ailyn House Project")}</b> &nbsp;|&nbsp; Manage your construction project efficiently.</div>
-    """, unsafe_allow_html=True)
     project = st.session_state.project
-    if project.get("client") or project.get("address") or project.get("target_date"):
-        st.caption(
-            f"Client: {project.get('client') or 'Not set'}  |  Site: {project.get('address') or 'Not set'}  |  "
-            f"Target: {project.get('target_date') or 'Not set'}  |  Status: {project.get('status', 'Active')}"
-        )
     overdue_tasks = [
         task for task in st.session_state.planner_tasks
         if task.get("date_obj", "") < manila_now().strftime("%Y-%m-%d")
         and task.get("status") != "Completed"
     ]
-    budget_alert = budget_alert_status(budget, used)
-    if budget_alert["severity"] == "danger":
-        st.error(budget_alert["message"])
-    elif budget_alert["severity"] == "warning":
-        st.warning(budget_alert["message"])
-    elif budget_alert["severity"] == "info":
-        st.info(budget_alert["message"])
-    if overdue_tasks:
-        st.warning(f"{len(overdue_tasks)} scheduled task(s) are overdue.")
-
     monthly_summary = get_monthly_summary()
     current_month_name = datetime.strptime(monthly_summary["month"], "%Y-%m").strftime("%b %Y")
     previous_month_name = datetime.strptime(monthly_summary["previous_month"], "%Y-%m").strftime("%b %Y")
-
     budget_alert = budget_alert_status(budget, used)
+
+    st.markdown(
+        f"""
+        <div class="dashboard-intro">
+            <div class="dashboard-intro-inner">
+                <div class="dashboard-brand">
+                    <img src="{AILYN_LOGO_DATA}" alt="Ailyn Construction Logo">
+                    <div>
+                        <h1>AILYN HOUSE PROJECT</h1>
+                        <small>Project Management System</small>
+                    </div>
+                </div>
+                <div class="dashboard-meta">
+                    <div class="status-pill"><span class="dot"></span>{project.get('status', 'Active').upper()} PROJECT</div>
+                    <div class="status-pill">{current_month_name.upper()}</div>
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.caption(
+        f"Client: {project.get('client') or 'Not set'}  |  Site: {project.get('address') or 'Not set'}  |  "
+        f"Target: {project.get('target_date') or 'Not set'}  |  Manager: {project.get('manager') or 'Not set'}"
+    )
+
     if budget_alert["severity"] == "danger":
-        st.error(budget_alert["message"])
+        st.markdown("<div class='alert-strip danger'>" + budget_alert["message"] + "</div>", unsafe_allow_html=True)
     elif budget_alert["severity"] == "warning":
-        st.warning(budget_alert["message"])
+        st.markdown("<div class='alert-strip warning'>" + budget_alert["message"] + "</div>", unsafe_allow_html=True)
     elif budget_alert["severity"] == "info":
-        st.info(budget_alert["message"])
-
-    if monthly_summary["delta_from_previous"] > 0:
-        st.info(f"This month is PHP {monthly_summary['delta_from_previous']:,.2f} higher than {previous_month_name}.")
-    elif monthly_summary["delta_from_previous"] < 0:
-        st.success(f"This month is PHP {abs(monthly_summary['delta_from_previous']):,.2f} lower than {previous_month_name}.")
-
+        st.markdown("<div class='alert-strip success'>" + budget_alert["message"] + "</div>", unsafe_allow_html=True)
     if overdue_tasks:
-        st.warning(f"{len(overdue_tasks)} scheduled task(s) are overdue.")
+        st.markdown(f"<div class='alert-strip warning'>{len(overdue_tasks)} scheduled task(s) are overdue.</div>", unsafe_allow_html=True)
 
-    summary_col1, summary_col2, summary_col3, summary_col4, summary_col5 = st.columns(5)
-    with summary_col1:
-        st.metric("TOTAL BUDGET", f"₱{budget:,.2f}")
-    with summary_col2:
-        st.metric("TOTAL EXPENSES", f"₱{used:,.2f}")
-    with summary_col3:
-        st.metric("REMAINING BALANCE", f"₱{balance:,.2f}")
-    with summary_col4:
-        st.metric(f"MONTH SPENT ({manila_now().strftime('%b %Y').upper()})", f"₱{monthly_construction_spend():,.2f}")
-    with summary_col5:
-        st.metric("UPCOMING TASKS", f"{len(upcoming_tasks)}")
+    st.markdown("""
+    <div class="workspace-toolbar">
+        <span class="workspace-chip">Dashboard</span>
+        <span class="workspace-chip">Operations</span>
+        <span class="workspace-chip">Reports</span>
+        <span class="workspace-chip">Settings</span>
+    </div>
+    """, unsafe_allow_html=True)
 
     action_col1, action_col2, action_col3, action_col4 = st.columns(4)
     with action_col1:
@@ -2024,51 +2483,54 @@ if view == "home":
         if st.button("PAYROLL DASHBOARD", use_container_width=True):
             set_view("payroll_dashboard")
 
-    st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
+    summary_col1, summary_col2, summary_col3, summary_col4 = st.columns(4)
+    with summary_col1:
+        st.metric("Budget", f"₱{budget:,.2f}")
+    with summary_col2:
+        st.metric("Expenses", f"₱{used:,.2f}")
+    with summary_col3:
+        st.metric("Balance", f"₱{balance:,.2f}")
+    with summary_col4:
+        st.metric("Upcoming", f"{len(upcoming_tasks)}")
 
-    st.markdown(f"""
-    <div class="dash-section">
-      <div class="section-head">
-        <div class="section-title" style="margin:0">CENTRALIZED PROJECT OVERVIEW</div>
-        <span style="font-size:11px;color:#7b867f;font-weight:700">{project.get('status', 'Active').upper()} • {project.get('client') or 'No client assigned'}</span>
-      </div>
-      <div class="legend">
-        <div class="legend-row"><span><i class="dot" style="background:#075c28"></i>Project</span><b>{project.get('name', 'Ailyn House Project')}</b></div>
-        <div class="legend-row"><span><i class="dot" style="background:#e0aa25"></i>Site</span><b>{project.get('address') or 'Not set'}</b></div>
-        <div class="legend-row"><span><i class="dot" style="background:#a78bfa"></i>Manager</span><b>{project.get('manager') or 'Not set'}</b></div>
-        <div class="legend-row"><span><i class="dot" style="background:#f26d6d"></i>Target</span><b>{project.get('target_date') or 'Not set'}</b></div>
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
+    left, center, right = st.columns([1.2, 1.3, 1.1])
 
-    st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
-
-    left, center, right = st.columns([1.2, 1.1, 1.1])
     with left:
-        st.markdown(f"""
-        <div class="dash-section">
-          <div class="section-head"><div class="section-title" style="margin:0">EXPENSES OVERVIEW</div><span style="font-size:11px;color:#7b867f;font-weight:700">THIS PROJECT</span></div>
-          <div class="donut-wrap">
-            <div class="donut" style="--p1:{p1}deg;--p2:{p2}deg;--p3:{p3}deg"><div class="donut-center">₱{used:,.0f}<small>Total Expenses</small></div></div>
-            <div class="legend">
-              <div class="legend-row"><span><i class="dot" style="background:#075c28"></i>Materials</span><b>₱{material:,.2f}</b></div>
-              <div class="legend-row"><span><i class="dot" style="background:#e0aa25"></i>Expenses</span><b>₱{expenses:,.2f}</b></div>
-              <div class="legend-row"><span><i class="dot" style="background:#e85d4a"></i>Excess</span><b>₱{excess:,.2f}</b></div>
+        st.markdown(
+            f"""
+            <div class="glass-panel">
+                <div class="section-heading">
+                    <h3>Expense Mix</h3>
+                    <span>Live</span>
+                </div>
+                <div style="display:flex;align-items:center;gap:18px;flex-wrap:wrap;">
+                    <div class="donut" style="--p1:{p1}deg;--p2:{p2}deg;--p3:{p3}deg; width:160px; height:160px; flex:0 0 160px;">
+                        <div class="donut-center">₱{used:,.0f}<small>Total</small></div>
+                    </div>
+                    <div class="highlight-list" style="flex:1; min-width:180px;">
+                        <div class="highlight-row"><span>Materials</span><strong>₱{material:,.2f}</strong></div>
+                        <div class="highlight-row"><span>Expenses</span><strong>₱{expenses:,.2f}</strong></div>
+                        <div class="highlight-row"><span>Excess</span><strong>₱{excess:,.2f}</strong></div>
+                    </div>
+                </div>
             </div>
-          </div>
-        </div>
-        """, unsafe_allow_html=True)
+            """,
+            unsafe_allow_html=True,
+        )
 
     with center:
         trend_rows = monthly_trend_summary(st.session_state.records, st.session_state.labor_records, st.session_state.payroll_expenses, months=6)
-        st.markdown("""
-        <div class="dash-section">
-          <div class="section-head">
-            <div class="section-title" style="margin:0">MONTHLY TREND</div>
-            <span style="font-size:11px;color:#7b867f;font-weight:700">LAST 6 MONTHS</span>
-          </div>
-        </div>
-        """, unsafe_allow_html=True)
+        st.markdown(
+            """
+            <div class="glass-panel">
+                <div class="section-heading">
+                    <h3>Monthly Trend</h3>
+                    <span>Last 6 months</span>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
         if trend_rows:
             st.dataframe(
                 trend_rows,
@@ -2087,59 +2549,80 @@ if view == "home":
             st.info("No monthly activity yet.")
 
     with right:
-        tx = list(reversed(st.session_state.records))[:5]
-        tx_html = ""
-        if tx:
-            for r in tx:
-                icon = "🛒" if r.get("type") == "material" else "▣" if r.get("type") == "expense" else "+"
-                tx_html += f'''<div class="tx-row"><div class="tx-left"><div class="tx-icon">{icon}</div><div><div class="tx-name">{r.get("name", "Transaction")}</div><div class="tx-type">{str(r.get("type", "")).title()}</div></div></div><div class="tx-right">₱{float(r.get("amount", 0)):,.2f}<div class="tx-date">{r.get("date", "")}</div></div></div>'''
+        recent = list(reversed(st.session_state.records))[:5]
+        recent_html = ""
+        if recent:
+            for r in recent:
+                recent_html += f"""
+                <div class="highlight-row">
+                    <div>
+                        <strong>{r.get('name', 'Transaction')}</strong><br>
+                        <span>{str(r.get('type', '')).title()} • {r.get('date', '')}</span>
+                    </div>
+                    <strong>₱{float(r.get('amount', 0)):,.2f}</strong>
+                </div>
+                """
         else:
-            tx_html = '<div style="padding:30px 0;color:#7a857e;text-align:center">No transactions yet.</div>'
+            recent_html = "<div class='highlight-row'><span>No transactions yet.</span></div>"
+
         st.markdown(
-            f'''<div class="dash-section"><div class="section-head"><div class="section-title" style="margin:0">RECENT TRANSACTIONS</div><span style="font-size:11px;color:#7b867f">LATEST 5</span></div>{tx_html}</div>''',
-            unsafe_allow_html=True)
+            f"""
+            <div class="glass-panel">
+                <div class="section-heading">
+                    <h3>Recent Activity</h3>
+                    <span>Latest 5</span>
+                </div>
+                <div class="highlight-list">{recent_html}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
     st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
 
-    st.markdown(f"""
-    <div class="dash-section">
-      <div class="section-head"><div class="section-title" style="margin:0">MONTHLY OVERVIEW</div><span style="font-size:11px;color:#7b867f;font-weight:700">{current_month_name}</span></div>
-      <div class="legend">
-        <div class="legend-row"><span><i class="dot" style="background:#075c28"></i>Materials</span><b>₱{monthly_summary['materials']:,.2f}</b></div>
-        <div class="legend-row"><span><i class="dot" style="background:#e0aa25"></i>Construction</span><b>₱{monthly_summary['construction']:,.2f}</b></div>
-        <div class="legend-row"><span><i class="dot" style="background:#a78bfa"></i>Labor</span><b>₱{monthly_summary['labor']:,.2f}</b></div>
-        <div class="legend-row"><span><i class="dot" style="background:#f26d6d"></i>Payroll</span><b>₱{monthly_summary['payroll']:,.2f}</b></div>
-        <div class="legend-row"><span><i class="dot" style="background:#4ade80"></i>Remaining</span><b>₱{monthly_summary['remaining']:,.2f}</b></div>
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
+    overview_left, overview_right = st.columns([1.3, 1])
+    with overview_left:
+        st.markdown(
+            f"""
+            <div class="glass-panel">
+                <div class="section-heading">
+                    <h3>Monthly Overview</h3>
+                    <span>{current_month_name}</span>
+                </div>
+                <div class="highlight-list">
+                    <div class="highlight-row"><span>Materials</span><strong>₱{monthly_summary['materials']:,.2f}</strong></div>
+                    <div class="highlight-row"><span>Construction</span><strong>₱{monthly_summary['construction']:,.2f}</strong></div>
+                    <div class="highlight-row"><span>Labor</span><strong>₱{monthly_summary['labor']:,.2f}</strong></div>
+                    <div class="highlight-row"><span>Payroll</span><strong>₱{monthly_summary['payroll']:,.2f}</strong></div>
+                    <div class="highlight-row"><span>Remaining</span><strong>₱{monthly_summary['remaining']:,.2f}</strong></div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
-    st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
+    with overview_right:
+        st.markdown(
+            f"""
+            <div class="glass-panel">
+                <div class="section-heading">
+                    <h3>Task Summary</h3>
+                    <span>Live status</span>
+                </div>
+                <div class="highlight-list">
+                    <div class="highlight-row"><span>Today</span><strong>{len(today_tasks)}</strong></div>
+                    <div class="highlight-row"><span>Upcoming</span><strong>{len(upcoming_tasks)}</strong></div>
+                    <div class="highlight-row"><span>Overdue</span><strong>{len(overdue_tasks)}</strong></div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
-    left, right = st.columns([1.3, 1])
-    with left:
-        st.markdown(f"""
-        <div class="dash-section">
-          <div class="schedule">
-            <div class="schedule-icon">▦</div>
-            <div><div class="schedule-title">TODAY'S SCHEDULE</div><div style="font-weight:800;font-size:13px;margin-top:4px">{manila_now().strftime('%B %d, %Y (%A)')}</div><div class="schedule-muted">{len(today_tasks)} task(s) scheduled for today.</div></div>
-            <div style="width:1px;height:58px;background:#dfe8e1;margin:0 12px"></div>
-            <div><div class="schedule-title">UPCOMING TASKS</div><div style="font-weight:800;font-size:13px;margin-top:4px">{len(upcoming_tasks)} task(s) planned</div><div class="schedule-muted">Stay on track and manage your construction tasks.</div></div>
-            <div style="margin-left:auto"><div class="open-planner">▣ &nbsp; Open Planner</div></div>
-          </div>
-        </div>
-        """, unsafe_allow_html=True)
-    with right:
-        st.markdown(f"""
-        <div class="dash-section">
-          <div class="section-head"><div class="section-title" style="margin:0">TASK SUMMARY</div><span style="font-size:11px;color:#7b867f;font-weight:700">LIVE STATUS</span></div>
-          <div class="legend">
-            <div class="legend-row"><span><i class="dot" style="background:#075c28"></i>Today's tasks</span><b>{len(today_tasks)}</b></div>
-            <div class="legend-row"><span><i class="dot" style="background:#e0aa25"></i>Upcoming</span><b>{len(upcoming_tasks)}</b></div>
-            <div class="legend-row"><span><i class="dot" style="background:#e85d4a"></i>Overdue</span><b>{len(overdue_tasks)}</b></div>
-          </div>
-        </div>
-        """, unsafe_allow_html=True)
+    if monthly_summary["delta_from_previous"] > 0:
+        st.info(f"This month is PHP {monthly_summary['delta_from_previous']:,.2f} higher than {previous_month_name}.")
+    elif monthly_summary["delta_from_previous"] < 0:
+        st.success(f"This month is PHP {abs(monthly_summary['delta_from_previous']):,.2f} lower than {previous_month_name}.")
 
 elif view == "payroll_dashboard":
     payroll_labor = sum(float(record.get("net", 0)) for record in st.session_state.labor_records)
@@ -3477,6 +3960,7 @@ elif view == "settings":
                     st.error("Enter a valid email address.")
                 else:
                     settings.update({"display_name": display_name.strip(), "email": email.strip(), "meeting_url": meeting_url.strip()})
+                    add_audit_event("profile_updated", {"display_name": display_name.strip(), "email": email.strip()})
                     persist_state()
                     st.success("Profile saved.")
     with preference_tab:
@@ -3489,6 +3973,7 @@ elif view == "settings":
             if st.form_submit_button("SAVE PREFERENCES", use_container_width=True):
                 st.session_state.dark_mode = dark_mode
                 settings.update({"client_mode": client_mode, "email_notifications": email_notifications, "budget_alerts": budget_alerts, "date_format": date_format})
+                add_audit_event("preferences_updated", {"budget_alerts": budget_alerts, "email_notifications": email_notifications, "date_format": date_format})
                 persist_state()
                 st.success("Preferences saved.")
                 st.rerun()
@@ -3501,6 +3986,22 @@ elif view == "settings":
                 st.rerun()
         else:
             st.info("Password login is disabled. Set AILYN_LOGIN_PASSWORD to protect this workspace.")
+
+        with st.form("role_access_form"):
+            role_options = ["manager", "staff", "viewer"]
+            current_role_index = role_options.index(st.session_state.get("current_user_role", "manager")) if st.session_state.get("current_user_role", "manager") in role_options else 0
+            current_user_role = st.selectbox("Current role", role_options, index=current_role_index, help="Manager can edit, staff can add records, viewer is read-only.")
+            if st.form_submit_button("SAVE ROLE", use_container_width=True):
+                st.session_state.current_user_role = current_user_role
+                add_audit_event("role_updated", {"role": current_user_role})
+                persist_state()
+                st.success("Role updated.")
+                st.rerun()
+
+        st.markdown("### Role permissions")
+        st.write("- Manager: full access, budgets, backups, settings")
+        st.write("- Staff: add records, view dashboards, export reports")
+        st.write("- Viewer: read-only dashboards and exports")
         st.markdown("### Social login readiness")
         google_ready = bool(os.getenv("GOOGLE_CLIENT_ID"))
         facebook_ready = bool(os.getenv("FACEBOOK_APP_ID"))
@@ -3509,10 +4010,16 @@ elif view == "settings":
         st.caption("Social login requires provider credentials, redirect URLs, and HTTPS. Add those through your deployment secrets; never save client secrets in app data.")
         st.markdown("### Data protection")
         st.write(f"Database backups available: {history_count() > 0}")
-        if st.button("CREATE BACKUP", use_container_width=True, key="settings_backup"):
-            backup_path = create_backup()
-            with open(backup_path, "rb") as backup_file:
-                st.download_button("DOWNLOAD BACKUP", backup_file.read(), file_name=os.path.basename(backup_path), mime="application/octet-stream", use_container_width=True, key="settings_download_backup")
+        if user_can_edit({"manager", "admin"}):
+            if st.button("CREATE BACKUP", use_container_width=True, key="settings_backup"):
+                backup_path = create_backup()
+                add_audit_event("backup_created", {"backup_path": os.path.basename(backup_path)})
+                with open(backup_path, "rb") as backup_file:
+                    st.download_button("DOWNLOAD BACKUP", backup_file.read(), file_name=os.path.basename(backup_path), mime="application/octet-stream", use_container_width=True, key="settings_download_backup")
+        else:
+            st.info("Backup creation is restricted to managers.")
+        st.markdown("### Recent activity")
+        render_recent_activity(limit=10)
 
 elif view == "photo_scanner":
     st.markdown("## PHOTO STUDIO")
