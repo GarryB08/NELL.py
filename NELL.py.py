@@ -503,6 +503,46 @@ def set_view(v):
     st.rerun()
 
 
+def render_top_navigation():
+    st.markdown(
+        f"""
+        <div class="top-nav-shell">
+            <div class="top-nav-brand">
+                <img class="top-nav-logo" src="{AILYN_LOGO_DATA}" alt="Ailyn Construction Logo">
+                <div>
+                    <div class="top-nav-title">AILYN HOUSE PROJECT</div>
+                    <div class="top-nav-subtitle">Official Project Control</div>
+                </div>
+            </div>
+            <div class="top-nav-meta">
+                <div class="top-nav-status"><span class="nav-status-dot"></span> LIVE SYSTEM</div>
+                <div class="top-nav-date">{manila_now().strftime('%b %d, %Y • %I:%M %p')}</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    nav_items = [
+        ("Dashboard", "home"),
+        ("Planner", "planner_output"),
+        ("Materials", "material"),
+        ("Ledger", "ledger"),
+        ("Payroll", "payroll_dashboard"),
+        ("Reports", "export"),
+        ("Tools", "project_tools"),
+        ("Settings", "settings"),
+    ]
+
+    nav_cols = st.columns(len(nav_items))
+    for index, (label, target) in enumerate(nav_items):
+        with nav_cols[index]:
+            if st.button(label, key=f"nav_{target}", use_container_width=True):
+                set_view(target)
+
+    st.markdown("<div class='nav-spacer'></div>", unsafe_allow_html=True)
+
+
 def render_module_shell(title, subtitle="", badge="OPERATIONS"):
     st.markdown(
         f"""
@@ -2233,6 +2273,96 @@ div[data-testid="stDataFrame"] {
   box-shadow: 0 0 14px rgba(114,247,176,0.6);
 }
 
+.top-nav-shell {
+  position: relative;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 18px;
+  margin: 0 0 18px;
+  padding: 18px 20px;
+  border-radius: 26px;
+  background: linear-gradient(145deg, rgba(17, 73, 45, 0.82), rgba(6, 31, 18, 0.72));
+  border: 1px solid rgba(163,255,194,0.18);
+  box-shadow: 0 18px 36px rgba(0,0,0,0.26), inset 0 1px 0 rgba(255,255,255,0.08);
+}
+
+.top-nav-shell:before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(110deg, transparent 0%, rgba(255,255,255,0.06) 42%, transparent 54%);
+  transform: translateX(-120%);
+  animation: scan-glow 8s linear infinite;
+}
+
+.top-nav-brand, .top-nav-meta {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.top-nav-logo {
+  width: 54px;
+  height: 54px;
+  object-fit: contain;
+  filter: drop-shadow(0 8px 16px rgba(0,0,0,0.24));
+}
+
+.top-nav-title {
+  color: #f5fff8;
+  font-family: 'Outfit', sans-serif;
+  font-size: clamp(18px, 1.6vw, 24px);
+  font-weight: 900;
+  letter-spacing: 0.06em;
+}
+
+.top-nav-subtitle {
+  color: #8fe0bb;
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+
+.top-nav-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: 999px;
+  background: rgba(114,247,176,0.08);
+  border: 1px solid rgba(114,247,176,0.20);
+  color: #dffae9;
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.nav-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #72f7b0;
+  box-shadow: 0 0 14px rgba(114,247,176,0.6);
+}
+
+.top-nav-date {
+  color: #dcefe5;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+}
+
+.nav-spacer {
+  height: 8px;
+}
+
 .workspace-toolbar {
   display: flex;
   flex-wrap: wrap;
@@ -2446,76 +2576,7 @@ div[data-testid="stDataFrame"] {
 </style>
 """, unsafe_allow_html=True)
 
-with st.sidebar:
-    st.markdown(f"""
-    <div class="sidebar-brand">
-      <div class="brand-row">
-        <img class="brand-logo" src="{AILYN_LOGO_DATA}" alt="Ailyn Construction Logo">
-        <div class="brand-copy">
-        <div class="brand-title"><span>AILYN HOUSE</span><span>PROJECT</span></div>
-          <div class="brand-sub">Official Project Control</div>
-        </div>
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
-    st.markdown(
-        f"<div class='sidebar-live'><span>●</span> &nbsp; LIVE SYSTEM &nbsp; • &nbsp; "
-        f"{manila_now().strftime('%I:%M %p  |  %b %d')}</div>",
-        unsafe_allow_html=True
-    )
-
-    st.subheader("Executive Overview")
-    if st.button("📊   Dashboard   ›", use_container_width=True, key="side_dashboard"):
-        set_view("home")
-
-    st.markdown("<div class='sidebar-budget-card'><div class='budget-title'>Budget Control</div></div>",
-                unsafe_allow_html=True)
-    if st.button("💰   Apply Budget", use_container_width=True, key="side_budget"):
-        budget_dialog()
-
-    if st.button("🔄   Restart System   ›", use_container_width=True, key="side_restart"):
-        clear_all()
-        set_view("home")
-
-    with st.expander("Project Details", expanded=False):
-        project = st.session_state.project
-        st.caption(f"{project.get('status', 'Active')} project")
-        if st.button("EDIT PROJECT DETAILS", use_container_width=True, key="side_project_details"):
-            project_settings_dialog()
-
-    st.subheader("Project Control")
-    if st.button("📝   New Work Entry   ›", use_container_width=True, key="side_new_work"):
-        set_view("planner_input")
-    if st.button("📅   Schedule & Progress   ›", use_container_width=True, key="side_schedule"):
-        set_view("planner_output")
-
-    st.subheader("Financial Operations")
-    if st.button("🧱   Material Entry   ›", use_container_width=True, key="side_material"):
-        set_view("material")
-    if st.button("🧾   Expense Entry   ›", use_container_width=True, key="side_expense"):
-        set_view("expense")
-    if st.button("🏦   Encash Deposit   ›", use_container_width=True, key="side_excess"):
-        set_view("excess")
-    if st.button("📒   Financial Ledger   ›", use_container_width=True, key="side_ledger"):
-        set_view("ledger")
-    if st.button("📈   Financial Report   ›", use_container_width=True, key="side_financial_report"):
-        set_view("export")
-
-    st.subheader("Payroll Operations")
-    if st.button("📊   Payroll Dashboard   ›", use_container_width=True, key="side_payroll_dashboard"):
-        set_view("payroll_dashboard")
-    if st.button("👷   Labor Account   ›", use_container_width=True, key="side_labor"):
-        set_view("add_labor")
-    if st.button("💳   Payroll Expense   ›", use_container_width=True, key="side_payroll_expense"):
-        set_view("add_payroll_expense")
-    if st.button("🪙   Account Remainder   ›", use_container_width=True, key="side_payroll_remaining"):
-        set_view("payroll_remaining")
-    if st.button("👥   Labor Accounts   ›", use_container_width=True, key="side_payroll_ledger"):
-        set_view("payroll_ledger")
-    if st.button("📋   Payroll Report   ›", use_container_width=True, key="side_payroll_report"):
-        set_view("payroll_export")
-    if st.button("🗃️   Receipts Archive   ›", use_container_width=True, key="side_archive"):
-        set_view("receipt_archive")
+render_top_navigation()
 
 view = st.session_state.view
 
