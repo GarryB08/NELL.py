@@ -65,3 +65,36 @@ def monthly_totals(records, labor_records, payroll_expenses, month):
     payroll = sum(float(r.get("price", 0)) for r in payroll_expenses if r.get("month") == month)
     return {"materials": materials, "construction": construction, "labor": labor, "payroll": payroll,
             "total": materials + construction + labor + payroll}
+
+
+def monthly_trend_summary(records, labor_records, payroll_expenses, months=6):
+    """Return recent monthly totals for dashboard analytics in descending month order."""
+    month_keys = sorted(
+        {
+            record.get("month")
+            for record in records
+            if record.get("month")
+        }
+        | {record.get("month") for record in labor_records if record.get("month")}
+        | {record.get("month") for record in payroll_expenses if record.get("month")},
+        reverse=True,
+    )[:months]
+
+    trend_rows = []
+    for month in month_keys:
+        materials = sum(float(r.get("amount", 0)) for r in records if r.get("type") == "material" and r.get("month") == month)
+        construction = sum(float(r.get("amount", 0)) for r in records if r.get("type") == "expense" and r.get("month") == month)
+        labor = sum(float(r.get("net", 0)) for r in labor_records if r.get("month") == month)
+        payroll = sum(float(r.get("price", 0)) for r in payroll_expenses if r.get("month") == month)
+        total = materials + construction + labor + payroll
+        trend_rows.append(
+            {
+                "Month": month,
+                "Materials": materials,
+                "Construction": construction,
+                "Labor": labor,
+                "Payroll": payroll,
+                "Total": total,
+            }
+        )
+    return trend_rows

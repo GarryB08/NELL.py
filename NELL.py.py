@@ -27,7 +27,7 @@ except ModuleNotFoundError:
 TESSERACT_NOT_FOUND_ERROR = getattr(pytesseract, "TesseractNotFoundError", RuntimeError)
 from storage import BACKUP_DIR, DB_FILE, create_backup, delete_scanner_photo, history_count, load_state as load_sqlite_state
 from storage import restore_backup, save_scanner_photo, save_state as save_sqlite_state
-from app_logic import FULL_DAY_RATES, TIER_TABLE, calculate_labor_pay, get_partial_rate
+from app_logic import FULL_DAY_RATES, TIER_TABLE, calculate_labor_pay, get_partial_rate, monthly_trend_summary
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(APP_DIR, "app_state.json")
@@ -547,6 +547,100 @@ def monthly_construction_spend(month=None):
     )
 
 
+def validate_transaction_input(name, price, qty, delivery, transaction_type="material"):
+    clean_name = (name or "").strip()
+    if not clean_name:
+        raise ValueError("Please enter a valid item name.")
+
+    amount = float(price if price is not None else 0.0)
+    quantity = int(qty if qty is not None else 1)
+    delivery_value = float(delivery if delivery is not None else 0.0)
+
+    if amount <= 0:
+        raise ValueError("Please enter an amount greater than zero.")
+    if transaction_type == "material" and quantity < 1:
+        raise ValueError("Please enter a quantity greater than zero.")
+    if delivery_value < 0:
+        raise ValueError("Delivery cannot be negative.")
+
+    total_amount = (amount * quantity) + delivery_value if transaction_type == "material" else amount
+    return {
+        "name": clean_name.upper(),
+        "price": amount,
+        "qty": quantity,
+        "delivery": delivery_value,
+        "amount": float(total_amount),
+    }
+
+
+def get_monthly_summary(month=None):
+    month = month or manila_now().strftime("%Y-%m")
+
+    def month_range(month_key_value):
+        try:
+            year, month_num = [int(part) for part in month_key_value.split("-")]
+        except ValueError:
+            return None, None
+        return year, month_num
+
+    def previous_month(month_key_value):
+        year, month_num = month_range(month_key_value)
+        if year is None:
+            return month_key_value
+        if month_num == 1:
+            return f"{year - 1}-12"
+        return f"{year}-{month_num - 1:02d}"
+
+    def aggregate(source_records, kind):
+        if kind == "materials":
+            return sum(float(record.get("amount", 0)) for record in source_records if record.get("type") == "material" and month_key(record) == month)
+        if kind == "expenses":
+            return sum(float(record.get("amount", 0)) for record in source_records if record.get("type") == "expense" and month_key(record) == month)
+        if kind == "excess":
+            return sum(float(record.get("amount", 0)) for record in source_records if record.get("type") == "excess" and month_key(record) == month)
+        if kind == "labor":
+            return sum(float(record.get("net", 0)) for record in source_records if month_key(record) == month)
+        if kind == "payroll":
+            return sum(float(record.get("price", 0)) for record in source_records if month_key(record) == month)
+        return 0.0
+
+    materials = aggregate(st.session_state.records, "materials")
+    construction = aggregate(st.session_state.records, "expenses")
+    excess = aggregate(st.session_state.records, "excess")
+    labor = aggregate(st.session_state.labor_records, "labor")
+    payroll = aggregate(st.session_state.payroll_expenses, "payroll")
+    total_spent = materials + construction + labor + payroll
+    budget = float(st.session_state.budget or 0)
+    remaining = budget - total_spent
+    previous_key = previous_month(month)
+
+    previous_materials = aggregate(st.session_state.records, "materials") if False else 0.0
+    previous_construction = previous_materials
+    previous_labor = previous_materials
+    previous_payroll = previous_materials
+
+    previous_materials = sum(float(record.get("amount", 0)) for record in st.session_state.records if record.get("type") == "material" and month_key(record) == previous_key)
+    previous_construction = sum(float(record.get("amount", 0)) for record in st.session_state.records if record.get("type") == "expense" and month_key(record) == previous_key)
+    previous_labor = sum(float(record.get("net", 0)) for record in st.session_state.labor_records if month_key(record) == previous_key)
+    previous_payroll = sum(float(record.get("price", 0)) for record in st.session_state.payroll_expenses if month_key(record) == previous_key)
+    previous_total = previous_materials + previous_construction + previous_labor + previous_payroll
+
+    return {
+        "month": month,
+        "previous_month": previous_key,
+        "materials": materials,
+        "construction": construction,
+        "excess": excess,
+        "labor": labor,
+        "payroll": payroll,
+        "total_spent": total_spent,
+        "budget": budget,
+        "remaining": remaining,
+        "previous_total": previous_total,
+        "delta_from_previous": total_spent - previous_total,
+    }
+
+
 # ================================================================
 # COMBINED MAIN RECEIPTS — FINANCIAL REPORT + PAYROLL REPORT
 # Copied from the MAIN receipt implementation.
@@ -626,8 +720,10 @@ def build_html_report(records, budget, custom_title="INVENTORY RECEIPT"):
 <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
 <style>
 @import url('https://fonts.googleapis.com/css?family=Inter:wght@400;600;700&display=swap');
+* {{ box-sizing: border-box; }}
+html, body {{ width: 100%; max-width: 100%; margin: 0; padding: 0; overflow-x: hidden; }}
 body {{ font-family: 'Inter', sans-serif; background-color: #f0f4f0; margin: 0; padding: 20px; color: #333; }}
-.receipt-container {{ max-width: 1000px; margin: auto; background: #fff; padding: 30px; border-radius: 4px; box-shadow: 0 4px 20px rgba(0,0,0,0.08); border-top: 10px solid #1b5e20; }}
+.receipt-container {{ width: min(100%, 980px); max-width: 980px; margin: auto; background: #fff; padding: clamp(16px, 2vw, 30px); border-radius: 4px; box-shadow: 0 4px 20px rgba(0,0,0,0.08); border-top: 10px solid #1b5e20; overflow-wrap: anywhere; word-break: break-word; }}
 .header {{ display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-start; margin-bottom: 30px; border-bottom: 2px solid #f0f0f0; padding-bottom: 15px; }}
 .company-info h1 {{ color: #1b5e20; margin: 0; font-size: 24px; letter-spacing: -1px; }}
 .company-info p {{ margin: 4px 0; font-size: 12px; color: #666; }}
@@ -635,9 +731,9 @@ body {{ font-family: 'Inter', sans-serif; background-color: #f0f4f0; margin: 0; 
 @media (min-width: 768px) {{ .receipt-meta {{ text-align: right; margin-top: 0; }} }}
 .receipt-meta h2 {{ margin: 0; font-size: 16px; text-transform: uppercase; color: #1b5e20; }}
 .receipt-meta p {{ margin: 4px 0; font-size: 12px; font-weight: bold; }}
-table {{ width: 100%; border-collapse: collapse; margin-bottom: 20px; font-size: 12px; }}
+table {{ width: 100%; border-collapse: collapse; margin-bottom: 20px; font-size: 12px; table-layout: fixed; }}
 th {{ background-color: #1b5e20; color: #ffffff; text-align: left; padding: 10px; text-transform: uppercase; letter-spacing: 1px; }}
-td {{ padding: 10px 8px; border-bottom: 1px solid #f0f0f0; }}
+td {{ padding: 10px 8px; border-bottom: 1px solid #f0f0f0; overflow-wrap: anywhere; word-break: break-word; }}
 .qty-col, .desccol, .pricecol, .deliverycol, .totalcol {{ text-align: left; }}
 td.desccol {{ font-weight: 700; color: #333333; }}
 th.desccol {{ color: #ffffff; }}
@@ -777,10 +873,10 @@ def generate_payroll_html(labor_records, expense_records, remaining_money=0.0, c
 html, body {{ width: 100%; max-width: 100%; margin: 0; overflow-x: hidden; }}
 @import url('https://fonts.googleapis.com/css?family=Inter:wght@400;600;700&display=swap');
 body {{ font-family: 'Inter', sans-serif !important; background-color: #f0f4f0 !important; color: #333; padding: 20px !important; }}
-#receiptContent {{ width: min(100%, 1000px); margin: 0 auto !important; background: #fff !important; padding: 30px !important; border-radius: 4px !important; box-shadow: 0 4px 20px rgba(0,0,0,0.08) !important; border-top: 10px solid #1b5e20 !important; }}
-#receiptContent table {{ max-width: 100%; }}
+#receiptContent {{ width: min(100%, 980px); max-width: 980px; margin: 0 auto !important; background: #fff !important; padding: clamp(16px, 2vw, 30px) !important; border-radius: 4px !important; box-shadow: 0 4px 20px rgba(0,0,0,0.08) !important; border-top: 10px solid #1b5e20 !important; overflow-wrap: anywhere; word-break: break-word; }}
+#receiptContent table {{ width: 100%; max-width: 100%; table-layout: fixed; }}
 #receiptContent th {{ background-color: #1b5e20 !important; color: #fff !important; text-transform: uppercase; letter-spacing: 1px; }}
-#receiptContent td {{ border-bottom: 1px solid #f0f0f0 !important; overflow-wrap: anywhere; }}
+#receiptContent td {{ border-bottom: 1px solid #f0f0f0 !important; overflow-wrap: anywhere; word-break: break-word; }}
 #receiptContent h1, #receiptContent h3 {{ color: #1b5e20 !important; }}
 #receiptContent > table:first-child {{ margin-bottom: 30px !important; }}
 #receiptContent > table:last-of-type td:last-child {{ background: #013220 !important; color: #fff !important; }}
@@ -1271,21 +1367,34 @@ def payroll_report_dialog():
 
 
 def add_tx(name, price, qty, delivery, ttype, sender, record_date=None, details=None):
-    p = float(price or 0.0)
-    q = int(qty or 0)
-    d = float(delivery or 0.0)
-    if p <= 0 or q <= 0:
+    try:
+        validated = validate_transaction_input(name, price, qty, delivery, ttype)
+    except ValueError as error:
+        st.warning(str(error))
         return False
-    amount = (p * q) + d if ttype == "material" else p
+
+    date_value = record_date or manila_now().date()
+    date_label = date_value.strftime("%b %d, %Y") if hasattr(date_value, "strftime") else manila_now().strftime("%b %d, %Y")
+    duplicate_record = any(
+        record.get("type") == ttype
+        and record.get("name", "").upper() == validated["name"]
+        and float(record.get("amount", 0) or 0) == validated["amount"]
+        and record.get("date", "") == date_label
+        for record in st.session_state.records
+    )
+    if duplicate_record:
+        st.warning("This exact record already exists. Duplicate entries were blocked.")
+        return False
+
     st.session_state.records.append({
         "id": str(time.time()),
-        "date": manila_now().strftime("%b %d, %Y"),
-        "recorded_at": datetime.combine(record_date or manila_now().date(), datetime.min.time(), PHILIPPINES_TZ).isoformat(),
-        "name": name.upper(),
-        "price": p,
-        "qty": q,
-        "delivery": d,
-        "amount": float(amount),
+        "date": date_label,
+        "recorded_at": datetime.combine(date_value, datetime.min.time(), PHILIPPINES_TZ).isoformat(),
+        "name": validated["name"],
+        "price": validated["price"],
+        "qty": validated["qty"],
+        "delivery": validated["delivery"],
+        "amount": float(validated["amount"]),
         "type": ttype,
         "sender": sender,
         **(details or {}),
@@ -1864,6 +1973,14 @@ if view == "home":
     if overdue_tasks:
         st.warning(f"{len(overdue_tasks)} scheduled task(s) are overdue.")
 
+    monthly_summary = get_monthly_summary()
+    current_month_name = datetime.strptime(monthly_summary["month"], "%Y-%m").strftime("%b %Y")
+    previous_month_name = datetime.strptime(monthly_summary["previous_month"], "%Y-%m").strftime("%b %Y")
+    if monthly_summary["delta_from_previous"] > 0:
+        st.info(f"This month is PHP {monthly_summary['delta_from_previous']:,.2f} higher than {previous_month_name}.")
+    elif monthly_summary["delta_from_previous"] < 0:
+        st.success(f"This month is PHP {abs(monthly_summary['delta_from_previous']):,.2f} lower than {previous_month_name}.")
+
     m1, m2, m3, m4 = st.columns(4)
     with m1:
         st.metric("TOTAL BUDGET", f"₱{budget:,.2f}")
@@ -1906,6 +2023,36 @@ if view == "home":
             f'''<div class="dash-section"><div class="section-head"><div class="section-title" style="margin:0">RECENT TRANSACTIONS</div><span style="font-size:11px;color:#7b867f">LATEST 5</span></div>{tx_html}</div>''',
             unsafe_allow_html=True)
 
+    st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
+    st.markdown(f"""
+    <div class="dash-section">
+      <div class="section-head"><div class="section-title" style="margin:0">MONTHLY OVERVIEW</div><span style="font-size:11px;color:#7b867f;font-weight:700">{current_month_name}</span></div>
+      <div class="legend">
+        <div class="legend-row"><span><i class="dot" style="background:#075c28"></i>Materials</span><b>₱{monthly_summary['materials']:,.2f}</b></div>
+        <div class="legend-row"><span><i class="dot" style="background:#e0aa25"></i>Construction</span><b>₱{monthly_summary['construction']:,.2f}</b></div>
+        <div class="legend-row"><span><i class="dot" style="background:#a78bfa"></i>Labor</span><b>₱{monthly_summary['labor']:,.2f}</b></div>
+        <div class="legend-row"><span><i class="dot" style="background:#f26d6d"></i>Payroll</span><b>₱{monthly_summary['payroll']:,.2f}</b></div>
+        <div class="legend-row"><span><i class="dot" style="background:#4ade80"></i>Remaining</span><b>₱{monthly_summary['remaining']:,.2f}</b></div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+    st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
+
+    trend_rows = monthly_trend_summary(st.session_state.records, st.session_state.labor_records, st.session_state.payroll_expenses, months=6)
+    if trend_rows:
+        st.dataframe(
+            trend_rows,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Month": st.column_config.TextColumn("Month"),
+                "Materials": st.column_config.NumberColumn("Materials", format="₱%.2f"),
+                "Construction": st.column_config.NumberColumn("Construction", format="₱%.2f"),
+                "Labor": st.column_config.NumberColumn("Labor", format="₱%.2f"),
+                "Payroll": st.column_config.NumberColumn("Payroll", format="₱%.2f"),
+                "Total": st.column_config.NumberColumn("Total", format="₱%.2f"),
+            },
+        )
     st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
     st.markdown(f"""
     <div class="dash-section">

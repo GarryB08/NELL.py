@@ -36,6 +36,23 @@ def test_weekly_payroll_totals_group_workers_and_salary():
     ]
 
 
+def test_monthly_trend_summary_builds_analytics_rows():
+    trend = app_logic.monthly_trend_summary(
+        [
+            {"type": "material", "month": "2026-08", "amount": 300},
+            {"type": "expense", "month": "2026-08", "amount": 200},
+            {"type": "material", "month": "2026-07", "amount": 150},
+        ],
+        [{"month": "2026-08", "net": 140}, {"month": "2026-07", "net": 90}],
+        [{"month": "2026-08", "price": 60}, {"month": "2026-07", "price": 30}],
+        months=2,
+    )
+    assert trend == [
+        {"Month": "2026-08", "Materials": 300.0, "Construction": 200.0, "Labor": 140.0, "Payroll": 60.0, "Total": 700.0},
+        {"Month": "2026-07", "Materials": 150.0, "Construction": 0.0, "Labor": 90.0, "Payroll": 30.0, "Total": 270.0},
+    ]
+
+
 def test_excel_exports_have_expected_sheets():
     assert load_workbook("ailyn_project_ledger.xlsx", read_only=True).sheetnames == [
         "Transactions", "Payroll", "Monthly Summary", "Receipt Archive"
