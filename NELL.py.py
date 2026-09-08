@@ -474,7 +474,8 @@ if st.session_state.view not in {
     "home", "payroll_dashboard", "planner_input", "planner_output", "material",
     "expense", "excess", "ledger", "add_labor", "add_payroll_expense",
     "payroll_remaining", "payroll_ledger", "export", "payroll_export",
-    "receipt_archive",
+    "receipt_archive", "client_portal", "communications", "settings",
+    "photo_scanner", "project_tools",
 }:
     st.session_state.view = "home"
 if "selected_role" not in st.session_state:
@@ -505,13 +506,25 @@ def set_view(v):
 
 def get_desktop_launchers():
     return [
-        {"category": "Workspace", "label": "Dashboard", "target": "home", "description": "Overview of the active project workspace.", "icon": "◈"},
-        {"category": "Operations", "label": "Planner", "target": "planner_output", "description": "Open the monthly scheduling and task workspace.", "icon": "🗓"},
-        {"category": "Operations", "label": "Materials", "target": "material", "description": "Capture incoming materials and inventory entries.", "icon": "📦"},
-        {"category": "Ledger", "label": "Construction Ledger", "target": "ledger", "description": "Review all construction entries and edit records.", "icon": "📒"},
-        {"category": "Finance", "label": "Payroll", "target": "payroll_dashboard", "description": "Labor, payroll costs, budget controls, and payout status.", "icon": "💼"},
-        {"category": "Reports", "label": "Reports", "target": "export", "description": "Build, save, and export official project receipts.", "icon": "📄"},
-        {"category": "Tools", "label": "Project Tools", "target": "project_tools", "description": "Manage photos, search records, and prepare reports.", "icon": "🧰"},
+        {"category": "Dashboard", "label": "Home Workspace", "target": "home", "description": "Overview of the active project workspace.", "icon": "◈"},
+        {"category": "Calendar", "label": "Planner Output", "target": "planner_output", "description": "Open the monthly scheduling and task calendar.", "icon": "🗓"},
+        {"category": "Calendar", "label": "Planner Input", "target": "planner_input", "description": "Add a new project task and assign it to a date.", "icon": "✍"},
+        {"category": "Materials", "label": "Materials", "target": "material", "description": "Capture incoming materials and inventory entries.", "icon": "📦"},
+        {"category": "Materials", "label": "Construction Expense", "target": "expense", "description": "Log expense entries tied to the active project.", "icon": "💸"},
+        {"category": "Materials", "label": "Excess / Deposit", "target": "excess", "description": "Record surplus funds, deposits, and balance adjustments.", "icon": "💰"},
+        {"category": "Ledger", "label": "Construction Ledger", "target": "ledger", "description": "Review every construction entry and edit records.", "icon": "📒"},
+        {"category": "Payroll", "label": "Payroll Dashboard", "target": "payroll_dashboard", "description": "Labor, payroll costs, budget controls, and payout status.", "icon": "💼"},
+        {"category": "Payroll", "label": "Add Labor Account", "target": "add_labor", "description": "Create a labor account and calculate payroll values.", "icon": "👷"},
+        {"category": "Payroll", "label": "Payroll Expense", "target": "add_payroll_expense", "description": "Track payroll support costs and related expenses.", "icon": "🧾"},
+        {"category": "Payroll", "label": "Remaining Money", "target": "payroll_remaining", "description": "Set remaining money to keep payroll totals accurate.", "icon": "📉"},
+        {"category": "Payroll", "label": "Labor & Payroll Ledger", "target": "payroll_ledger", "description": "Review labor accounts and payroll expenses together.", "icon": "🧮"},
+        {"category": "Reports", "label": "Construction Report", "target": "export", "description": "Prepare and export the construction receipt report.", "icon": "📄"},
+        {"category": "Reports", "label": "Payroll Report", "target": "payroll_export", "description": "Generate and export labor and payroll statements.", "icon": "📊"},
+        {"category": "Reports", "label": "Receipt Archive", "target": "receipt_archive", "description": "Open saved reports, exports, backups, and archive history.", "icon": "🗂"},
+        {"category": "Clients", "label": "Client Portal", "target": "client_portal", "description": "View project progress, updates, and client-facing data.", "icon": "👥"},
+        {"category": "Clients", "label": "Messages & Calls", "target": "communications", "description": "Monitor messages, radio updates, and meeting links.", "icon": "💬"},
+        {"category": "Tools", "label": "Project Tools", "target": "project_tools", "description": "Manage project photos, search records, and prepare reports.", "icon": "🧰"},
+        {"category": "Tools", "label": "Photo Studio", "target": "photo_scanner", "description": "Capture a receipt or project update and scan it.", "icon": "📷"},
         {"category": "System", "label": "Settings", "target": "settings", "description": "Profile, preferences, security, and workspace controls.", "icon": "⚙"},
     ]
 
@@ -520,33 +533,43 @@ def render_top_navigation():
     st.markdown(
         """
         <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            background: linear-gradient(180deg, #dfeaf7 0%, #d6e4f4 30%, #cfe0f3 100%) !important;
+        }
+        .stApp {
+            background: linear-gradient(180deg, #dfeaf7 0%, #d6e4f4 30%, #cfe0f3 100%) !important;
+        }
+        [data-testid="stHeader"] {
+            background: transparent !important;
+            box-shadow: none !important;
+        }
+        .block-container {
+            padding-top: 18px !important;
+            padding-bottom: 130px !important;
+        }
         .desktop-shell {
             position: relative;
             overflow: hidden;
             margin-bottom: 18px;
             padding: 18px 20px;
             border-radius: 24px;
-            background: linear-gradient(145deg, rgba(17, 73, 45, 0.8), rgba(6, 30, 18, 0.72));
-            border: 1px solid rgba(163, 255, 194, 0.18);
-            box-shadow: 0 18px 36px rgba(0,0,0,0.24), inset 0 1px 0 rgba(255,255,255,0.08);
+            background: linear-gradient(145deg, rgba(255,255,255,0.92), rgba(235,242,249,0.9));
+            border: 1px solid rgba(127, 152, 176, 0.35);
+            box-shadow: 0 16px 34px rgba(31, 55, 82, 0.12), inset 0 1px 0 rgba(255,255,255,0.8);
         }
         .desktop-shell:before {
             content: "";
             position: absolute;
             inset: 0;
-            background: linear-gradient(110deg, transparent 0%, rgba(255,255,255,0.06) 42%, transparent 54%);
+            background: linear-gradient(110deg, transparent 0%, rgba(255,255,255,0.08) 42%, transparent 54%);
             transform: translateX(-120%);
             animation: scan-glow 8s linear infinite;
         }
-        .desktop-shell-inner {
+        .desktop-brand {
             position: relative;
             z-index: 1;
-            display: flex;
-            align-items: center;
-            gap: 16px;
-            flex-wrap: wrap;
-        }
-        .desktop-brand {
             display: flex;
             align-items: center;
             gap: 14px;
@@ -557,46 +580,33 @@ def render_top_navigation():
             height: 54px;
             object-fit: contain;
             border-radius: 16px;
-        }
-        .desktop-home-button {
-            min-height: 48px !important;
-            padding: 0 18px !important;
-            border-radius: 16px !important;
-            background: linear-gradient(145deg, rgba(27, 109, 63, 0.94), rgba(5, 37, 22, 0.96)) !important;
-            border: 1px solid rgba(163,255,194,0.2) !important;
-            box-shadow: 0 8px 0 rgba(2,17,10,0.7), 0 14px 28px rgba(0,0,0,0.2) !important;
+            box-shadow: 0 10px 24px rgba(36, 105, 185, 0.18);
         }
         .desktop-brand-copy {
             min-width: 0;
         }
         .desktop-brand-title {
-            font-family: 'Outfit', sans-serif;
-            color: #f5fff8;
-            font-size: 18px;
+            color: #1a2d3d;
+            font-size: 22px;
             font-weight: 900;
-            letter-spacing: 0.05em;
+            letter-spacing: 0.04em;
             line-height: 1.05;
         }
         .desktop-brand-sub {
-            color: #8fe0bb;
+            color: #4f6e86;
             font-size: 10px;
             font-weight: 900;
-            letter-spacing: 0.18em;
+            letter-spacing: 0.17em;
             text-transform: uppercase;
         }
-        .desktop-command {
-            flex: 1 1 420px;
-        }
-        .desktop-command .stTextInput > div > div {
-            border-radius: 16px !important;
-        }
-        .desktop-clock {
-            margin-left: auto;
+        .desktop-shell-meta {
+            position: relative;
+            z-index: 1;
             display: flex;
-            flex-direction: column;
-            align-items: flex-end;
-            gap: 5px;
-            text-align: right;
+            align-items: center;
+            justify-content: flex-end;
+            gap: 12px;
+            flex-wrap: wrap;
         }
         .desktop-status {
             display: inline-flex;
@@ -604,9 +614,9 @@ def render_top_navigation():
             gap: 8px;
             padding: 7px 10px;
             border-radius: 999px;
-            background: rgba(114,247,176,0.08);
-            border: 1px solid rgba(114,247,176,0.2);
-            color: #dffae9;
+            background: rgba(62, 141, 232, 0.10);
+            border: 1px solid rgba(62, 141, 232, 0.22);
+            color: #1e4f7d;
             font-size: 10px;
             font-weight: 900;
             letter-spacing: 0.12em;
@@ -616,22 +626,178 @@ def render_top_navigation():
             width: 8px;
             height: 8px;
             border-radius: 50%;
-            background: #72f7b0;
-            box-shadow: 0 0 14px rgba(114,247,176,0.6);
+            background: #3d9bf4;
+            box-shadow: 0 0 14px rgba(61, 155, 244, 0.65);
         }
         .desktop-clock-time {
-            color: #dcefe5;
+            color: #2c4b67;
             font-size: 11px;
             font-weight: 800;
             letter-spacing: 0.06em;
         }
-        @media (max-width: 900px) {
-            .desktop-clock {
-                margin-left: 0;
-                align-items: flex-start;
-                text-align: left;
+        .desktop-taskbar {
+            position: fixed;
+            left: 50%;
+            bottom: 16px;
+            transform: translateX(-50%);
+            width: min(96vw, 1200px);
+            z-index: 9997;
+            padding: 10px 12px;
+            border-radius: 22px;
+            background: rgba(244, 248, 253, 0.82);
+            border: 1px solid rgba(127, 152, 176, 0.35);
+            box-shadow: 0 18px 36px rgba(31, 55, 82, 0.14), inset 0 1px 0 rgba(255,255,255,0.7);
+            backdrop-filter: blur(18px) saturate(140%);
+            -webkit-backdrop-filter: blur(18px) saturate(140%);
+        }
+        .desktop-taskbar .stButton > button {
+            min-height: 44px !important;
+            border-radius: 14px !important;
+            padding: 0 14px !important;
+            background: linear-gradient(145deg, rgba(255,255,255,0.96), rgba(233,240,247,0.82)) !important;
+            border: 1px solid rgba(127, 152, 176, 0.36) !important;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.7) !important;
+            color: #233b50 !important;
+            font-weight: 800 !important;
+        }
+        .desktop-taskbar .stButton > button:hover {
+            transform: translateY(-1px) !important;
+            border-color: rgba(61, 155, 244, 0.55) !important;
+            box-shadow: 0 10px 18px rgba(61, 155, 244, 0.14), inset 0 1px 0 rgba(255,255,255,0.75) !important;
+        }
+        .desktop-taskbar .taskbar-primary {
+            background: linear-gradient(145deg, rgba(36, 128, 226, 0.96), rgba(22, 102, 191, 0.96)) !important;
+            border-color: rgba(100, 174, 245, 0.6) !important;
+            color: white !important;
+            box-shadow: 0 10px 18px rgba(36, 128, 226, 0.26), inset 0 1px 0 rgba(255,255,255,0.2) !important;
+        }
+        .desktop-modal-overlay {
+            position: fixed;
+            inset: 0;
+            z-index: 9998;
+            display: flex;
+            align-items: flex-start;
+            justify-content: center;
+            padding-top: 78px;
+            background: rgba(20, 29, 37, 0.18);
+            backdrop-filter: blur(8px);
+            -webkit-backdrop-filter: blur(8px);
+        }
+        .desktop-modal-panel {
+            width: min(92vw, 1120px);
+            max-height: 78vh;
+            overflow-y: auto;
+            padding: 20px;
+            border-radius: 28px;
+            background: linear-gradient(145deg, rgba(245,248,252,0.96), rgba(228,236,245,0.9));
+            border: 1px solid rgba(127, 152, 176, 0.35);
+            box-shadow: 0 25px 60px rgba(31, 55, 82, 0.18), inset 0 1px 0 rgba(255,255,255,0.85);
+        }
+        .desktop-modal-panel-compact {
+            width: min(90vw, 900px);
+        }
+        .desktop-panel-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 14px;
+            flex-wrap: wrap;
+        }
+        .desktop-panel-title {
+            color: #1a2d3d;
+            font-size: 18px;
+            font-weight: 900;
+            letter-spacing: 0.04em;
+        }
+        .desktop-panel-subtitle {
+            color: #4f6e86;
+            font-size: 11px;
+            font-weight: 800;
+            letter-spacing: 0.14em;
+            text-transform: uppercase;
+        }
+        .desktop-panel-category {
+            color: #2d5f8d;
+            font-size: 10px;
+            font-weight: 900;
+            letter-spacing: 0.18em;
+            text-transform: uppercase;
+            margin: 12px 0 10px;
+        }
+        .desktop-shortcut-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 12px;
+        }
+        .desktop-shortcut-card {
+            background: linear-gradient(145deg, rgba(255,255,255,0.95), rgba(234,242,249,0.83));
+            border: 1px solid rgba(127, 152, 176, 0.28);
+            border-radius: 16px;
+            padding: 14px;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.7);
+            height: 100%;
+        }
+        .desktop-shortcut-icon {
+            width: 34px;
+            height: 34px;
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: rgba(62, 141, 232, 0.10);
+            border: 1px solid rgba(62, 141, 232, 0.22);
+            color: #2d70b8;
+            font-size: 16px;
+            font-weight: 900;
+            margin-bottom: 8px;
+        }
+        .desktop-shortcut-card .shortcut-label {
+            color: #1c2f3d;
+            font-weight: 900;
+            font-size: 14px;
+            margin-bottom: 4px;
+        }
+        .desktop-shortcut-card .shortcut-desc {
+            color: #4c6273;
+            font-size: 11px;
+            line-height: 1.45;
+            margin-bottom: 10px;
+        }
+        .desktop-shortcut-card button {
+            width: 100%;
+            min-height: 42px !important;
+        }
+        @media (max-width: 700px) {
+            .desktop-shortcut-grid {
+                grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
             }
-            .desktop-shell-inner {
+            .desktop-modal-panel {
+                width: min(94vw, 1120px);
+                padding: 14px;
+            }
+            .desktop-taskbar {
+                width: min(96vw, 900px);
+                bottom: 12px;
+                padding: 8px 10px;
+            }
+            .desktop-taskbar .stButton > button {
+                min-height: 40px !important;
+                padding: 0 10px !important;
+            }
+        }
+        @media (max-width: 580px) {
+            .block-container {
+                padding-bottom: 150px !important;
+            }
+            .desktop-shell {
+                padding: 14px 16px;
+            }
+            .desktop-brand-title {
+                font-size: 18px;
+            }
+            .desktop-panel-header {
+                flex-direction: column;
                 align-items: flex-start;
             }
         }
@@ -640,34 +806,164 @@ def render_top_navigation():
         unsafe_allow_html=True,
     )
 
+    if "desktop_start_menu_open" not in st.session_state:
+        st.session_state.desktop_start_menu_open = False
+    if "desktop_shortcut_menu_open" not in st.session_state:
+        st.session_state.desktop_shortcut_menu_open = False
+
     st.markdown("<div class='desktop-shell'>", unsafe_allow_html=True)
 
-    shell_cols = st.columns([1.8, 4.0, 1.4])
-
+    shell_cols = st.columns([2.4, 1.2])
     with shell_cols[0]:
-        if st.button("◈ AILYN HOUSE", key="desktop_home_launcher", use_container_width=True):
-            set_view("home")
-
-    with shell_cols[1]:
-        st.text_input(
-            "Command / Search",
-            key="desktop_command_search",
-            placeholder="Type: payroll, reports, materials, planner, tools...",
-            label_visibility="collapsed",
-        )
-
-    with shell_cols[2]:
         st.markdown(
             f"""
-            <div class="desktop-clock">
-                <div class="desktop-status"><span class="desktop-status-dot"></span> LIVE</div>
-                <div class="desktop-clock-time">{manila_now().strftime('%b %d, %Y')}<br>{manila_now().strftime('%I:%M %p')}</div>
+            <div class='desktop-brand'>
+                <img src="{AILYN_LOGO_DATA}" alt="Ailyn House logo">
+                <div class='desktop-brand-copy'>
+                    <div class='desktop-brand-title'>AILYN HOUSE</div>
+                    <div class='desktop-brand-sub'>Project Workspace</div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with shell_cols[1]:
+        st.markdown(
+            f"""
+            <div class='desktop-shell-meta'>
+                <div class='desktop-status'><span class='desktop-status-dot'></span> LIVE</div>
+                <div class='desktop-clock-time'>{manila_now().strftime('%b %d, %Y')}<br>{manila_now().strftime('%I:%M %p')}</div>
             </div>
             """,
             unsafe_allow_html=True,
         )
 
     st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("<div class='desktop-taskbar'>", unsafe_allow_html=True)
+    taskbar_cols = st.columns([1.1, 1.1, 1.0, 1.0, 1.0, 1.0, 1.0, 1.2])
+
+    with taskbar_cols[0]:
+        if st.button("Start", key="taskbar_start", use_container_width=True):
+            st.session_state.desktop_start_menu_open = not st.session_state.desktop_start_menu_open
+            st.session_state.desktop_shortcut_menu_open = False
+    with taskbar_cols[1]:
+        if st.button("Search", key="taskbar_search", use_container_width=True):
+            st.session_state.desktop_shortcut_menu_open = not st.session_state.desktop_shortcut_menu_open
+            st.session_state.desktop_start_menu_open = False
+    with taskbar_cols[2]:
+        if st.button("Home", key="taskbar_home", use_container_width=True):
+            set_view("home")
+    with taskbar_cols[3]:
+        if st.button("Payroll", key="taskbar_payroll", use_container_width=True):
+            set_view("payroll_dashboard")
+    with taskbar_cols[4]:
+        if st.button("Materials", key="taskbar_materials", use_container_width=True):
+            set_view("material")
+    with taskbar_cols[5]:
+        if st.button("Reports", key="taskbar_reports", use_container_width=True):
+            set_view("export")
+    with taskbar_cols[6]:
+        if st.button("Calendar", key="taskbar_calendar", use_container_width=True):
+            set_view("planner_output")
+    with taskbar_cols[7]:
+        st.markdown(
+            f"""
+            <div class='desktop-clock-time' style='padding: 10px 12px; text-align: right; min-height: 44px; display: flex; align-items: center; justify-content: flex-end; border-radius: 14px; background: rgba(255,255,255,0.36); border: 1px solid rgba(127, 152, 176, 0.2);'>
+                {manila_now().strftime('%b %d')}<br>{manila_now().strftime('%I:%M %p')}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    if st.session_state.desktop_start_menu_open:
+        st.markdown("<div class='desktop-modal-overlay'>", unsafe_allow_html=True)
+        st.markdown("<div class='desktop-modal-panel'>", unsafe_allow_html=True)
+        st.markdown("<div class='desktop-panel-header'><div class='desktop-panel-title'>Start</div><div class='desktop-panel-subtitle'>Application Launcher</div></div>", unsafe_allow_html=True)
+
+        launchers = get_desktop_launchers()
+        grouped = {}
+        for launcher in launchers:
+            grouped.setdefault(launcher["category"], []).append(launcher)
+
+        for category in grouped:
+            st.markdown(f"<div class='desktop-panel-category'>{category}</div>", unsafe_allow_html=True)
+            grid_cols = st.columns(min(4, len(grouped[category])))
+            for index, launcher in enumerate(grouped[category]):
+                with grid_cols[index]:
+                    st.markdown(
+                        f"""
+                        <div class='desktop-shortcut-card'>
+                            <div class='desktop-shortcut-icon'>{launcher['icon']}</div>
+                            <div class='shortcut-label'>{launcher['label']}</div>
+                            <div class='shortcut-desc'>{launcher['description']}</div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                    if st.button("Open", key=f"start_shortcut_{launcher['target']}", use_container_width=True):
+                        st.session_state.desktop_start_menu_open = False
+                        st.session_state.desktop_shortcut_menu_open = False
+                        st.session_state.desktop_shortcut_query = ""
+                        set_view(launcher["target"])
+
+        st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    if st.session_state.desktop_shortcut_menu_open:
+        st.markdown("<div class='desktop-modal-overlay'>", unsafe_allow_html=True)
+        st.markdown("<div class='desktop-modal-panel desktop-modal-panel-compact'>", unsafe_allow_html=True)
+        st.markdown("<div class='desktop-panel-header'><div class='desktop-panel-title'>Quick Access</div><div class='desktop-panel-subtitle'>Search available functions</div></div>", unsafe_allow_html=True)
+
+        query = st.text_input(
+            "Search",
+            key="desktop_shortcut_query",
+            placeholder="Type a name, category, or keyword...",
+            label_visibility="collapsed",
+        )
+
+        launcher_query = (query or "").strip().lower()
+        launchers = get_desktop_launchers()
+        filtered_launchers = [
+            launcher for launcher in launchers
+            if not launcher_query
+            or launcher_query in launcher["label"].lower()
+            or launcher_query in launcher["category"].lower()
+            or launcher_query in launcher["description"].lower()
+        ]
+
+        if filtered_launchers:
+            grouped = {}
+            for launcher in filtered_launchers:
+                grouped.setdefault(launcher["category"], []).append(launcher)
+
+            for category in grouped:
+                st.markdown(f"<div class='desktop-panel-category'>{category}</div>", unsafe_allow_html=True)
+                grid_cols = st.columns(min(3, len(grouped[category])))
+                for index, launcher in enumerate(grouped[category]):
+                    with grid_cols[index]:
+                        st.markdown(
+                            f"""
+                            <div class='desktop-shortcut-card'>
+                                <div class='desktop-shortcut-icon'>{launcher['icon']}</div>
+                                <div class='shortcut-label'>{launcher['label']}</div>
+                                <div class='shortcut-desc'>{launcher['description']}</div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+                        if st.button("Open", key=f"search_shortcut_{launcher['target']}", use_container_width=True):
+                            st.session_state.desktop_shortcut_menu_open = False
+                            st.session_state.desktop_start_menu_open = False
+                            st.session_state.desktop_shortcut_query = ""
+                            set_view(launcher["target"])
+        else:
+            st.info("No matching functions found. Try payroll, reports, materials, calendar, clients, or settings.")
+
+        st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
 
 
 def render_module_shell(title, subtitle="", badge="OPERATIONS"):
@@ -2742,9 +3038,9 @@ if view == "home":
             padding: 18px 18px 14px;
             margin-bottom: 18px;
             border-radius: 24px;
-            background: linear-gradient(145deg, rgba(14, 61, 38, 0.8), rgba(5, 24, 15, 0.76));
-            border: 1px solid rgba(163,255,194,0.18);
-            box-shadow: 0 18px 36px rgba(0,0,0,0.24), inset 0 1px 0 rgba(255,255,255,0.08);
+            background: linear-gradient(145deg, rgba(247,250,253,0.96), rgba(234,239,245,0.9));
+            border: 1px solid rgba(133, 154, 175, 0.32);
+            box-shadow: 0 18px 36px rgba(31, 55, 82, 0.12), inset 0 1px 0 rgba(255,255,255,0.8);
         }
         .desktop-workspace-shell:before {
             content: "";
@@ -2777,7 +3073,7 @@ if view == "home":
         }
         .desktop-workspace-copy h2 {
             margin: 0;
-            color: #f5fff8;
+            color: #1a2d3d;
             font-size: clamp(20px, 1.8vw, 28px);
             font-weight: 900;
             letter-spacing: 0.03em;
@@ -2785,7 +3081,7 @@ if view == "home":
         .desktop-workspace-copy small {
             display: block;
             margin-top: 4px;
-            color: #9de0b8;
+            color: #4f6e86;
             font-size: 10px;
             font-weight: 900;
             letter-spacing: 0.16em;
@@ -2822,9 +3118,9 @@ if view == "home":
             overflow: hidden;
             padding: 16px;
             border-radius: 18px;
-            background: linear-gradient(145deg, rgba(15, 63, 39, 0.78), rgba(5, 24, 15, 0.72));
-            border: 1px solid rgba(163,255,194,0.16);
-            box-shadow: 0 14px 29px rgba(0,0,0,0.18), inset 0 1px 0 rgba(255,255,255,0.06);
+            background: linear-gradient(145deg, rgba(255,255,255,0.96), rgba(237,244,250,0.86));
+            border: 1px solid rgba(133, 154, 175, 0.3);
+            box-shadow: 0 14px 29px rgba(31,55,82,0.10), inset 0 1px 0 rgba(255,255,255,0.7);
             height: 100%;
         }
         .desktop-launcher-card:hover {
@@ -2846,7 +3142,7 @@ if view == "home":
             margin-bottom: 12px;
         }
         .desktop-launcher-card .category {
-            color: #9de0b8;
+            color: #466984;
             font-size: 9px;
             font-weight: 900;
             letter-spacing: 0.14em;
@@ -2854,13 +3150,13 @@ if view == "home":
             margin-bottom: 7px;
         }
         .desktop-launcher-card .title {
-            color: #f5fff8;
+            color: #1b2f3d;
             font-size: 15px;
             font-weight: 900;
             margin-bottom: 6px;
         }
         .desktop-launcher-card .desc {
-            color: #cfe6d7;
+            color: #4d6476;
             font-size: 11px;
             line-height: 1.45;
             margin-bottom: 12px;
