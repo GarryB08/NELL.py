@@ -1306,8 +1306,14 @@ st.markdown("""
 *{box-sizing:border-box}
 html,body,[class*="css"]{font-family:'Manrope',sans-serif}
 .stApp{
-  background:url("https://images.unsplash.com/photo-1600585154340-be6161a56a0c") no-repeat center center fixed;
-  background-size:cover;background-position:center;
+  background-color:#04180f;
+  background-image:
+    linear-gradient(135deg, rgba(3,30,18,.62), rgba(10,85,45,.54)),
+    url("https://images.unsplash.com/photo-1600585154340-be6161a56a0c");
+  background-repeat:no-repeat;
+  background-position:center center;
+  background-size:cover;
+  background-attachment:fixed;
 }
 .stApp:before{
   content:"";position:fixed;inset:0;z-index:0;pointer-events:none;
