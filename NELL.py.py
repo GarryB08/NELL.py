@@ -768,6 +768,88 @@ def render_top_navigation():
             width: 100%;
             min-height: 42px !important;
         }
+        .desktop-start-tile-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 12px;
+        }
+        .desktop-start-tile {
+            padding: 16px 14px;
+            border-radius: 18px;
+            border: 1px solid rgba(127, 152, 176, 0.28);
+            background: linear-gradient(145deg, rgba(255,255,255,0.96), rgba(233,240,247,0.86));
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.72);
+            height: 100%;
+        }
+        .desktop-start-tile .desktop-start-icon {
+            width: 42px;
+            height: 42px;
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-bottom: 10px;
+            background: linear-gradient(145deg, rgba(36, 128, 226, 0.14), rgba(58, 167, 224, 0.06));
+            border: 1px solid rgba(61, 155, 244, 0.28);
+            color: #2d70b8;
+            font-size: 18px;
+            font-weight: 900;
+        }
+        .desktop-start-tile .desktop-start-label {
+            color: #1c2f3d;
+            font-size: 14px;
+            font-weight: 900;
+            margin-bottom: 4px;
+        }
+        .desktop-start-tile .desktop-start-desc {
+            color: #4c6273;
+            font-size: 11px;
+            line-height: 1.45;
+            margin-bottom: 10px;
+        }
+        .desktop-start-tile button {
+            width: 100%;
+            min-height: 42px !important;
+        }
+        .desktop-pinned-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 14px;
+            margin-top: 18px;
+        }
+        .desktop-pinned-tile {
+            padding: 16px 12px;
+            border-radius: 18px;
+            background: linear-gradient(145deg, rgba(255,255,255,0.96), rgba(235,242,249,0.82));
+            border: 1px solid rgba(127, 152, 176, 0.3);
+            box-shadow: 0 12px 24px rgba(31,55,82,0.08), inset 0 1px 0 rgba(255,255,255,0.7);
+            height: 100%;
+        }
+        .desktop-pinned-icon {
+            width: 44px;
+            height: 44px;
+            border-radius: 14px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 10px;
+            background: linear-gradient(145deg, rgba(36, 128, 226, 0.14), rgba(58, 167, 224, 0.08));
+            border: 1px solid rgba(61, 155, 244, 0.28);
+            color: #2d70b8;
+            font-size: 18px;
+            font-weight: 900;
+        }
+        .desktop-pinned-label {
+            color: #1c2f3d;
+            font-size: 13px;
+            font-weight: 900;
+            text-align: center;
+            margin-bottom: 8px;
+        }
+        .desktop-pinned-tile button {
+            width: 100%;
+            min-height: 40px !important;
+        }
         @media (max-width: 700px) {
             .desktop-shortcut-grid {
                 grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
@@ -890,15 +972,16 @@ def render_top_navigation():
 
         for category in grouped:
             st.markdown(f"<div class='desktop-panel-category'>{category}</div>", unsafe_allow_html=True)
-            grid_cols = st.columns(min(4, len(grouped[category])))
+            st.markdown("<div class='desktop-start-tile-grid'>", unsafe_allow_html=True)
+            start_cols = st.columns(min(4, len(grouped[category])))
             for index, launcher in enumerate(grouped[category]):
-                with grid_cols[index]:
+                with start_cols[index]:
                     st.markdown(
                         f"""
-                        <div class='desktop-shortcut-card'>
-                            <div class='desktop-shortcut-icon'>{launcher['icon']}</div>
-                            <div class='shortcut-label'>{launcher['label']}</div>
-                            <div class='shortcut-desc'>{launcher['description']}</div>
+                        <div class='desktop-start-tile'>
+                            <div class='desktop-start-icon'>{launcher['icon']}</div>
+                            <div class='desktop-start-label'>{launcher['label']}</div>
+                            <div class='desktop-start-desc'>{launcher['description']}</div>
                         </div>
                         """,
                         unsafe_allow_html=True,
@@ -908,6 +991,7 @@ def render_top_navigation():
                         st.session_state.desktop_shortcut_menu_open = False
                         st.session_state.desktop_shortcut_query = ""
                         set_view(launcher["target"])
+            st.markdown("</div>", unsafe_allow_html=True)
 
         st.markdown("</div>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
@@ -3250,6 +3334,33 @@ if view == "home":
         st.info("No launcher matches your search. Try payroll, reports, planner, settings, or tools.")
 
     st.markdown("</div>", unsafe_allow_html=True)
+
+    home_shortcuts = [
+        {"target": "home", "label": "Dashboard", "description": "Open the desktop workspace", "icon": "◈"},
+        {"target": "payroll_dashboard", "label": "Payroll", "description": "Labor, payroll, and payout controls", "icon": "💼"},
+        {"target": "material", "label": "Materials", "description": "Track incoming materials", "icon": "📦"},
+        {"target": "ledger", "label": "Ledger", "description": "Review construction and account entries", "icon": "📒"},
+        {"target": "export", "label": "Reports", "description": "Generate financial and construction reports", "icon": "📑"},
+        {"target": "planner_output", "label": "Calendar", "description": "View the project planner", "icon": "🗓"},
+        {"target": "client_portal", "label": "Clients", "description": "Open client-facing updates", "icon": "👥"},
+        {"target": "settings", "label": "Settings", "description": "Open system and workspace settings", "icon": "⚙"},
+    ]
+
+    st.markdown("<div class='desktop-section-label'>Desktop shortcuts</div>", unsafe_allow_html=True)
+    home_shortcut_cols = st.columns(min(6, len(home_shortcuts)))
+    for index, item in enumerate(home_shortcuts):
+        with home_shortcut_cols[index]:
+            st.markdown(
+                f"""
+                <div class='desktop-pinned-tile'>
+                    <div class='desktop-pinned-icon'>{item['icon']}</div>
+                    <div class='desktop-pinned-label'>{item['label']}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            if st.button("Open", key=f"home_desktop_tile_{item['target']}", use_container_width=True):
+                set_view(item["target"])
 
     summary_col1, summary_col2, summary_col3, summary_col4 = st.columns(4)
     with summary_col1:
