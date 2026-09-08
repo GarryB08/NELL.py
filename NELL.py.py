@@ -503,44 +503,171 @@ def set_view(v):
     st.rerun()
 
 
+def get_desktop_launchers():
+    return [
+        {"category": "Workspace", "label": "Dashboard", "target": "home", "description": "Overview of the active project workspace.", "icon": "◈"},
+        {"category": "Operations", "label": "Planner", "target": "planner_output", "description": "Open the monthly scheduling and task workspace.", "icon": "🗓"},
+        {"category": "Operations", "label": "Materials", "target": "material", "description": "Capture incoming materials and inventory entries.", "icon": "📦"},
+        {"category": "Ledger", "label": "Construction Ledger", "target": "ledger", "description": "Review all construction entries and edit records.", "icon": "📒"},
+        {"category": "Finance", "label": "Payroll", "target": "payroll_dashboard", "description": "Labor, payroll costs, budget controls, and payout status.", "icon": "💼"},
+        {"category": "Reports", "label": "Reports", "target": "export", "description": "Build, save, and export official project receipts.", "icon": "📄"},
+        {"category": "Tools", "label": "Project Tools", "target": "project_tools", "description": "Manage photos, search records, and prepare reports.", "icon": "🧰"},
+        {"category": "System", "label": "Settings", "target": "settings", "description": "Profile, preferences, security, and workspace controls.", "icon": "⚙"},
+    ]
+
+
 def render_top_navigation():
     st.markdown(
-        f"""
-        <div class="top-nav-shell">
-            <div class="top-nav-brand">
-                <img class="top-nav-logo" src="{AILYN_LOGO_DATA}" alt="Ailyn Construction Logo">
-                <div>
-                    <div class="top-nav-title">AILYN HOUSE PROJECT</div>
-                    <div class="top-nav-subtitle">Official Project Control</div>
-                </div>
-            </div>
-            <div class="top-nav-meta">
-                <div class="top-nav-status"><span class="nav-status-dot"></span> LIVE SYSTEM</div>
-                <div class="top-nav-date">{manila_now().strftime('%b %d, %Y • %I:%M %p')}</div>
-            </div>
-        </div>
+        """
+        <style>
+        .desktop-shell {
+            position: relative;
+            overflow: hidden;
+            margin-bottom: 18px;
+            padding: 18px 20px;
+            border-radius: 24px;
+            background: linear-gradient(145deg, rgba(17, 73, 45, 0.8), rgba(6, 30, 18, 0.72));
+            border: 1px solid rgba(163, 255, 194, 0.18);
+            box-shadow: 0 18px 36px rgba(0,0,0,0.24), inset 0 1px 0 rgba(255,255,255,0.08);
+        }
+        .desktop-shell:before {
+            content: "";
+            position: absolute;
+            inset: 0;
+            background: linear-gradient(110deg, transparent 0%, rgba(255,255,255,0.06) 42%, transparent 54%);
+            transform: translateX(-120%);
+            animation: scan-glow 8s linear infinite;
+        }
+        .desktop-shell-inner {
+            position: relative;
+            z-index: 1;
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            flex-wrap: wrap;
+        }
+        .desktop-brand {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            min-width: 0;
+        }
+        .desktop-brand img {
+            width: 54px;
+            height: 54px;
+            object-fit: contain;
+            border-radius: 16px;
+        }
+        .desktop-home-button {
+            min-height: 48px !important;
+            padding: 0 18px !important;
+            border-radius: 16px !important;
+            background: linear-gradient(145deg, rgba(27, 109, 63, 0.94), rgba(5, 37, 22, 0.96)) !important;
+            border: 1px solid rgba(163,255,194,0.2) !important;
+            box-shadow: 0 8px 0 rgba(2,17,10,0.7), 0 14px 28px rgba(0,0,0,0.2) !important;
+        }
+        .desktop-brand-copy {
+            min-width: 0;
+        }
+        .desktop-brand-title {
+            font-family: 'Outfit', sans-serif;
+            color: #f5fff8;
+            font-size: 18px;
+            font-weight: 900;
+            letter-spacing: 0.05em;
+            line-height: 1.05;
+        }
+        .desktop-brand-sub {
+            color: #8fe0bb;
+            font-size: 10px;
+            font-weight: 900;
+            letter-spacing: 0.18em;
+            text-transform: uppercase;
+        }
+        .desktop-command {
+            flex: 1 1 420px;
+        }
+        .desktop-command .stTextInput > div > div {
+            border-radius: 16px !important;
+        }
+        .desktop-clock {
+            margin-left: auto;
+            display: flex;
+            flex-direction: column;
+            align-items: flex-end;
+            gap: 5px;
+            text-align: right;
+        }
+        .desktop-status {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 7px 10px;
+            border-radius: 999px;
+            background: rgba(114,247,176,0.08);
+            border: 1px solid rgba(114,247,176,0.2);
+            color: #dffae9;
+            font-size: 10px;
+            font-weight: 900;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+        }
+        .desktop-status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #72f7b0;
+            box-shadow: 0 0 14px rgba(114,247,176,0.6);
+        }
+        .desktop-clock-time {
+            color: #dcefe5;
+            font-size: 11px;
+            font-weight: 800;
+            letter-spacing: 0.06em;
+        }
+        @media (max-width: 900px) {
+            .desktop-clock {
+                margin-left: 0;
+                align-items: flex-start;
+                text-align: left;
+            }
+            .desktop-shell-inner {
+                align-items: flex-start;
+            }
+        }
+        </style>
         """,
         unsafe_allow_html=True,
     )
 
-    nav_items = [
-        ("Dashboard", "home"),
-        ("Planner", "planner_output"),
-        ("Materials", "material"),
-        ("Ledger", "ledger"),
-        ("Payroll", "payroll_dashboard"),
-        ("Reports", "export"),
-        ("Tools", "project_tools"),
-        ("Settings", "settings"),
-    ]
+    st.markdown("<div class='desktop-shell'>", unsafe_allow_html=True)
 
-    nav_cols = st.columns(len(nav_items))
-    for index, (label, target) in enumerate(nav_items):
-        with nav_cols[index]:
-            if st.button(label, key=f"nav_{target}", use_container_width=True):
-                set_view(target)
+    shell_cols = st.columns([1.8, 4.0, 1.4])
 
-    st.markdown("<div class='nav-spacer'></div>", unsafe_allow_html=True)
+    with shell_cols[0]:
+        if st.button("◈ AILYN HOUSE", key="desktop_home_launcher", use_container_width=True):
+            set_view("home")
+
+    with shell_cols[1]:
+        st.text_input(
+            "Command / Search",
+            key="desktop_command_search",
+            placeholder="Type: payroll, reports, materials, planner, tools...",
+            label_visibility="collapsed",
+        )
+
+    with shell_cols[2]:
+        st.markdown(
+            f"""
+            <div class="desktop-clock">
+                <div class="desktop-status"><span class="desktop-status-dot"></span> LIVE</div>
+                <div class="desktop-clock-time">{manila_now().strftime('%b %d, %Y')}<br>{manila_now().strftime('%I:%M %p')}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
 def render_module_shell(title, subtitle="", badge="OPERATIONS"):
@@ -2607,20 +2734,165 @@ if view == "home":
     budget_alert = budget_alert_status(budget, used)
 
     st.markdown(
+        """
+        <style>
+        .desktop-workspace-shell {
+            position: relative;
+            overflow: hidden;
+            padding: 18px 18px 14px;
+            margin-bottom: 18px;
+            border-radius: 24px;
+            background: linear-gradient(145deg, rgba(14, 61, 38, 0.8), rgba(5, 24, 15, 0.76));
+            border: 1px solid rgba(163,255,194,0.18);
+            box-shadow: 0 18px 36px rgba(0,0,0,0.24), inset 0 1px 0 rgba(255,255,255,0.08);
+        }
+        .desktop-workspace-shell:before {
+            content: "";
+            position: absolute;
+            inset: 0;
+            background: linear-gradient(110deg, transparent 0%, rgba(255,255,255,0.06) 42%, transparent 54%);
+            transform: translateX(-120%);
+            animation: scan-glow 8s linear infinite;
+        }
+        .desktop-workspace-header {
+            position: relative;
+            z-index: 1;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+            flex-wrap: wrap;
+            margin-bottom: 18px;
+        }
+        .desktop-workspace-title {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .desktop-workspace-title img {
+            width: 52px;
+            height: 52px;
+            object-fit: contain;
+            border-radius: 16px;
+        }
+        .desktop-workspace-copy h2 {
+            margin: 0;
+            color: #f5fff8;
+            font-size: clamp(20px, 1.8vw, 28px);
+            font-weight: 900;
+            letter-spacing: 0.03em;
+        }
+        .desktop-workspace-copy small {
+            display: block;
+            margin-top: 4px;
+            color: #9de0b8;
+            font-size: 10px;
+            font-weight: 900;
+            letter-spacing: 0.16em;
+            text-transform: uppercase;
+        }
+        .desktop-workspace-meta {
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+        .desktop-workspace-meta .status-pill {
+            margin: 0;
+        }
+        .desktop-section-label {
+            position: relative;
+            z-index: 1;
+            margin: 0 0 12px;
+            color: #8fe0bb;
+            font-size: 10px;
+            font-weight: 900;
+            letter-spacing: 0.18em;
+            text-transform: uppercase;
+        }
+        .desktop-launcher-grid {
+            position: relative;
+            z-index: 1;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+            gap: 14px;
+        }
+        .desktop-launcher-card {
+            position: relative;
+            overflow: hidden;
+            padding: 16px;
+            border-radius: 18px;
+            background: linear-gradient(145deg, rgba(15, 63, 39, 0.78), rgba(5, 24, 15, 0.72));
+            border: 1px solid rgba(163,255,194,0.16);
+            box-shadow: 0 14px 29px rgba(0,0,0,0.18), inset 0 1px 0 rgba(255,255,255,0.06);
+            height: 100%;
+        }
+        .desktop-launcher-card:hover {
+            border-color: rgba(163,255,194,0.34);
+            transform: translateY(-2px);
+        }
+        .desktop-launcher-icon {
+            width: 38px;
+            height: 38px;
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: rgba(114,247,176,0.1);
+            border: 1px solid rgba(114,247,176,0.24);
+            color: #72f7b0;
+            font-size: 18px;
+            font-weight: 900;
+            margin-bottom: 12px;
+        }
+        .desktop-launcher-card .category {
+            color: #9de0b8;
+            font-size: 9px;
+            font-weight: 900;
+            letter-spacing: 0.14em;
+            text-transform: uppercase;
+            margin-bottom: 7px;
+        }
+        .desktop-launcher-card .title {
+            color: #f5fff8;
+            font-size: 15px;
+            font-weight: 900;
+            margin-bottom: 6px;
+        }
+        .desktop-launcher-card .desc {
+            color: #cfe6d7;
+            font-size: 11px;
+            line-height: 1.45;
+            margin-bottom: 12px;
+        }
+        .desktop-launcher-card button {
+            width: 100%;
+        }
+        @media (max-width: 700px) {
+            .desktop-workspace-header {
+                align-items: flex-start;
+            }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("<div class='desktop-workspace-shell'>", unsafe_allow_html=True)
+
+    st.markdown(
         f"""
-        <div class="dashboard-intro">
-            <div class="dashboard-intro-inner">
-                <div class="dashboard-brand">
-                    <img src="{AILYN_LOGO_DATA}" alt="Ailyn Construction Logo">
-                    <div>
-                        <h1>AILYN HOUSE PROJECT</h1>
-                        <small>Project Management System</small>
-                    </div>
+        <div class='desktop-workspace-header'>
+            <div class='desktop-workspace-title'>
+                <img src="{AILYN_LOGO_DATA}" alt="Ailyn Construction Logo">
+                <div class='desktop-workspace-copy'>
+                    <h2>AILYN HOUSE PROJECT</h2>
+                    <small>Premium Workspace</small>
                 </div>
-                <div class="dashboard-meta">
-                    <div class="status-pill"><span class="dot"></span>{project.get('status', 'Active').upper()} PROJECT</div>
-                    <div class="status-pill">{current_month_name.upper()}</div>
-                </div>
+            </div>
+            <div class='desktop-workspace-meta'>
+                <div class='status-pill'><span class='dot'></span>{project.get('status', 'Active').upper()} PROJECT</div>
+                <div class='status-pill'>{current_month_name.upper()}</div>
             </div>
         </div>
         """,
@@ -2641,28 +2913,47 @@ if view == "home":
     if overdue_tasks:
         st.markdown(f"<div class='alert-strip warning'>{len(overdue_tasks)} scheduled task(s) are overdue.</div>", unsafe_allow_html=True)
 
-    st.markdown("""
-    <div class="workspace-toolbar">
-        <span class="workspace-chip">Dashboard</span>
-        <span class="workspace-chip">Operations</span>
-        <span class="workspace-chip">Reports</span>
-        <span class="workspace-chip">Settings</span>
-    </div>
-    """, unsafe_allow_html=True)
+    desktop_query = str(st.session_state.get("desktop_command_search", "")).strip().lower()
+    launchers = get_desktop_launchers()
+    filtered_launchers = []
+    if desktop_query:
+        filtered_launchers = [
+            item for item in launchers
+            if desktop_query in item["label"].lower()
+            or desktop_query in item["category"].lower()
+            or desktop_query in item["description"].lower()
+        ]
+    else:
+        filtered_launchers = launchers
 
-    action_col1, action_col2, action_col3, action_col4 = st.columns(4)
-    with action_col1:
-        if st.button("OPEN PLANNER", use_container_width=True):
-            set_view("planner_output")
-    with action_col2:
-        if st.button("ADD MATERIAL", use_container_width=True):
-            set_view("material")
-    with action_col3:
-        if st.button("VIEW LEDGER", use_container_width=True):
-            set_view("ledger")
-    with action_col4:
-        if st.button("PAYROLL DASHBOARD", use_container_width=True):
-            set_view("payroll_dashboard")
+    if filtered_launchers:
+        grouped_launchers = {}
+        for item in filtered_launchers:
+            grouped_launchers.setdefault(item["category"], []).append(item)
+
+        st.markdown("<div class='desktop-section-label'>Workspace launcher</div>", unsafe_allow_html=True)
+        for category, items in grouped_launchers.items():
+            st.markdown(f"<div class='desktop-section-label'>{category}</div>", unsafe_allow_html=True)
+            cat_cols = st.columns(min(4, len(items)))
+            for index, item in enumerate(items):
+                with cat_cols[index]:
+                    st.markdown(
+                        f"""
+                        <div class='desktop-launcher-card'>
+                            <div class='desktop-launcher-icon'>{item['icon']}</div>
+                            <div class='category'>{item['category']}</div>
+                            <div class='title'>{item['label']}</div>
+                            <div class='desc'>{item['description']}</div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                    if st.button("Open", key=f"desktop_launcher_{item['target']}", use_container_width=True):
+                        set_view(item["target"])
+    else:
+        st.info("No launcher matches your search. Try payroll, reports, planner, settings, or tools.")
+
+    st.markdown("</div>", unsafe_allow_html=True)
 
     summary_col1, summary_col2, summary_col3, summary_col4 = st.columns(4)
     with summary_col1:
@@ -2806,22 +3097,13 @@ if view == "home":
         st.success(f"This month is PHP {abs(monthly_summary['delta_from_previous']):,.2f} lower than {previous_month_name}.")
 
 elif view == "payroll_dashboard":
+    render_module_shell("Payroll Dashboard", "Payroll control center for labor accounts, payroll expenses, and final payouts.", "PAYROLL")
     payroll_labor = sum(float(record.get("net", 0)) for record in st.session_state.labor_records)
     payroll_expenses = sum(float(record.get("price", 0)) for record in st.session_state.payroll_expenses)
     payroll_total = payroll_labor + payroll_expenses
     payroll_remaining = float(st.session_state.remaining_money or 0)
     payroll_output = payroll_total - payroll_remaining
 
-    st.markdown(f"""
-        <div class="dashboard-heading">
-            <img src="{AILYN_LOGO_DATA}" alt="Ailyn Construction Logo">
-            <div>
-                <div class="dashboard-heading-title">PAYROLL DASHBOARD</div>
-                <div class="dashboard-heading-sub">AILYN HOUSE PROJECT | AILYN HOUSE</div>
-            </div>
-        </div>
-        <div class="dashboard-welcome">Payroll control center for labor accounts, payroll expenses, and final payouts.</div>
-    """, unsafe_allow_html=True)
     st.caption("A focused view of labor, payroll expenses, and the current payout.")
     p1, p2, p3, p4 = st.columns(4)
     with p1:
@@ -2869,8 +3151,7 @@ elif view == "payroll_dashboard":
         st.info("No labor accounts yet. Add the first worker from Payroll Operations.")
 
 elif view == "planner_input":
-    st.subheader("📅 PLANNER INPUT - ADD NEW WORK TASK")
-    st.caption("Select the exact day from the monthly calendar, then enter the work details.")
+    render_module_shell("Planner Input", "Select the exact day from the monthly calendar, then enter the work details and save the work task.", "PLANNER")
 
     # ================================================================
     # ACCURATE MONTHLY CALENDAR
@@ -3158,8 +3439,7 @@ elif view == "planner_input":
 
 
 elif view == "planner_output":
-    st.subheader("📆 PLANNER OUTPUT - FULL MONTH CALENDAR")
-    st.caption("Full monthly project calendar with scheduled work tasks. Download it as a PNG image.")
+    render_module_shell("Planner Output", "View the full monthly project calendar with scheduled work tasks and export it as a PNG image.", "PLANNER")
 
     import calendar as _calendar
     from datetime import date as _date
@@ -4000,8 +4280,7 @@ elif view == "client_portal":
     completed_tasks = sum(task.get("status") == "Completed" for task in st.session_state.planner_tasks)
     total_tasks = len(st.session_state.planner_tasks)
     progress = int(completed_tasks / total_tasks * 100) if total_tasks else 0
-    st.markdown("## CLIENT PORTAL")
-    st.caption(f"{project.get('name', 'Ailyn House Project')} | {project.get('status', 'Active')} | Client view")
+    render_module_shell("Client Portal", f"{project.get('name', 'Ailyn House Project')} | {project.get('status', 'Active')} | Client view", "CLIENTS")
     portal_metrics = st.columns(4)
     with portal_metrics[0]:
         st.metric("PROJECT PROGRESS", f"{progress}%")
@@ -4056,8 +4335,7 @@ elif view == "client_portal":
             set_view("home")
 
 elif view == "communications":
-    st.markdown("## MESSAGES & CALLS")
-    st.caption("Keep project communication and client meetings in one place.")
+    render_module_shell("Messages & Calls", "Keep project communication and client meetings in one place.", "COMMUNICATIONS")
     message_tab, radio_tab, calls_tab = st.tabs(["MESSAGES", "PROJECT RADIO", "VOICE & VIDEO CALLS"])
     with message_tab:
         message_sender = st.text_input("Your name", value=st.session_state.app_settings.get("display_name", "") or "Project team", key="message_sender")
@@ -4128,8 +4406,7 @@ elif view == "communications":
 
 elif view == "settings":
     settings = st.session_state.app_settings
-    st.markdown("## SETTINGS")
-    st.caption("Manage your account, project preferences, notifications, and security.")
+    render_module_shell("Settings", "Manage your account, project preferences, notifications, and security.", "SYSTEM")
     profile_tab, preference_tab, security_tab = st.tabs(["PROFILE", "PREFERENCES", "SECURITY"])
     with profile_tab:
         with st.form("account_profile_form"):
@@ -4203,8 +4480,7 @@ elif view == "settings":
         render_recent_activity(limit=10)
 
 elif view == "photo_scanner":
-    st.markdown("## PHOTO STUDIO")
-    st.caption("Capture a receipt or project update. The app will read and organize the photo for you.")
+    render_module_shell("Photo Studio", "Capture a receipt or project update. The app will read and organize the photo for you.", "TOOLS")
     studio_capture, studio_status = st.columns([1.25, 0.75])
     with studio_capture:
         st.markdown("### Camera")
