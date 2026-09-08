@@ -503,6 +503,24 @@ def set_view(v):
     st.rerun()
 
 
+def render_module_shell(title, subtitle="", badge="OPERATIONS"):
+    st.markdown(
+        f"""
+        <div class="module-shell">
+            <div class="module-shell-header">
+                <div class="module-shell-copy">
+                    <div class="module-shell-kicker">AILYN HOUSE</div>
+                    <h2 class="module-shell-title">{title}</h2>
+                </div>
+                <div class="module-shell-badge">{badge}</div>
+            </div>
+            {f'<p class="module-shell-subtitle">{subtitle}</p>' if subtitle else ''}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def project_settings_dialog():
     project = st.session_state.project
     with st.form("project_settings_form"):
@@ -1587,6 +1605,32 @@ section[data-testid="stSidebar"] button p{font-family:'Manrope'!important;font-w
 button,.stDownloadButton>button,.stFormSubmitButton>button{position:relative!important;overflow:hidden!important;min-height:46px!important;border-radius:16px!important;color:#f5fff8!important;font-weight:800!important;background:linear-gradient(145deg,rgba(25,92,54,.88),rgba(5,33,19,.94))!important;border:1px solid rgba(173,255,201,.22)!important;box-shadow:0 6px 0 rgba(2,17,10,.78),0 13px 27px rgba(0,0,0,.25),inset 0 1px 0 rgba(255,255,255,.13)!important;transition:all .17s ease!important}
 button:hover,.stDownloadButton>button:hover,.stFormSubmitButton>button:hover{transform:translateY(-3px)!important;border-color:rgba(114,247,176,.58)!important;box-shadow:0 9px 0 rgba(2,17,10,.78),0 20px 34px rgba(0,0,0,.35),0 0 25px rgba(114,247,176,.13),inset 0 1px 0 rgba(255,255,255,.2)!important}
 button:active,.stDownloadButton>button:active,.stFormSubmitButton>button:active{transform:translateY(3px)!important;box-shadow:0 2px 0 rgba(2,17,10,.8),0 5px 10px rgba(0,0,0,.28)!important}
+/* glass tabs, forms, uploaders and data panels */
+div[data-testid="stTabs"] [role="tablist"]{display:flex;flex-wrap:wrap;gap:8px;padding:7px;border-radius:18px;background:rgba(3,25,15,.72);border:1px solid rgba(163,255,194,.14);box-shadow:inset 0 4px 14px rgba(0,0,0,.16)}
+div[data-testid="stTabs"] [role="tab"]{padding:10px 14px;border-radius:12px;border:1px solid transparent;background:transparent;color:#cfe6d7;font-weight:800;letter-spacing:.06em;text-transform:uppercase;transition:all .18s ease}
+div[data-testid="stTabs"] [role="tab"][aria-selected="true"]{background:linear-gradient(145deg,rgba(28,114,65,.86),rgba(6,35,20,.9));border-color:rgba(114,247,176,.36);box-shadow:0 8px 18px rgba(0,0,0,.18),0 0 20px rgba(114,247,176,.10)}
+div[data-testid="stForm"]{background:linear-gradient(145deg,rgba(9,37,24,.68),rgba(4,22,13,.78));border:1px solid rgba(163,255,194,.12);border-radius:22px;padding:16px;box-shadow:inset 0 1px 0 rgba(255,255,255,.06)}
+div[data-testid="stFileUploaderDropzone"]{background:linear-gradient(145deg,rgba(11,52,33,.72),rgba(4,23,14,.76))!important;border:1px solid rgba(163,255,194,.18)!important;border-radius:18px!important;box-shadow:inset 0 4px 18px rgba(0,0,0,.18)!important}
+[data-testid="stFileUploaderDropzone"] div{color:#eafaf0!important}
+div[data-testid="stVerticalBlockBorderWrapper"]{border-radius:22px!important}
+div[data-testid="stDataFrame"]{background:rgba(7,34,22,.46)!important;border-radius:18px!important;border:1px solid rgba(163,255,194,.18)!important;overflow:hidden}
+[data-testid="stDataFrame"] .stDataFrameContainer{background:transparent!important}
+/* system-wide content architecture */
+div[data-testid="stMain"]{overflow-x:hidden}
+div[data-testid="stMain"] > div{padding-top:8px!important}
+div[data-testid="stVerticalBlockBorderWrapper"],div[data-testid="stVerticalBlock"] > div[data-testid="stVerticalBlockBorderWrapper"]{background:linear-gradient(145deg,rgba(10,42,26,.78),rgba(4,25,16,.68))!important;border:1px solid rgba(163,255,194,.18)!important;border-radius:22px!important;box-shadow:inset 0 1px 0 rgba(255,255,255,.06),0 16px 34px rgba(0,0,0,.20)!important}
+div[data-testid="stVerticalBlockBorderWrapper"] > div{border-radius:22px!important}
+div[data-testid="stMain"] h1,div[data-testid="stMain"] h2,div[data-testid="stMain"] h3,div[data-testid="stMain"] h4{font-family:'Outfit',sans-serif!important;letter-spacing:.02em!important;color:#f5fff8!important}
+div[data-testid="stMain"] h2{font-size:26px!important;font-weight:900!important;margin-bottom:8px!important}
+div[data-testid="stMain"] h3{font-size:18px!important;font-weight:800!important}
+div[data-testid="stMain"] .stMarkdownContainer p,div[data-testid="stMain"] .stMarkdownContainer li,div[data-testid="stMain"] .stMarkdownContainer span{color:#dcefe5!important}
+div[data-testid="stMaterialValue"]{color:#f5fff8!important}
+div[data-testid="stExpander"]{background:rgba(5,29,17,.58)!important;border:1px solid rgba(163,255,194,.15)!important;border-radius:20px!important;box-shadow:0 10px 25px rgba(0,0,0,.18)!important;overflow:hidden!important}
+div[data-testid="stExpander"] summary{padding:14px 16px!important;border-radius:18px!important;background:linear-gradient(145deg,rgba(17,79,47,.80),rgba(5,31,19,.74))!important;border-bottom:1px solid rgba(163,255,194,.16)!important;color:#f5fff8!important;font-weight:800!important;letter-spacing:.06em!important;text-transform:uppercase}
+div[data-testid="stExpander"] summary:hover{background:linear-gradient(145deg,rgba(26,109,62,.82),rgba(6,38,22,.82))!important}
+div[data-testid="stExpander"] > div{padding:14px 16px!important;background:rgba(6,31,20,.38)!important}
+div[data-testid="stCheckbox"]{padding:8px 10px;border-radius:14px;background:rgba(255,255,255,.02);border:1px solid rgba(163,255,194,.06)}
+div[data-testid="stRadio"],div[data-testid="stSelectbox"],div[data-testid="stNumberInput"],div[data-testid="stTextInput"],div[data-testid="stTextArea"],div[data-testid="stDateInput"]{border-radius:16px!important}
 /* glass input fields */
 div[data-baseweb="input"],div[data-baseweb="base-input"],textarea,div[data-baseweb="select"]>div{background:rgba(3,25,15,.78)!important;border:1px solid rgba(163,255,194,.18)!important;border-radius:15px!important;color:#fff!important;min-height:48px!important;box-shadow:inset 0 4px 15px rgba(0,0,0,.23),0 4px 12px rgba(0,0,0,.12)!important}
 input,textarea{color:#fff!important;-webkit-text-fill-color:#fff!important}input:focus,textarea:focus,div[data-baseweb="input"]:focus-within,div[data-baseweb="select"]>div:focus-within{border-color:#72f7b0!important;box-shadow:0 0 0 3px rgba(114,247,176,.08),0 0 24px rgba(114,247,176,.14),inset 0 4px 15px rgba(0,0,0,.2)!important}label{font-weight:700!important;color:#c8e8d2!important}
@@ -2194,6 +2238,82 @@ div[data-testid="stDataFrame"] {
   flex-wrap: wrap;
   gap: 10px;
   margin-bottom: 18px;
+}
+
+.module-shell {
+  position: relative;
+  overflow: hidden;
+  margin: 0 0 18px;
+  padding: 18px 20px 16px;
+  border-radius: 24px;
+  background: linear-gradient(145deg, rgba(15, 68, 41, 0.82), rgba(4, 26, 16, 0.72));
+  border: 1px solid rgba(163,255,194,0.18);
+  box-shadow: 0 18px 36px rgba(0,0,0,0.26), inset 0 1px 0 rgba(255,255,255,0.08);
+}
+
+.module-shell:before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(110deg, transparent 0%, rgba(255,255,255,0.06) 42%, transparent 54%);
+  transform: translateX(-120%);
+  animation: scan-glow 8s linear infinite;
+}
+
+.module-shell-header {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.module-shell-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.module-shell-kicker {
+  color: #8fe0bb;
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+}
+
+.module-shell-title {
+  margin: 0;
+  color: #f5fff8;
+  font-size: clamp(24px, 2vw, 32px);
+  font-weight: 900;
+  letter-spacing: 0.02em;
+}
+
+.module-shell-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 8px 12px;
+  border-radius: 999px;
+  background: rgba(114,247,176,0.08);
+  border: 1px solid rgba(114,247,176,0.24);
+  color: #dffae9;
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.module-shell-subtitle {
+  position: relative;
+  z-index: 1;
+  margin: 10px 0 0;
+  color: #cfe6d7;
+  font-size: 13px;
+  line-height: 1.5;
 }
 
 .workspace-chip {
@@ -3274,7 +3394,7 @@ elif view == "planner_output":
 
 
 elif view == "material":
-    st.subheader("➕ ADD MATERIAL")
+    render_module_shell("Material Entry", "Capture incoming materials, unit prices, delivery, and sender details for the active project record.", "OPERATIONS")
     with st.form(key="material_form", clear_on_submit=True):
         name = st.text_input("Material Name", key="material_name")
         price = st.number_input("Price", min_value=0.01, value=None, placeholder="0.00", key="material_price")
@@ -3294,7 +3414,7 @@ elif view == "material":
         set_view("home")
 
 elif view == "expense":
-    st.subheader("➕ ADD CONSTRUCTION EXPENSE")
+    render_module_shell("Construction Expense", "Log project costs clearly and keep every expense tied to a build activity and sender.", "FINANCE")
     with st.form(key="expense_form", clear_on_submit=True):
         name = st.text_input("Expense Name")
         amount = st.number_input("Amount", min_value=0.01, value=None, placeholder="0.00")
@@ -3312,7 +3432,7 @@ elif view == "expense":
         set_view("home")
 
 elif view == "excess":
-    st.subheader("➕ ADD EXCESS MONEY")
+    render_module_shell("Excess / Deposit Entry", "Record surplus funds, deposits, or adjustments that should be separated from normal project costs.", "FINANCE")
     with st.form(key="excess_form", clear_on_submit=True):
         name = st.text_input("Reason")
         amount = st.number_input("Amount", min_value=0.01, value=None, placeholder="0.00")
@@ -3342,7 +3462,7 @@ elif view == "excess":
         set_view("home")
 
 elif view == "ledger":
-    st.subheader("📖 CONSTRUCTION LEDGER")
+    render_module_shell("Construction Ledger", "Review every project record in one place, search instantly, and update entries without leaving the ledger flow.", "LEDGER")
     ledger_query = st.text_input("Search construction entries", key="construction_ledger_search").strip().lower()
     visible_records = [
         record for record in st.session_state.records
@@ -3421,8 +3541,8 @@ elif view == "ledger":
                 st.rerun()
 
 elif view == "add_labor":
-    st.subheader("👷 ADD LABOR ACCOUNT")
-    st.caption("Click a role button below (Cashier POS Style) to select the work role quickly:")
+    render_module_shell("Labor Account", "Create a labor entry quickly using role-based presets and keep payroll calculations accurate.", "PAYROLL")
+    st.caption("Click a role button below to fast-select the work role for the new account.")
 
     col_r1, col_r2, col_r3 = st.columns(3)
     with col_r1:
@@ -3474,7 +3594,7 @@ elif view == "add_labor":
                 st.warning("Please enter a worker name and valid worked days/points.")
 
 elif view == "add_payroll_expense":
-    st.subheader("➕ ADD PAYROLL EXPENSE")
+    render_module_shell("Payroll Expense", "Track extra payroll costs such as support expenses, additional payouts, and operational charges.", "PAYROLL")
     with st.form(key="payroll_expense_form", clear_on_submit=True):
         desc = st.text_input("Expense Description")
         amt = st.number_input("Amount", min_value=0.01, value=None, placeholder="0.00")
@@ -3495,7 +3615,7 @@ elif view == "add_payroll_expense":
                 st.warning("Please enter a valid amount.")
 
 elif view == "payroll_remaining":
-    st.subheader("⚙️ SET REMAINING MONEY")
+    render_module_shell("Remaining Money", "Set the amount still left after payroll calculations so the dashboard and reports remain accurate.", "PAYROLL")
     res = st.number_input("Leftover/Remaining money to subtract from total", min_value=0.0, value=None,
                           placeholder="0.00")
     if st.button("APPLY REMAINING MONEY", use_container_width=True):
@@ -3508,7 +3628,7 @@ elif view == "payroll_remaining":
             st.warning("Please enter an amount.")
 
 elif view == "payroll_ledger":
-    st.subheader("📋 LABOR & PAYROLL LEDGER")
+    render_module_shell("Labor & Payroll Ledger", "Review labor accounts and payroll expense entries together, then edit or remove items when needed.", "LEDGER")
     payroll_query = st.text_input("Search payroll entries", key="payroll_ledger_search").strip().lower()
     visible_labor = [record for record in st.session_state.labor_records if not payroll_query or payroll_query in str(record).lower()]
     visible_payroll_expenses = [record for record in st.session_state.payroll_expenses if not payroll_query or payroll_query in str(record).lower()]
@@ -3622,7 +3742,7 @@ elif view == "payroll_ledger":
                 st.rerun()
 
 elif view == "export":
-    st.subheader("📄 EXPORT CONSTRUCTION REPORT")
+    render_module_shell("Construction Report", "Prepare a polished construction receipt with saved title, printable layout, and export-ready delivery.", "REPORTS")
     receipt_title = st.text_input("Receipt Title", value="OFFICIAL RECEIPT",
                                   placeholder="Enter a title for this receipt")
     html = build_html_report(st.session_state.records, st.session_state.budget, custom_title=receipt_title)
@@ -3648,7 +3768,7 @@ elif view == "export":
         set_view("receipt_archive")
 
 elif view == "payroll_export":
-    st.subheader("📄 EXPORT PAYROLL REPORT")
+    render_module_shell("Payroll Report", "Generate a clean labor and payroll summary, save it to the archive, and send it when needed.", "REPORTS")
     receipt_title = st.text_input("Receipt Title", value="OFFICIAL LABOR TALLY",
                                   placeholder="Enter a title for this receipt")
     html, total = generate_payroll_html(
@@ -3697,7 +3817,7 @@ elif view == "payroll_export":
             st.error(f"❌ EMAIL FAILED: {e}")
 
 elif view == "receipt_archive":
-    st.subheader("📂 RECEIPT ARCHIVE | AILYN HOUSE")
+    render_module_shell("Receipt Archive", "Access every saved report, export the complete ledger files, and manage your project records from one place.", "ARCHIVE")
     st.caption("Every saved receipt is preserved here and summarized in the complete Excel ledger.")
     st.metric(
         f"TOTAL SPENT THIS MONTH ({manila_now().strftime('%b %Y').upper()})",
@@ -4047,7 +4167,7 @@ elif view == "photo_scanner":
         set_view("home")
 
 elif view == "project_tools":
-    st.subheader("PROJECT TOOLS")
+    render_module_shell("Project Tools", "Organize project evidence, search across records, and prepare focused reports from one control center.", "TOOLS")
     st.caption("Organize project evidence, find records quickly, and prepare focused reports.")
     tools_gallery, tools_search, tools_cleanup = st.tabs(["PHOTO GALLERY", "SEARCH & REPORTS", "DATA CLEANUP"])
 
