@@ -20,11 +20,16 @@ def get_partial_rate(decimal_part, role):
     return TIER_TABLE.get(round(decimal_part, 1), {}).get(role, 0.0)
 
 
-def calculate_labor_pay(worked_days, role):
+def calculate_labor_pay(worked_days, role, daily_rate=None):
     full_days = int(worked_days)
     partial_days = round(worked_days - full_days, 1)
-    full_pay = full_days * FULL_DAY_RATES.get(role, 0.0)
-    partial_pay = get_partial_rate(partial_days, role)
+    rate = FULL_DAY_RATES.get(role, 0.0) if daily_rate is None else float(daily_rate)
+    full_pay = full_days * rate
+    partial_pay = (
+        get_partial_rate(partial_days, role)
+        if role in FULL_DAY_RATES
+        else round(partial_days * rate, 2)
+    )
     return full_pay + partial_pay, full_pay, partial_pay
 
 

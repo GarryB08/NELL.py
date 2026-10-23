@@ -2,7 +2,6 @@ import os
 import time
 import base64
 import ast
-import logging
 from io import BytesIO
 import operator
 import smtplib
@@ -10,7 +9,6 @@ import shutil
 import tempfile
 import hashlib
 import hmac
-import secrets
 import uuid
 import re
 from datetime import datetime
@@ -26,24 +24,15 @@ try:
 except ModuleNotFoundError:
     pytesseract = None
 TESSERACT_NOT_FOUND_ERROR = getattr(pytesseract, "TesseractNotFoundError", RuntimeError)
-from storage import BACKUP_DIR, DB_FILE, create_backup, delete_scanner_photo, history_count, load_state as load_sqlite_state
+from storage import create_backup, delete_scanner_photo, load_state as load_sqlite_state
 from storage import restore_backup, save_scanner_photo, save_state as save_sqlite_state
-from app_logic import FULL_DAY_RATES, TIER_TABLE, budget_alert_status, calculate_labor_pay, get_partial_rate, monthly_trend_summary
+from app_logic import FULL_DAY_RATES, calculate_labor_pay
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-STATE_FILE = os.path.join(APP_DIR, "app_state.json")
 EXCEL_FILE = os.path.join(APP_DIR, "ailyn_project_ledger.xlsx")
 MATERIALS_EXCEL_FILE = os.path.join(APP_DIR, "materials_ledger.xlsx")
 LABOR_EXCEL_FILE = os.path.join(APP_DIR, "labor_ledger.xlsx")
 PHILIPPINES_TZ = ZoneInfo("Asia/Manila")
-
-LOGGER = logging.getLogger("ailyn_house")
-if not LOGGER.handlers:
-    logger_handler = logging.FileHandler(os.path.join(APP_DIR, "ailyn_house.log"), encoding="utf-8")
-    logger_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    LOGGER.addHandler(logger_handler)
-LOGGER.setLevel(logging.INFO)
-LOGGER.propagate = False
 
 
 def manila_now():
@@ -58,21 +47,43 @@ def scan_photo_text(photo):
     return pytesseract.image_to_string(image).strip()
 
 
+def _as_float(value, default=0.0):
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if numeric != numeric or abs(numeric) == float("inf"):
+        return float(default)
+    return numeric
+
+
 def parse_scanned_receipt(text):
     """Extract conservative material-entry suggestions from OCR text."""
+    text = text or ""
     amount_pattern = r"(?:PHP|₱)\s*([0-9][0-9,]*(?:\.\d{1,2})?)"
     currency_amounts = [float(value.replace(",", "")) for value in re.findall(amount_pattern, text, re.IGNORECASE)]
     all_amounts = [float(value.replace(",", "")) for value in re.findall(r"\b[0-9][0-9,]*\.\d{2}\b", text)]
     amounts = currency_amounts or all_amounts
     quantity_match = re.search(r"\b(?:qty|quantity)\s*[:x-]?\s*(\d+)\b|\b(\d+)\s*(?:pcs?|pieces?|units?|x)\b", text, re.IGNORECASE)
-    quantity = int(next(value for value in quantity_match.groups() if value)) if quantity_match else 1
+    quantity = 1
+    if quantity_match:
+        for candidate in quantity_match.groups():
+            if candidate and candidate.isdigit():
+                quantity = int(candidate)
+                break
     delivery_match = re.search(r"delivery\D+([0-9][0-9,]*(?:\.\d{1,2})?)", text, re.IGNORECASE)
-    delivery = float(delivery_match.group(1).replace(",", "")) if delivery_match else 0.0
+    if delivery_match:
+        try:
+            delivery = float(delivery_match.group(1).replace(",", ""))
+        except ValueError:
+            delivery = 0.0
+    else:
+        delivery = 0.0
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     name = next((line for line in lines if not re.search(r"(?:php|₱|total|qty|quantity|delivery|receipt|invoice|date)", line, re.IGNORECASE)), "")
     total = amounts[-1] if amounts else 0.0
     price = total / quantity if quantity > 0 else total
-    return {"name": name[:120], "price": price, "qty": quantity, "delivery": delivery}
+    return {"name": name[:120], "price": price, "qty": max(1, quantity), "delivery": delivery}
 
 
 def normalize_photo_bytes(photo_bytes, mime_type="image/jpeg"):
@@ -81,28 +92,6 @@ def normalize_photo_bytes(photo_bytes, mime_type="image/jpeg"):
     output = BytesIO()
     image.save(output, format="JPEG", quality=90, optimize=True)
     return output.getvalue(), "image/jpeg"
-
-
-def searchable_records(state):
-    records = []
-    for category, key in (("Financial", "records"), ("Labor", "labor_records"), ("Payroll", "payroll_expenses")):
-        for record in state.get(key, []):
-            row_category = "Expense" if category == "Financial" and record.get("type") == "expense" else "Material" if category == "Financial" else category
-            records.append({"category": row_category, **record})
-    return records
-
-
-def find_duplicate_records(records):
-    groups = {}
-    for record in records:
-        signature = (
-            record.get("type", record.get("category", "")),
-            str(record.get("name", record.get("item", record.get("description", "")))).strip().lower(),
-            round(float(record.get("amount", record.get("price", record.get("net", 0))) or 0), 2),
-            record.get("date", record.get("month", "")),
-        )
-        groups.setdefault(signature, []).append(record)
-    return [group for group in groups.values() if len(group) > 1]
 
 
 # --- PERSISTENCE HELPERS
@@ -122,7 +111,6 @@ PERSISTENT_KEYS = [
     "client_notes",
     "app_settings",
     "messages",
-    "auth_users",
 ]
 
 def load_state():
@@ -130,19 +118,30 @@ def load_state():
 
 
 def month_key(record):
+    if not isinstance(record, dict):
+        return manila_now().strftime("%Y-%m")
     recorded_at = record.get("recorded_at")
     if recorded_at:
         try:
-            return datetime.fromisoformat(recorded_at).strftime("%Y-%m")
-        except ValueError:
+            if isinstance(recorded_at, str):
+                return datetime.fromisoformat(recorded_at).strftime("%Y-%m")
+            if hasattr(recorded_at, "strftime"):
+                return recorded_at.strftime("%Y-%m")
+        except (TypeError, ValueError):
             pass
-    try:
-        return datetime.strptime(record.get("date", ""), "%b %d, %Y").strftime("%Y-%m")
-    except ValueError:
-        return manila_now().strftime("%Y-%m")
+    raw_date = record.get("date")
+    if raw_date:
+        try:
+            if isinstance(raw_date, str):
+                return datetime.strptime(raw_date, "%b %d, %Y").strftime("%Y-%m")
+            if hasattr(raw_date, "strftime"):
+                return raw_date.strftime("%Y-%m")
+        except (TypeError, ValueError):
+            pass
+    return manila_now().strftime("%Y-%m")
 
 
-def write_excel(state, archive_entry=None):
+def write_excel(state):
     """Write the current app data to a durable workbook with monthly totals."""
     workbook = Workbook()
     transactions_sheet = workbook.active
@@ -167,8 +166,8 @@ def write_excel(state, archive_entry=None):
         ])
     for record in state.get("payroll_expenses", []):
         payroll_sheet.append([
-            record.get("date", ""), month_key(record), "Payroll Expense", record.get("item", ""),
-            "", "", "", "", float(record.get("price", 0)),
+            record.get("date", ""), month_key(record), "Payroll Expense", "", record.get("item", ""),
+            "", "", "", "", "", float(record.get("price", 0)),
         ])
 
     summary = workbook.create_sheet("Monthly Summary")
@@ -182,15 +181,12 @@ def write_excel(state, archive_entry=None):
         excess = sum(float(r.get("amount", 0)) for r in state.get("records", []) if month_key(r) == month and r.get("type") == "excess")
         labor = sum(float(r.get("net", 0)) for r in state.get("labor_records", []) if month_key(r) == month)
         payroll = sum(float(r.get("price", 0)) for r in state.get("payroll_expenses", []) if month_key(r) == month)
-        summary.append([month, materials, construction, excess, labor, payroll, materials + construction + labor + payroll])
+        summary.append([month, materials, construction, excess, labor, payroll, materials + construction - excess + labor + payroll])
 
     archive = workbook.create_sheet("Receipt Archive")
     archive.append(["Receipt ID", "Saved At", "Report Type", "Title", "HTML File"])
     for entry in state.get("receipt_archive", []):
         archive.append([entry.get("id", ""), entry.get("saved_at", ""), entry.get("report_type", ""), entry.get("title", ""), entry.get("file", "")])
-    if archive_entry:
-            archive.append([archive_entry["id"], archive_entry["saved_at"], archive_entry["report_type"], archive_entry["title"], archive_entry["file"]])
-
     for sheet in workbook.worksheets:
         sheet.freeze_panes = "A2"
         sheet.auto_filter.ref = sheet.dimensions
@@ -273,170 +269,21 @@ ADMIN_PASSWORD = os.getenv("AILYN_ADMIN_PASSWORD", "")
 UPDATE_SIGNING_KEY = os.getenv("AILYN_UPDATE_SIGNING_KEY", "")
 LOGIN_PASSWORD = os.getenv("AILYN_LOGIN_PASSWORD", "")
 
-
-def hash_account_password(password, salt=None):
-    salt = salt or secrets.token_hex(16)
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 240000).hex()
-    return salt, digest
-
-
-def verify_account_password(password, account):
-    _, digest = hash_account_password(password, account.get("salt", ""))
-    return hmac.compare_digest(digest, account.get("password_hash", ""))
-
-
-def authenticate_account(username, password, accounts):
-    account = next((item for item in accounts if item.get("username", "").lower() == username.strip().lower()), None)
-    return account is not None and verify_account_password(password, account)
-
-# ================================================================
-# OWN APP LOGO / FAVICON
-# The app uses its embedded Ailyn House logo, so no external logo
-# website or CDN is required. Replace AILYN_LOGO_DATA above with
-# your own PNG/JPG data URI if you want a different logo.
-# ================================================================
-try:
-    _logo_b64 = AILYN_LOGO_DATA.split(",", 1)[1]
-    APP_LOGO_IMAGE = Image.open(BytesIO(base64.b64decode(_logo_b64))).convert("RGBA")
-except Exception:
-    APP_LOGO_IMAGE = None
-
-# ================================================================
-# CUSTOM HOME-SCREEN / PWA SUPPORT
-# ================================================================
-# Streamlit itself does not provide a native manifest.json editor.
-# These endpoints expose the app's PWA metadata when the app is
-# hosted behind a normal web server/proxy that routes these paths.
-# The browser can then use the supplied 192x192 and 512x512 icons.
-# ================================================================
-
-PWA_APP_NAME = APP_NAME
-PWA_SHORT_NAME = "Ailyn Planner"
-PWA_THEME_COLOR = "#071b11"
-
-def _pwa_manifest():
-    return {
-        "name": PWA_APP_NAME,
-        "short_name": PWA_SHORT_NAME,
-        "start_url": "./",
-        "scope": "./",
-        "display": "standalone",
-        "orientation": "portrait-primary",
-        "background_color": PWA_THEME_COLOR,
-        "theme_color": PWA_THEME_COLOR,
-        "description": "Ailyn House project planner",
-        "icons": [
-            {
-                "src": "logo-192.png",
-                "sizes": "192x192",
-                "type": "image/png",
-                "purpose": "any maskable"
-            },
-            {
-                "src": "logo-512.png",
-                "sizes": "512x512",
-                "type": "image/png",
-                "purpose": "any maskable"
-            }
-        ]
-    }
-
-def _pwa_manifest_json():
-    return json.dumps(_pwa_manifest(), separators=(",", ":"))
-
-def _pwa_install_metadata():
-    # The meta/link tags below are injected into the app HTML.
-    # They are harmless if the deployment proxy does not expose
-    # the manifest/icon paths, and become active when those files
-    # are served by the deployment.
-    return f"""
-    <link rel="manifest" href="./manifest.json">
-    <meta name="mobile-web-app-capable" content="yes">
-    <meta name="apple-mobile-web-app-capable" content="yes">
-    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-    <meta name="apple-mobile-web-app-title" content="{html.escape(PWA_SHORT_NAME)}">
-    <meta name="theme-color" content="{PWA_THEME_COLOR}">
-    <link rel="apple-touch-icon" href="./logo-192.png">
-    """
-
-
-
-def render_pwa_install_info():
-    st.markdown(
-        """
-        <div style="
-            padding:14px 16px;
-            border:1px solid rgba(114,247,176,.22);
-            border-radius:14px;
-            background:rgba(114,247,176,.06);
-            margin:10px 0;
-        ">
-            <b>📱 ADD TO PHONE HOME SCREEN</b><br>
-            <span style="opacity:.8;font-size:13px;">
-            Open this app in your phone browser and choose
-            <b>Add to Home screen</b>. The custom app icon is supplied
-            by the PWA manifest when the deployment serves the icon files.
-            </span>
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-
 st.set_page_config(
     page_title=APP_NAME,
-    page_icon=APP_LOGO_IMAGE if APP_LOGO_IMAGE is not None else "🏠",
+    page_icon=Image.open(BytesIO(base64.b64decode(AILYN_LOGO_DATA.split(",", 1)[1]))),
     layout="wide",
 )
 
-google_auth = st.secrets.get("auth", {})
-google_auth_ready = bool(
-    google_auth.get("client_id")
-    and google_auth.get("client_secret")
-    and google_auth.get("server_metadata_url")
-)
-
-google_user = st.user.to_dict() if google_auth_ready else {}
-if google_user.get("is_logged_in", False):
-    st.session_state.authenticated = True
-    st.session_state.authenticated_user = google_user.get("name") or google_user.get("email") or "Google user"
-
-# CUSTOM PWA BRANDING ACTIVE
-# Browser favicon is configured by st.set_page_config(page_icon=...).
-# The manifest/apple-touch-icon metadata is available for deployments
-# that expose manifest.json and the icon assets.
-
-
-if not st.session_state.get("authenticated"):
-    st.markdown(f"""
-    <style>
-    .stApp {{ background: url("https://images.unsplash.com/photo-1600585154340-be6161a56a0c") center/cover fixed !important; }}
-    .stApp:before {{ content:""; position:fixed; inset:0; background:linear-gradient(135deg,rgba(3,30,18,.78),rgba(10,85,45,.72)); pointer-events:none; }}
-    .auth-shell {{ position:relative; z-index:1; max-width:560px; margin:5vh auto 0; padding:42px 34px 34px; border:1px solid rgba(200,255,224,.32); border-radius:24px; background:rgba(6,27,18,.82); box-shadow:0 28px 80px rgba(0,0,0,.42), inset 0 1px 0 rgba(255,255,255,.12); text-align:center; }}
-    .auth-logo {{ width:92px; height:92px; object-fit:contain; margin-bottom:12px; filter:drop-shadow(0 10px 20px rgba(0,0,0,.35)); }}
-    .auth-title {{ color:#f5fff8; font-family:'Outfit',sans-serif; font-size:30px; font-weight:900; letter-spacing:.08em; margin:0; }}
-    .auth-subtitle {{ color:#a9c9b5; font-size:15px; margin:8px 0 28px; }}
-    .auth-note {{ color:#a9c9b5; font-size:12px; margin-top:18px; }}
-    [data-testid="stForm"] {{ border:0 !important; padding:0 !important; background:transparent !important; }}
-    @media (max-width:600px) {{ .auth-shell {{ margin:2vh 10px 0; padding:32px 20px 26px; }} .auth-title {{ font-size:23px; }} }}
-    </style>
-    <div class="auth-shell">
-      <img class="auth-logo" src="{AILYN_LOGO_DATA}" alt="Ailyn House logo">
-      <h1 class="auth-title">AILYN HOUSE PROJECT</h1>
-      <div class="auth-subtitle">Project Management System</div>
-    </div>
-    """, unsafe_allow_html=True)
-    with st.form("sign_in_form", clear_on_submit=False):
-        username = st.text_input("Name (optional)", placeholder="Leave blank to continue as Guest", key="auth_username")
-        submitted = st.form_submit_button("↪  ENTER APP", use_container_width=True)
-    if submitted:
-        st.session_state.authenticated = True
-        st.session_state.authenticated_user = username.strip() or "Guest"
-        st.rerun()
-    if google_auth_ready:
-        if st.button("CONTINUE WITH GOOGLE", use_container_width=True):
-            st.login()
-    else:
-        st.caption("Anyone can leave the name blank and press Enter to continue. Google passkeys can use Face ID when configured.")
+if LOGIN_PASSWORD and not st.session_state.get("authenticated"):
+    st.title("Ailyn House Project")
+    st.caption("Sign in to access this project workspace.")
+    login_password = st.text_input("Workspace password", type="password")
+    if st.button("SIGN IN", use_container_width=True):
+        if hmac.compare_digest(login_password, LOGIN_PASSWORD):
+            st.session_state.authenticated = True
+            st.rerun()
+        st.error("Invalid workspace password.")
     st.stop()
 
 # Load persisted state safely
@@ -470,12 +317,15 @@ if "remaining_money" not in st.session_state:
     st.session_state.remaining_money = 0.0
 if "view" not in st.session_state:
     st.session_state.view = "home"
+if "workspace_width" not in st.session_state:
+    st.session_state.workspace_width = 1200
+if "sidebar_width" not in st.session_state:
+    st.session_state.sidebar_width = 330
 if st.session_state.view not in {
-    "home", "payroll_dashboard", "planner_input", "planner_output", "material",
+    "home", "payroll_dashboard", "material_dashboard", "planner_input", "planner_output", "material",
     "expense", "excess", "ledger", "add_labor", "add_payroll_expense",
     "payroll_remaining", "payroll_ledger", "export", "payroll_export",
-    "receipt_archive", "client_portal", "communications", "settings",
-    "photo_scanner", "project_tools",
+    "receipt_archive", "monthly_close", "update",
 }:
     st.session_state.view = "home"
 if "selected_role" not in st.session_state:
@@ -486,12 +336,12 @@ if "editing_labor_index" not in st.session_state:
     st.session_state.editing_labor_index = None
 if "editing_payroll_expense_index" not in st.session_state:
     st.session_state.editing_payroll_expense_index = None
+if "scanner_input_version" not in st.session_state:
+    st.session_state.scanner_input_version = 0
+if "scanner_open" not in st.session_state:
+    st.session_state.scanner_open = False
 if "dark_mode" not in st.session_state:
     st.session_state.dark_mode = False
-if "audit_events" not in st.session_state:
-    st.session_state.audit_events = []
-if "current_user_role" not in st.session_state:
-    st.session_state.current_user_role = "manager"
 if not os.path.exists(EXCEL_FILE):
     write_excel(st.session_state)
 if not os.path.exists(MATERIALS_EXCEL_FILE) or not os.path.exists(LABOR_EXCEL_FILE):
@@ -502,724 +352,6 @@ def set_view(v):
     st.session_state.view = v
     persist_state()
     st.rerun()
-
-
-def get_desktop_launchers():
-    return [
-        {"category": "Dashboard", "label": "Home Workspace", "target": "home", "description": "Overview of the active project workspace.", "icon": "◈"},
-        {"category": "Calendar", "label": "Planner Output", "target": "planner_output", "description": "Open the monthly scheduling and task calendar.", "icon": "🗓"},
-        {"category": "Calendar", "label": "Planner Input", "target": "planner_input", "description": "Add a new project task and assign it to a date.", "icon": "✍"},
-        {"category": "Materials", "label": "Materials", "target": "material", "description": "Capture incoming materials and inventory entries.", "icon": "📦"},
-        {"category": "Materials", "label": "Construction Expense", "target": "expense", "description": "Log expense entries tied to the active project.", "icon": "💸"},
-        {"category": "Materials", "label": "Excess / Deposit", "target": "excess", "description": "Record surplus funds, deposits, and balance adjustments.", "icon": "💰"},
-        {"category": "Ledger", "label": "Construction Ledger", "target": "ledger", "description": "Review every construction entry and edit records.", "icon": "📒"},
-        {"category": "Payroll", "label": "Payroll Dashboard", "target": "payroll_dashboard", "description": "Labor, payroll costs, budget controls, and payout status.", "icon": "💼"},
-        {"category": "Payroll", "label": "Add Labor Account", "target": "add_labor", "description": "Create a labor account and calculate payroll values.", "icon": "👷"},
-        {"category": "Payroll", "label": "Payroll Expense", "target": "add_payroll_expense", "description": "Track payroll support costs and related expenses.", "icon": "🧾"},
-        {"category": "Payroll", "label": "Remaining Money", "target": "payroll_remaining", "description": "Set remaining money to keep payroll totals accurate.", "icon": "📉"},
-        {"category": "Payroll", "label": "Labor & Payroll Ledger", "target": "payroll_ledger", "description": "Review labor accounts and payroll expenses together.", "icon": "🧮"},
-        {"category": "Reports", "label": "Construction Report", "target": "export", "description": "Prepare and export the construction receipt report.", "icon": "📄"},
-        {"category": "Reports", "label": "Payroll Report", "target": "payroll_export", "description": "Generate and export labor and payroll statements.", "icon": "📊"},
-        {"category": "Reports", "label": "Receipt Archive", "target": "receipt_archive", "description": "Open saved reports, exports, backups, and archive history.", "icon": "🗂"},
-        {"category": "Clients", "label": "Client Portal", "target": "client_portal", "description": "View project progress, updates, and client-facing data.", "icon": "👥"},
-        {"category": "Clients", "label": "Messages & Calls", "target": "communications", "description": "Monitor messages, radio updates, and meeting links.", "icon": "💬"},
-        {"category": "Tools", "label": "Project Tools", "target": "project_tools", "description": "Manage project photos, search records, and prepare reports.", "icon": "🧰"},
-        {"category": "Tools", "label": "Photo Studio", "target": "photo_scanner", "description": "Capture a receipt or project update and scan it.", "icon": "📷"},
-        {"category": "System", "label": "Settings", "target": "settings", "description": "Profile, preferences, security, and workspace controls.", "icon": "⚙"},
-    ]
-
-
-def render_top_navigation():
-    st.markdown(
-        """
-        <style>
-        html, body {
-            margin: 0;
-            padding: 0;
-            background: linear-gradient(180deg, #dfeaf7 0%, #d6e4f4 30%, #cfe0f3 100%) !important;
-        }
-        .stApp {
-            background: linear-gradient(180deg, #dfeaf7 0%, #d6e4f4 30%, #cfe0f3 100%) !important;
-        }
-        [data-testid="stHeader"] {
-            background: transparent !important;
-            box-shadow: none !important;
-        }
-        .block-container {
-            padding-top: 18px !important;
-            padding-bottom: 130px !important;
-        }
-        .desktop-shell {
-            position: relative;
-            overflow: hidden;
-            margin-bottom: 18px;
-            padding: 18px 20px;
-            border-radius: 24px;
-            background: linear-gradient(145deg, rgba(255,255,255,0.92), rgba(235,242,249,0.9));
-            border: 1px solid rgba(127, 152, 176, 0.35);
-            box-shadow: 0 16px 34px rgba(31, 55, 82, 0.12), inset 0 1px 0 rgba(255,255,255,0.8);
-        }
-        .desktop-shell:before {
-            content: "";
-            position: absolute;
-            inset: 0;
-            background: linear-gradient(110deg, transparent 0%, rgba(255,255,255,0.08) 42%, transparent 54%);
-            transform: translateX(-120%);
-            animation: scan-glow 8s linear infinite;
-        }
-        .desktop-brand {
-            position: relative;
-            z-index: 1;
-            display: flex;
-            align-items: center;
-            gap: 14px;
-            min-width: 0;
-        }
-        .desktop-brand img {
-            width: 54px;
-            height: 54px;
-            object-fit: contain;
-            border-radius: 16px;
-            box-shadow: 0 10px 24px rgba(36, 105, 185, 0.18);
-        }
-        .desktop-brand-copy {
-            min-width: 0;
-        }
-        .desktop-brand-title {
-            color: #1a2d3d;
-            font-size: 22px;
-            font-weight: 900;
-            letter-spacing: 0.04em;
-            line-height: 1.05;
-        }
-        .desktop-brand-sub {
-            color: #4f6e86;
-            font-size: 10px;
-            font-weight: 900;
-            letter-spacing: 0.17em;
-            text-transform: uppercase;
-        }
-        .desktop-shell-meta {
-            position: relative;
-            z-index: 1;
-            display: flex;
-            align-items: center;
-            justify-content: flex-end;
-            gap: 12px;
-            flex-wrap: wrap;
-        }
-        .desktop-status {
-            display: inline-flex;
-            align-items: center;
-            gap: 8px;
-            padding: 7px 10px;
-            border-radius: 999px;
-            background: rgba(62, 141, 232, 0.10);
-            border: 1px solid rgba(62, 141, 232, 0.22);
-            color: #1e4f7d;
-            font-size: 10px;
-            font-weight: 900;
-            letter-spacing: 0.12em;
-            text-transform: uppercase;
-        }
-        .desktop-status-dot {
-            width: 8px;
-            height: 8px;
-            border-radius: 50%;
-            background: #3d9bf4;
-            box-shadow: 0 0 14px rgba(61, 155, 244, 0.65);
-        }
-        .desktop-clock-time {
-            color: #2c4b67;
-            font-size: 11px;
-            font-weight: 800;
-            letter-spacing: 0.06em;
-        }
-        .desktop-taskbar {
-            position: fixed;
-            left: 50%;
-            bottom: 16px;
-            transform: translateX(-50%);
-            width: min(96vw, 1200px);
-            z-index: 9997;
-            padding: 10px 12px;
-            border-radius: 22px;
-            background: rgba(244, 248, 253, 0.82);
-            border: 1px solid rgba(127, 152, 176, 0.35);
-            box-shadow: 0 18px 36px rgba(31, 55, 82, 0.14), inset 0 1px 0 rgba(255,255,255,0.7);
-            backdrop-filter: blur(18px) saturate(140%);
-            -webkit-backdrop-filter: blur(18px) saturate(140%);
-        }
-        .desktop-taskbar .stButton > button {
-            min-height: 44px !important;
-            border-radius: 14px !important;
-            padding: 0 14px !important;
-            background: linear-gradient(145deg, rgba(255,255,255,0.96), rgba(233,240,247,0.82)) !important;
-            border: 1px solid rgba(127, 152, 176, 0.36) !important;
-            box-shadow: inset 0 1px 0 rgba(255,255,255,0.7) !important;
-            color: #233b50 !important;
-            font-weight: 800 !important;
-        }
-        .desktop-taskbar .stButton > button:hover {
-            transform: translateY(-1px) !important;
-            border-color: rgba(61, 155, 244, 0.55) !important;
-            box-shadow: 0 10px 18px rgba(61, 155, 244, 0.14), inset 0 1px 0 rgba(255,255,255,0.75) !important;
-        }
-        .desktop-taskbar .taskbar-primary {
-            background: linear-gradient(145deg, rgba(36, 128, 226, 0.96), rgba(22, 102, 191, 0.96)) !important;
-            border-color: rgba(100, 174, 245, 0.6) !important;
-            color: white !important;
-            box-shadow: 0 10px 18px rgba(36, 128, 226, 0.26), inset 0 1px 0 rgba(255,255,255,0.2) !important;
-        }
-        .desktop-modal-overlay {
-            position: fixed;
-            inset: 0;
-            z-index: 9998;
-            display: flex;
-            align-items: flex-start;
-            justify-content: center;
-            padding-top: 78px;
-            background: rgba(20, 29, 37, 0.18);
-            backdrop-filter: blur(8px);
-            -webkit-backdrop-filter: blur(8px);
-        }
-        .desktop-modal-panel {
-            width: min(92vw, 1120px);
-            max-height: 78vh;
-            overflow-y: auto;
-            padding: 20px;
-            border-radius: 28px;
-            background: linear-gradient(145deg, rgba(245,248,252,0.96), rgba(228,236,245,0.9));
-            border: 1px solid rgba(127, 152, 176, 0.35);
-            box-shadow: 0 25px 60px rgba(31, 55, 82, 0.18), inset 0 1px 0 rgba(255,255,255,0.85);
-        }
-        .desktop-modal-panel-compact {
-            width: min(90vw, 900px);
-        }
-        .desktop-panel-header {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 12px;
-            margin-bottom: 14px;
-            flex-wrap: wrap;
-        }
-        .desktop-panel-title {
-            color: #1a2d3d;
-            font-size: 18px;
-            font-weight: 900;
-            letter-spacing: 0.04em;
-        }
-        .desktop-panel-subtitle {
-            color: #4f6e86;
-            font-size: 11px;
-            font-weight: 800;
-            letter-spacing: 0.14em;
-            text-transform: uppercase;
-        }
-        .desktop-panel-category {
-            color: #2d5f8d;
-            font-size: 10px;
-            font-weight: 900;
-            letter-spacing: 0.18em;
-            text-transform: uppercase;
-            margin: 12px 0 10px;
-        }
-        .desktop-shortcut-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-            gap: 12px;
-        }
-        .desktop-shortcut-card {
-            background: linear-gradient(145deg, rgba(255,255,255,0.95), rgba(234,242,249,0.83));
-            border: 1px solid rgba(127, 152, 176, 0.28);
-            border-radius: 16px;
-            padding: 14px;
-            box-shadow: inset 0 1px 0 rgba(255,255,255,0.7);
-            height: 100%;
-        }
-        .desktop-shortcut-icon {
-            width: 34px;
-            height: 34px;
-            border-radius: 10px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            background: rgba(62, 141, 232, 0.10);
-            border: 1px solid rgba(62, 141, 232, 0.22);
-            color: #2d70b8;
-            font-size: 16px;
-            font-weight: 900;
-            margin-bottom: 8px;
-        }
-        .desktop-shortcut-card .shortcut-label {
-            color: #1c2f3d;
-            font-weight: 900;
-            font-size: 14px;
-            margin-bottom: 4px;
-        }
-        .desktop-shortcut-card .shortcut-desc {
-            color: #4c6273;
-            font-size: 11px;
-            line-height: 1.45;
-            margin-bottom: 10px;
-        }
-        .desktop-shortcut-card button {
-            width: 100%;
-            min-height: 42px !important;
-        }
-        .desktop-start-tile-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-            gap: 12px;
-        }
-        .desktop-start-tile {
-            padding: 16px 14px;
-            border-radius: 18px;
-            border: 1px solid rgba(127, 152, 176, 0.28);
-            background: linear-gradient(145deg, rgba(255,255,255,0.96), rgba(233,240,247,0.86));
-            box-shadow: inset 0 1px 0 rgba(255,255,255,0.72);
-            height: 100%;
-        }
-        .desktop-start-tile .desktop-start-icon {
-            width: 42px;
-            height: 42px;
-            border-radius: 12px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            margin-bottom: 10px;
-            background: linear-gradient(145deg, rgba(36, 128, 226, 0.14), rgba(58, 167, 224, 0.06));
-            border: 1px solid rgba(61, 155, 244, 0.28);
-            color: #2d70b8;
-            font-size: 18px;
-            font-weight: 900;
-        }
-        .desktop-start-tile .desktop-start-label {
-            color: #1c2f3d;
-            font-size: 14px;
-            font-weight: 900;
-            margin-bottom: 4px;
-        }
-        .desktop-start-tile .desktop-start-desc {
-            color: #4c6273;
-            font-size: 11px;
-            line-height: 1.45;
-            margin-bottom: 10px;
-        }
-        .desktop-start-tile button {
-            width: 100%;
-            min-height: 42px !important;
-        }
-        .desktop-pinned-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-            gap: 14px;
-            margin-top: 18px;
-        }
-        .desktop-pinned-tile {
-            padding: 16px 12px;
-            border-radius: 18px;
-            background: linear-gradient(145deg, rgba(255,255,255,0.96), rgba(235,242,249,0.82));
-            border: 1px solid rgba(127, 152, 176, 0.3);
-            box-shadow: 0 12px 24px rgba(31,55,82,0.08), inset 0 1px 0 rgba(255,255,255,0.7);
-            height: 100%;
-        }
-        .desktop-pinned-icon {
-            width: 44px;
-            height: 44px;
-            border-radius: 14px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            margin: 0 auto 10px;
-            background: linear-gradient(145deg, rgba(36, 128, 226, 0.14), rgba(58, 167, 224, 0.08));
-            border: 1px solid rgba(61, 155, 244, 0.28);
-            color: #2d70b8;
-            font-size: 18px;
-            font-weight: 900;
-        }
-        .desktop-pinned-label {
-            color: #1c2f3d;
-            font-size: 13px;
-            font-weight: 900;
-            text-align: center;
-            margin-bottom: 8px;
-        }
-        .desktop-pinned-tile button {
-            width: 100%;
-            min-height: 40px !important;
-        }
-        @media (max-width: 700px) {
-            .desktop-shortcut-grid {
-                grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-            }
-            .desktop-modal-panel {
-                width: min(94vw, 1120px);
-                padding: 14px;
-            }
-            .desktop-taskbar {
-                width: min(96vw, 900px);
-                bottom: 12px;
-                padding: 8px 10px;
-            }
-            .desktop-taskbar .stButton > button {
-                min-height: 40px !important;
-                padding: 0 10px !important;
-            }
-        }
-        @media (max-width: 580px) {
-            .block-container {
-                padding-bottom: 150px !important;
-            }
-            .desktop-shell {
-                padding: 14px 16px;
-            }
-            .desktop-brand-title {
-                font-size: 18px;
-            }
-            .desktop-panel-header {
-                flex-direction: column;
-                align-items: flex-start;
-            }
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    if "desktop_start_menu_open" not in st.session_state:
-        st.session_state.desktop_start_menu_open = False
-    if "desktop_shortcut_menu_open" not in st.session_state:
-        st.session_state.desktop_shortcut_menu_open = False
-
-    st.markdown("<div class='desktop-shell'>", unsafe_allow_html=True)
-
-    shell_cols = st.columns([2.4, 1.2])
-    with shell_cols[0]:
-        st.markdown(
-            f"""
-            <div class='desktop-brand'>
-                <img src="{AILYN_LOGO_DATA}" alt="Ailyn House logo">
-                <div class='desktop-brand-copy'>
-                    <div class='desktop-brand-title'>AILYN HOUSE</div>
-                    <div class='desktop-brand-sub'>Project Workspace</div>
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    with shell_cols[1]:
-        st.markdown(
-            f"""
-            <div class='desktop-shell-meta'>
-                <div class='desktop-status'><span class='desktop-status-dot'></span> LIVE</div>
-                <div class='desktop-clock-time'>{manila_now().strftime('%b %d, %Y')}<br>{manila_now().strftime('%I:%M %p')}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown("<div class='desktop-taskbar'>", unsafe_allow_html=True)
-    taskbar_cols = st.columns([1.1, 1.1, 1.0, 1.0, 1.0, 1.0, 1.0, 1.2])
-
-    with taskbar_cols[0]:
-        if st.button("Start", key="taskbar_start", use_container_width=True):
-            st.session_state.desktop_start_menu_open = not st.session_state.desktop_start_menu_open
-            st.session_state.desktop_shortcut_menu_open = False
-    with taskbar_cols[1]:
-        if st.button("Search", key="taskbar_search", use_container_width=True):
-            st.session_state.desktop_shortcut_menu_open = not st.session_state.desktop_shortcut_menu_open
-            st.session_state.desktop_start_menu_open = False
-    with taskbar_cols[2]:
-        if st.button("Home", key="taskbar_home", use_container_width=True):
-            set_view("home")
-    with taskbar_cols[3]:
-        if st.button("Payroll", key="taskbar_payroll", use_container_width=True):
-            set_view("payroll_dashboard")
-    with taskbar_cols[4]:
-        if st.button("Materials", key="taskbar_materials", use_container_width=True):
-            set_view("material")
-    with taskbar_cols[5]:
-        if st.button("Reports", key="taskbar_reports", use_container_width=True):
-            set_view("export")
-    with taskbar_cols[6]:
-        if st.button("Calendar", key="taskbar_calendar", use_container_width=True):
-            set_view("planner_output")
-    with taskbar_cols[7]:
-        st.markdown(
-            f"""
-            <div class='desktop-clock-time' style='padding: 10px 12px; text-align: right; min-height: 44px; display: flex; align-items: center; justify-content: flex-end; border-radius: 14px; background: rgba(255,255,255,0.36); border: 1px solid rgba(127, 152, 176, 0.2);'>
-                {manila_now().strftime('%b %d')}<br>{manila_now().strftime('%I:%M %p')}
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    if st.session_state.desktop_start_menu_open:
-        st.markdown("<div class='desktop-modal-overlay'>", unsafe_allow_html=True)
-        st.markdown("<div class='desktop-modal-panel'>", unsafe_allow_html=True)
-        st.markdown("<div class='desktop-panel-header'><div class='desktop-panel-title'>Start</div><div class='desktop-panel-subtitle'>Application Launcher</div></div>", unsafe_allow_html=True)
-
-        launchers = get_desktop_launchers()
-        grouped = {}
-        for launcher in launchers:
-            grouped.setdefault(launcher["category"], []).append(launcher)
-
-        for category in grouped:
-            st.markdown(f"<div class='desktop-panel-category'>{category}</div>", unsafe_allow_html=True)
-            st.markdown("<div class='desktop-start-tile-grid'>", unsafe_allow_html=True)
-            start_cols = st.columns(min(4, len(grouped[category])))
-            for index, launcher in enumerate(grouped[category]):
-                with start_cols[index]:
-                    st.markdown(
-                        f"""
-                        <div class='desktop-start-tile'>
-                            <div class='desktop-start-icon'>{launcher['icon']}</div>
-                            <div class='desktop-start-label'>{launcher['label']}</div>
-                            <div class='desktop-start-desc'>{launcher['description']}</div>
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
-                    if st.button("Open", key=f"start_shortcut_{launcher['target']}", use_container_width=True):
-                        st.session_state.desktop_start_menu_open = False
-                        st.session_state.desktop_shortcut_menu_open = False
-                        st.session_state.desktop_shortcut_query = ""
-                        set_view(launcher["target"])
-            st.markdown("</div>", unsafe_allow_html=True)
-
-        st.markdown("</div>", unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    if st.session_state.desktop_shortcut_menu_open:
-        st.markdown("<div class='desktop-modal-overlay'>", unsafe_allow_html=True)
-        st.markdown("<div class='desktop-modal-panel desktop-modal-panel-compact'>", unsafe_allow_html=True)
-        st.markdown("<div class='desktop-panel-header'><div class='desktop-panel-title'>Quick Access</div><div class='desktop-panel-subtitle'>Search available functions</div></div>", unsafe_allow_html=True)
-
-        query = st.text_input(
-            "Search",
-            key="desktop_shortcut_query",
-            placeholder="Type a name, category, or keyword...",
-            label_visibility="collapsed",
-        )
-
-        launcher_query = (query or "").strip().lower()
-        launchers = get_desktop_launchers()
-        filtered_launchers = [
-            launcher for launcher in launchers
-            if not launcher_query
-            or launcher_query in launcher["label"].lower()
-            or launcher_query in launcher["category"].lower()
-            or launcher_query in launcher["description"].lower()
-        ]
-
-        if filtered_launchers:
-            grouped = {}
-            for launcher in filtered_launchers:
-                grouped.setdefault(launcher["category"], []).append(launcher)
-
-            for category in grouped:
-                st.markdown(f"<div class='desktop-panel-category'>{category}</div>", unsafe_allow_html=True)
-                grid_cols = st.columns(min(3, len(grouped[category])))
-                for index, launcher in enumerate(grouped[category]):
-                    with grid_cols[index]:
-                        st.markdown(
-                            f"""
-                            <div class='desktop-shortcut-card'>
-                                <div class='desktop-shortcut-icon'>{launcher['icon']}</div>
-                                <div class='shortcut-label'>{launcher['label']}</div>
-                                <div class='shortcut-desc'>{launcher['description']}</div>
-                            </div>
-                            """,
-                            unsafe_allow_html=True,
-                        )
-                        if st.button("Open", key=f"search_shortcut_{launcher['target']}", use_container_width=True):
-                            st.session_state.desktop_shortcut_menu_open = False
-                            st.session_state.desktop_start_menu_open = False
-                            st.session_state.desktop_shortcut_query = ""
-                            set_view(launcher["target"])
-        else:
-            st.info("No matching functions found. Try payroll, reports, materials, calendar, clients, or settings.")
-
-        st.markdown("</div>", unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
-
-
-def render_module_shell(title, subtitle="", badge="OPERATIONS"):
-    st.markdown(
-        f"""
-        <div class="module-shell">
-            <div class="module-shell-header">
-                <div class="module-shell-copy">
-                    <div class="module-shell-kicker">AILYN HOUSE</div>
-                    <h2 class="module-shell-title">{title}</h2>
-                </div>
-                <div class="module-shell-badge">{badge}</div>
-            </div>
-            {f'<p class="module-shell-subtitle">{subtitle}</p>' if subtitle else ''}
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def project_settings_dialog():
-    project = st.session_state.project
-    with st.form("project_settings_form"):
-        name = st.text_input("Project name", value=project.get("name", "Ailyn House Project"))
-        client = st.text_input("Client name", value=project.get("client", ""))
-        address = st.text_input("Site address", value=project.get("address", ""))
-        manager = st.text_input("Project manager", value=project.get("manager", ""))
-        status = st.selectbox("Project status", ["Planning", "Active", "On Hold", "Completed"], index=["Planning", "Active", "On Hold", "Completed"].index(project.get("status", "Active")))
-        target_date = st.date_input("Target completion", value=datetime.fromisoformat(project["target_date"]).date() if project.get("target_date") else manila_now().date())
-        if st.form_submit_button("SAVE PROJECT DETAILS", use_container_width=True):
-            if not user_can_edit({"manager", "admin"}):
-                st.warning("Only managers can edit project details.")
-            elif not name.strip():
-                st.error("Project name is required.")
-            else:
-                st.session_state.project = {"name": name.strip(), "client": client.strip(), "address": address.strip(), "manager": manager.strip(), "status": status, "target_date": target_date.isoformat()}
-                add_audit_event("project_updated", {"project": st.session_state.project})
-                persist_state()
-                st.success("Project details saved.")
-
-
-def total_materials():
-    return sum(r["amount"] for r in st.session_state.records if r["type"] == "material")
-
-
-def total_expenses():
-    return sum(r["amount"] for r in st.session_state.records if r["type"] == "expense")
-
-
-def total_excess():
-    return sum(r["amount"] for r in st.session_state.records if r["type"] == "excess")
-
-
-def get_total():
-    return total_materials() + total_expenses()
-
-
-def get_balance():
-    return float(st.session_state.budget) - total_excess() - get_total()
-
-
-def monthly_spend(month=None):
-    month = month or manila_now().strftime("%Y-%m")
-    construction = sum(
-        float(record.get("amount", 0)) for record in st.session_state.records
-        if record.get("type") in {"material", "expense"} and month_key(record) == month
-    )
-    labor = sum(float(record.get("net", 0)) for record in st.session_state.labor_records if month_key(record) == month)
-    payroll_expenses = sum(float(record.get("price", 0)) for record in st.session_state.payroll_expenses if month_key(record) == month)
-    return construction + labor + payroll_expenses
-
-
-def monthly_construction_spend(month=None):
-    month = month or manila_now().strftime("%Y-%m")
-    return sum(
-        float(record.get("amount", 0)) for record in st.session_state.records
-        if record.get("type") in {"material", "expense"} and month_key(record) == month
-    )
-
-
-def validate_transaction_input(name, price, qty, delivery, transaction_type="material"):
-    clean_name = (name or "").strip()
-    if not clean_name:
-        raise ValueError("Please enter a valid item name.")
-
-    amount = float(price if price is not None else 0.0)
-    quantity = int(qty if qty is not None else 1)
-    delivery_value = float(delivery if delivery is not None else 0.0)
-
-    if amount <= 0:
-        raise ValueError("Please enter an amount greater than zero.")
-    if transaction_type == "material" and quantity < 1:
-        raise ValueError("Please enter a quantity greater than zero.")
-    if delivery_value < 0:
-        raise ValueError("Delivery cannot be negative.")
-
-    total_amount = (amount * quantity) + delivery_value if transaction_type == "material" else amount
-    return {
-        "name": clean_name.upper(),
-        "price": amount,
-        "qty": quantity,
-        "delivery": delivery_value,
-        "amount": float(total_amount),
-    }
-
-
-def get_monthly_summary(month=None):
-    month = month or manila_now().strftime("%Y-%m")
-
-    def month_range(month_key_value):
-        try:
-            year, month_num = [int(part) for part in month_key_value.split("-")]
-        except ValueError:
-            return None, None
-        return year, month_num
-
-    def previous_month(month_key_value):
-        year, month_num = month_range(month_key_value)
-        if year is None:
-            return month_key_value
-        if month_num == 1:
-            return f"{year - 1}-12"
-        return f"{year}-{month_num - 1:02d}"
-
-    def aggregate(source_records, kind):
-        if kind == "materials":
-            return sum(float(record.get("amount", 0)) for record in source_records if record.get("type") == "material" and month_key(record) == month)
-        if kind == "expenses":
-            return sum(float(record.get("amount", 0)) for record in source_records if record.get("type") == "expense" and month_key(record) == month)
-        if kind == "excess":
-            return sum(float(record.get("amount", 0)) for record in source_records if record.get("type") == "excess" and month_key(record) == month)
-        if kind == "labor":
-            return sum(float(record.get("net", 0)) for record in source_records if month_key(record) == month)
-        if kind == "payroll":
-            return sum(float(record.get("price", 0)) for record in source_records if month_key(record) == month)
-        return 0.0
-
-    materials = aggregate(st.session_state.records, "materials")
-    construction = aggregate(st.session_state.records, "expenses")
-    excess = aggregate(st.session_state.records, "excess")
-    labor = aggregate(st.session_state.labor_records, "labor")
-    payroll = aggregate(st.session_state.payroll_expenses, "payroll")
-    total_spent = materials + construction + labor + payroll
-    budget = float(st.session_state.budget or 0)
-    remaining = budget - total_spent
-    previous_key = previous_month(month)
-
-    previous_materials = aggregate(st.session_state.records, "materials") if False else 0.0
-    previous_construction = previous_materials
-    previous_labor = previous_materials
-    previous_payroll = previous_materials
-
-    previous_materials = sum(float(record.get("amount", 0)) for record in st.session_state.records if record.get("type") == "material" and month_key(record) == previous_key)
-    previous_construction = sum(float(record.get("amount", 0)) for record in st.session_state.records if record.get("type") == "expense" and month_key(record) == previous_key)
-    previous_labor = sum(float(record.get("net", 0)) for record in st.session_state.labor_records if month_key(record) == previous_key)
-    previous_payroll = sum(float(record.get("price", 0)) for record in st.session_state.payroll_expenses if month_key(record) == previous_key)
-    previous_total = previous_materials + previous_construction + previous_labor + previous_payroll
-
-    return {
-        "month": month,
-        "previous_month": previous_key,
-        "materials": materials,
-        "construction": construction,
-        "excess": excess,
-        "labor": labor,
-        "payroll": payroll,
-        "total_spent": total_spent,
-        "budget": budget,
-        "remaining": remaining,
-        "previous_total": previous_total,
-        "delta_from_previous": total_spent - previous_total,
-    }
 
 
 # ================================================================
@@ -1281,8 +413,8 @@ def receipt_preview_height(item_count, row_height=58, base_height=560):
 def build_html_report(records, budget, custom_title="INVENTORY RECEIPT"):
     material_and_expense_records = [r for r in records if r["type"] in ["material", "expense"]]
     excess_records = [r for r in records if r["type"] == "excess"]
-    material_total = sum(r["amount"] for r in material_and_expense_records)
     excess_total = sum(r["amount"] for r in excess_records)
+    material_total = sum(r["amount"] for r in material_and_expense_records) - excess_total
     remaining_balance = get_balance()
     date_now = manila_now().strftime("%B %d, %Y")
     sobra_amount = 0.0
@@ -1300,36 +432,42 @@ def build_html_report(records, budget, custom_title="INVENTORY RECEIPT"):
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
 <style>
-@import url('https://fonts.googleapis.com/css?family=Inter:wght@400;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Orbitron:wght@600;700;800&display=swap');
+:root {{ --ink: #064e3b; --muted: #356b50; --emerald: #075c35; --deep: #03281a; --line: #dbe8df; --champagne: #b3945a; }}
 * {{ box-sizing: border-box; }}
-html, body {{ width: 100%; max-width: 100%; margin: 0; padding: 0; overflow-x: hidden; }}
-body {{ font-family: 'Inter', sans-serif; background-color: #f0f4f0; margin: 0; padding: 20px; color: #333; }}
-.receipt-container {{ width: min(100%, 980px); max-width: 980px; margin: auto; background: #fff; padding: clamp(16px, 2vw, 30px); border-radius: 4px; box-shadow: 0 4px 20px rgba(0,0,0,0.08); border-top: 10px solid #1b5e20; overflow-wrap: anywhere; word-break: break-word; }}
-.header {{ display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-start; margin-bottom: 30px; border-bottom: 2px solid #f0f0f0; padding-bottom: 15px; }}
-.company-info h1 {{ color: #1b5e20; margin: 0; font-size: 24px; letter-spacing: -1px; }}
-.company-info p {{ margin: 4px 0; font-size: 12px; color: #666; }}
+body {{ font-family: 'DM Sans', sans-serif; font-weight: 500; background: #e6e6e6; margin: 0; padding: 20px; color: var(--ink); }}
+.receipt-meta h2 {{ font-family: 'Orbitron', sans-serif; font-weight: 800; letter-spacing: .08em; }}
+.receipt-container {{ max-width: 1000px; margin: auto; background: #e6e6e6; padding: 30px; border-radius: 14px; box-shadow: 0 22px 50px rgba(16, 52, 34, .16), 0 2px 0 rgba(255,255,255,.9) inset; border-top: 8px solid var(--deep); position: relative; overflow: hidden; }}
+.header {{ position: relative; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-start; margin-bottom: 26px; border-bottom: 1px solid var(--line); padding-bottom: 16px; }}
+.company-brand {{ display: flex; align-items: center; gap: 12px; }}
+.company-brand img {{ width: 58px; height: 58px; object-fit: contain; filter: drop-shadow(0 5px 9px rgba(0, 45, 25, .22)); }}
+.company-info h1 {{ color: var(--deep); margin: 0; font-family: 'Orbitron', sans-serif; font-size: 29px; letter-spacing: .02em; line-height: 1.1; }}
+.company-info p {{ margin: 5px 0; font-size: 12px; color: var(--ink); }}
 .receipt-meta {{ text-align: left; margin-top: 10px; }}
 @media (min-width: 768px) {{ .receipt-meta {{ text-align: right; margin-top: 0; }} }}
-.receipt-meta h2 {{ margin: 0; font-size: 16px; text-transform: uppercase; color: #1b5e20; }}
-.receipt-meta p {{ margin: 4px 0; font-size: 12px; font-weight: bold; }}
-table {{ width: 100%; border-collapse: collapse; margin-bottom: 20px; font-size: 12px; table-layout: fixed; }}
-th {{ background-color: #1b5e20; color: #ffffff; text-align: left; padding: 10px; text-transform: uppercase; letter-spacing: 1px; }}
-td {{ padding: 10px 8px; border-bottom: 1px solid #f0f0f0; overflow-wrap: anywhere; word-break: break-word; }}
+.receipt-meta h2 {{ margin: 0; font-size: 16px; text-transform: uppercase; color: var(--deep); }}
+.receipt-meta p {{ margin: 5px 0; font-size: 12px; font-weight: 600; color: var(--ink); }}
+table {{ width: 100%; border-collapse: separate; border-spacing: 0; margin-bottom: 20px; font-size: 12px; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }}
+th {{ background: linear-gradient(105deg, var(--deep), var(--emerald)); color: #ffffff; text-align: left; padding: 11px 10px; text-transform: uppercase; letter-spacing: .12em; font-size: 10px; }}
+td {{ padding: 11px 10px; border-bottom: 1px solid #e5eee8; color: var(--ink); }}
+tbody tr:last-child td {{ border-bottom: 0; }}
+tbody tr:hover td {{ background: #f1f8f4; }}
 .qty-col, .desccol, .pricecol, .deliverycol, .totalcol {{ text-align: left; }}
-td.desccol {{ font-weight: 700; color: #333333; }}
+td.desccol {{ font-weight: 700; color: var(--ink); }}
 th.desccol {{ color: #ffffff; }}
+.expense-description {{ color: var(--ink); }}
 .summary-container {{ display: flex; justify-content: flex-end; }}
 .summary-table {{ width: 100%; }}
 @media (min-width: 768px) {{ .summary-table {{ width: 420px; }} }}
-.grand-total {{ background: #013220; color: white; padding: 20px; border-radius: 4px; margin-top: 15px; }}
+.grand-total {{ background: linear-gradient(145deg, #063d27 0%, #012417 70%, #00150d 100%); color: white; padding: 20px; border-radius: 10px; margin-top: 15px; box-shadow: 0 14px 28px rgba(1, 35, 22, .22), inset 0 1px 0 rgba(255,255,255,.16); }}
 .balance-info {{ font-size: 13px; line-height: 1.8; }}
 .balance-row {{ display: flex; justify-content: space-between; }}
-.material-row {{ font-size: 18px; font-weight: bold; }}
-.final-balance-row {{ display: flex; justify-content: space-between; border-top: 1px dashed rgba(255,255,255,0.4); margin-top: 8px; padding-top: 8px; font-size: 18px; font-weight: bold; }}
-.footer {{ margin-top: 30px; text-align: center; font-size: 9px; color: #aaa; text-transform: uppercase; letter-spacing: 1px; }}
+.material-row {{ font-size: 18px; font-weight: 700; color: #f5fff8; }}
+.final-balance-row {{ display: flex; justify-content: space-between; border-top: 1px solid rgba(206,255,225,.24); margin-top: 10px; padding-top: 10px; font-size: 18px; font-weight: 700; }}
+.footer {{ margin-top: 30px; text-align: center; font-size: 9px; color: var(--ink); text-transform: uppercase; letter-spacing: .14em; }}
 .save-btn-container {{ text-align: center; margin-bottom: 25px; }}
-.save-img-btn {{ background-color: #1b5e20; color: white; border: none; padding: 12px 24px; font-size: 14px; font-weight: bold; border-radius: 6px; cursor: pointer; box-shadow: 0 4px 10px rgba(0,0,0,0.15); }}
-.save-img-btn:hover {{ background-color:#013220; }}
+.save-img-btn {{ background: linear-gradient(105deg, #075c35, #0b8a50); color: white; border: 1px solid rgba(255,255,255,.22); padding: 12px 24px; font-size: 14px; font-weight: 700; border-radius: 8px; cursor: pointer; box-shadow: 0 8px 18px rgba(1,50,30,.22), inset 0 1px 0 rgba(255,255,255,.2); }}
+.save-img-btn:hover {{ background: linear-gradient(105deg, #0b7444, #10a461); transform: translateY(-1px); }}
 @media print {{ .save-btn-container {{ display: none; }} }}
 </style>
 </head>
@@ -1340,10 +478,12 @@ th.desccol {{ color: #ffffff; }}
 <div class="receipt-container" id="receiptContent">
 <div class="header">
 <div class="company-info">
+<div class="company-brand"><img src="{AILYN_LOGO_DATA}" alt="Ailyn House logo"><div>
 <h1>AILYN HOUSE PROJECT</h1>
 <p>Official Material & Expense Inventory</p>
 <p>Management System {APP_VERSION}</p>
 <p>Backup Receiver: <i>{RECEIVER_AILYN}</i></p>
+</div></div>
 </div>
 <div class="receipt-meta">
 <h2>{custom_title}</h2>
@@ -1374,6 +514,8 @@ th.desccol {{ color: #ffffff; }}
 <td class="totalcol">PHP {float(r['amount']):,.2f}</td>
 </tr>"""
 
+    show_budget_summary = budget > 0 or excess_total > 0
+
     html += f"""
 </tbody>
 </table>
@@ -1385,6 +527,10 @@ th.desccol {{ color: #ffffff; }}
 <span>Material/Expense Total:</span>
 <span>PHP {material_total:,.2f}</span>
 </div>
+"""
+
+    if show_budget_summary:
+        html += f"""
 <div class="balance-row" style="font-size: 13px; margin-top: 4px; border-top: 1px solid rgba(255,255,255,0.2); padding-top: 4px;">
 <span>Excess Money Total:</span>
 <span style="color: #a5d6a7;">PHP {excess_total:,.2f}</span>
@@ -1394,13 +540,14 @@ th.desccol {{ color: #ffffff; }}
 <span>PHP {budget:,.2f}</span>
 </div>
 """
-    if sobra_amount > 0:
+
+    if show_budget_summary and sobra_amount > 0:
         html += f"""
 <div class="final-balance-row">
 <span>EXCESS</span>
 <span style="color: #a5d6a7;">PHP {sobra_amount:,.2f}</span>
 </div>"""
-    if kulang_amount > 0:
+    if show_budget_summary and kulang_amount > 0:
         html += f"""
 <div class="final-balance-row">
 <span>SHORTAGE</span>
@@ -1437,11 +584,14 @@ function saveAsImage() {{
 
 
 def generate_payroll_html(labor_records, expense_records, remaining_money=0.0, custom_title="INVENTORY RECEIPT"):
-    date_str = manila_now().strftime("%B %d, %Y | %I:%M %p")
-    total_labor = sum(r['net'] for r in labor_records)
-    total_expenses = sum(e['price'] for e in expense_records)
+    date_str = manila_now().strftime("%B %d, %Y")
+    time_str = manila_now().strftime("%I:%M %p")
+    total_labor = sum(float(r.get('net', 0) or 0) for r in labor_records)
+    total_expenses = sum(float(e.get('price', 0) or 0) for e in expense_records)
+    remaining_balance = float(remaining_money or 0.0)
     sub_total = total_labor + total_expenses
-    grand_total = sub_total - (remaining_money or 0.0)
+    grand_total = sub_total - remaining_balance
+    balance_color = "#ffffff" if remaining_balance <= 0 else "#a5d6a7"
 
     html = f"""<!DOCTYPE html>
 <html>
@@ -1450,78 +600,99 @@ def generate_payroll_html(labor_records, expense_records, remaining_money=0.0, c
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
 <style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Orbitron:wght@600;700;800&display=swap');
+:root {{ --ink: #064e3b; --muted: #356b50; --emerald: #075c35; --deep: #03281a; --line: #dbe8df; --champagne: #b3945a; }}
 * {{ box-sizing: border-box; }}
-html, body {{ width: 100%; max-width: 100%; margin: 0; overflow-x: hidden; }}
-@import url('https://fonts.googleapis.com/css?family=Inter:wght@400;600;700&display=swap');
-body {{ font-family: 'Inter', sans-serif !important; background-color: #f0f4f0 !important; color: #333; padding: 20px !important; }}
-#receiptContent {{ width: min(100%, 980px); max-width: 980px; margin: 0 auto !important; background: #fff !important; padding: clamp(16px, 2vw, 30px) !important; border-radius: 4px !important; box-shadow: 0 4px 20px rgba(0,0,0,0.08) !important; border-top: 10px solid #1b5e20 !important; overflow-wrap: anywhere; word-break: break-word; }}
-#receiptContent table {{ width: 100%; max-width: 100%; table-layout: fixed; }}
-#receiptContent th {{ background-color: #1b5e20 !important; color: #fff !important; text-transform: uppercase; letter-spacing: 1px; }}
-#receiptContent td {{ border-bottom: 1px solid #f0f0f0 !important; overflow-wrap: anywhere; word-break: break-word; }}
-#receiptContent h1, #receiptContent h3 {{ color: #1b5e20 !important; }}
-#receiptContent > table:first-child {{ margin-bottom: 30px !important; }}
-#receiptContent > table:last-of-type td:last-child {{ background: #013220 !important; color: #fff !important; }}
+body {{ font-family: 'DM Sans', sans-serif; font-weight: 500; background: #e6e6e6; margin: 0; padding: 20px; color: var(--ink); }}
+.receipt-meta h2 {{ font-family: 'Orbitron', sans-serif; font-weight: 800; letter-spacing: .08em; }}
+.receipt-container {{ max-width: 1000px; margin: auto; background: #e6e6e6; padding: 30px; border-radius: 14px; box-shadow: 0 22px 50px rgba(16, 52, 34, .16), 0 2px 0 rgba(255,255,255,.9) inset; border-top: 8px solid var(--deep); position: relative; overflow: hidden; }}
+.header {{ position: relative; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-start; margin-bottom: 24px; border-bottom: 1px solid var(--line); padding-bottom: 16px; }}
+.company-brand {{ display: flex; align-items: center; gap: 12px; }}
+.company-brand img {{ width: 52px; height: 52px; object-fit: contain; filter: drop-shadow(0 5px 9px rgba(0, 45, 25, .22)); }}
+.company-info h1 {{ color: var(--deep); margin: 0; font-family: 'Orbitron', sans-serif; font-size: 24px; letter-spacing: .02em; }}
+.company-info p {{ margin: 5px 0; font-size: 12px; color: var(--ink); }}
+.receipt-meta {{ text-align: left; margin-top: 10px; }}
+@media (min-width: 768px) {{ .receipt-meta {{ text-align: right; margin-top: 0; }} }}
+.receipt-meta h2 {{ margin: 0; font-size: 16px; text-transform: uppercase; color: var(--deep); }}
+.receipt-meta p {{ margin: 5px 0; font-size: 12px; font-weight: 600; color: var(--ink); }}
+table {{ width: 100%; border-collapse: separate; border-spacing: 0; margin-bottom: 18px; font-size: 12px; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }}
+th {{ background: linear-gradient(105deg, var(--deep), var(--emerald)); color: #ffffff; text-align: left; padding: 11px 10px; text-transform: uppercase; letter-spacing: .12em; font-size: 10px; }}
+td {{ padding: 11px 10px; border-bottom: 1px solid #e5eee8; color: var(--ink); }}
+tbody tr:last-child td {{ border-bottom: 0; }}
+tbody tr:hover td {{ background: #f1f8f4; }}
+.expense-description {{ color: var(--ink); }}
+.summary-container {{ display: flex; justify-content: flex-end; }}
+.summary-table {{ width: 100%; }}
+@media (min-width: 768px) {{ .summary-table {{ width: 420px; }} }}
+.grand-total {{ background: linear-gradient(145deg, #063d27 0%, #012417 70%, #00150d 100%); color: white; padding: 20px; border-radius: 10px; margin-top: 10px; box-shadow: 0 14px 28px rgba(1, 35, 22, .22), inset 0 1px 0 rgba(255,255,255,.16); }}
+.balance-info {{ font-size: 13px; line-height: 1.8; }}
+.balance-row {{ display: flex; justify-content: space-between; gap: 10px; }}
+.material-row {{ font-size: 18px; font-weight: 700; }}
+.final-balance-row {{ display: flex; justify-content: space-between; border-top: 1px solid rgba(206,255,225,.24); margin-top: 10px; padding-top: 10px; font-size: 18px; font-weight: 700; }}
+.footer {{ margin-top: 30px; text-align: center; font-size: 9px; color: var(--ink); text-transform: uppercase; letter-spacing: .14em; }}
 .save-btn-container {{ text-align: center; margin-bottom: 25px; }}
-.save-img-btn {{ background-color: #1b5e20; color: white; border: none; padding: 12px 24px; font-size: 14px; font-weight: bold; border-radius: 6px; cursor: pointer; box-shadow: 0 4px 10px rgba(0,0,0,0.15); }}
-.save-img-btn:hover {{ background-color: #2e7d32; }}
+.save-img-btn {{ background: linear-gradient(105deg, #075c35, #0b8a50); color: white; border: 1px solid rgba(255,255,255,.22); padding: 12px 24px; font-size: 14px; font-weight: 700; border-radius: 8px; cursor: pointer; box-shadow: 0 8px 18px rgba(1,50,30,.22), inset 0 1px 0 rgba(255,255,255,.2); }}
+.save-img-btn:hover {{ background: linear-gradient(105deg, #0b7444, #10a461); transform: translateY(-1px); }}
 @media print {{ .save-btn-container {{ display: none; }} }}
 @media (max-width: 600px) {{
-    body {{ padding: 10px !important; }}
-    #receiptContent {{ width: 100%; padding: 16px !important; text-align: center; }}
-    #receiptContent > table {{ table-layout: fixed; font-size: 10px; }}
-    #receiptContent th, #receiptContent td {{ padding: 7px 3px !important; line-height: 1.25; }}
-    #receiptContent h1 {{ font-size: 20px !important; }}
-    #receiptContent h3 {{ font-size: 15px !important; }}
-    #receiptContent > table:first-child td {{ display: block; width: 100% !important; text-align: center !important; }}
-    #receiptContent > table:last-of-type td:last-child {{ width: 100% !important; text-align: center !important; }}
+    body {{ padding: 10px; }}
+    .receipt-container {{ padding: 18px; }}
+    table {{ font-size: 10px; }}
+    th, td {{ padding: 7px 5px; line-height: 1.3; }}
+    .company-info h1 {{ font-size: 18px; }}
+    .receipt-meta h2 {{ font-size: 14px; }}
+    .grand-total {{ padding: 15px; }}
+    .material-row, .final-balance-row {{ font-size: 14px; }}
     .save-img-btn {{ max-width: 100%; padding: 10px 12px; font-size: 12px; }}
 }}
 </style>
 </head>
-<body style="font-family: 'Segoe UI', sans-serif; background-color: #f4f7f6; padding: 40px;">
+<body>
 <div class="save-btn-container">
 <button class="save-img-btn" onclick="saveAsImage()">SEE PHOTO & DOWNLOAD IMAGE (Phone & Laptop)</button>
 </div>
-<div id="receiptContent" style="max-width: 900px; margin: auto; background: white; border-top: 10px solid #1b5e20; padding: 40px; border-radius: 8px; box-shadow: 0 4px 15px rgba(0,0,0,0.1);">
-<table style="width: 100%; border-collapse: collapse; margin-bottom: 30px;">
-<tr>
-<td>
-<h1 style="color: #1b5e20; margin: 0; text-transform: uppercase;">Ailyn House Project</h1>
-<p style="color: #555; margin: 5px 0 0 0;">Official Labor Tally</p>
-<p style="color: #777; font-size: 14px; margin: 0;">Management System v3.6 Enterprise</p>
-</td>
-<td style="text-align: right;">
-<h3 style="color: #1b5e20; margin: 0;">{custom_title}</h3>
-<p style="color: #555; font-size: 14px; margin: 5px 0 0 0;">Date: {date_str}</p>
-<p style="color: #777; font-size: 12px; margin: 5px 0 0 0;">Account: {RECEIVER_EMAIL}</p>
-</td>
-</tr>
-</table>
-<div style="border-bottom: 2px solid #eee; margin-bottom: 30px;"></div>
-<table style="width: 100%; border-collapse: collapse; margin-bottom: 30px;">
+<div class="receipt-container" id="receiptContent">
+<div class="header">
+<div class="company-info">
+<div class="company-brand"><img src="{AILYN_LOGO_DATA}" alt="Ailyn House logo"><div>
+<h1>AILYN HOUSE PROJECT</h1>
+<p>Official Labor & Payroll Summary</p>
+<p>Management System {APP_VERSION}</p>
+<p>Backup Receiver: <i>{RECEIVER_AILYN}</i></p>
+</div></div>
+</div>
+<div class="receipt-meta">
+<h2>{custom_title}</h2>
+<p>Date: {date_str}</p>
+<p>Time: {time_str}</p>
+</div>
+</div>
+<table>
 <thead>
-<tr style="background-color: #1b5e20; color: white; text-transform: uppercase; font-size: 14px;">
-<th style="padding: 12px; text-align: left;">Worker Name</th>
-<th style="padding: 12px; text-align: center;">Role</th>
-<th style="padding: 12px; text-align: center;">Days / Point</th>
-<th style="padding: 12px; text-align: right;">Gross Pay</th>
-<th style="padding: 12px; text-align: right;">C.A.</th>
-<th style="padding: 12px; text-align: right;">Net Pay</th>
+<tr>
+<th>Worker</th>
+<th>Role</th>
+<th>Days</th>
+<th>Gross Pay</th>
+<th>C.A.</th>
+<th>Net Pay</th>
 </tr>
 </thead>
 <tbody>"""
 
     for r in labor_records:
         role_display = r.get('role', 'Labor')
-        gross = r.get('gross_pay', r['days'] * r['rate'])
+        gross = float(r.get('gross_pay', (float(r.get('days', 0)) * float(r.get('rate', 0)))))
+        ca = float(r.get('ca', 0) or 0)
+        net = float(r.get('net', 0) or 0)
         html += f"""
 <tr>
-<td style="padding: 12px; border-bottom: 1px solid #ddd; font-weight: bold;">{r['name']}</td>
-<td style="padding: 12px; border-bottom: 1px solid #ddd; text-align: center;">{role_display}</td>
-<td style="padding: 12px; border-bottom: 1px solid #ddd; text-align: center;">{r['days']:.1f}</td>
-<td style="padding: 12px; border-bottom: 1px solid #ddd; text-align: right;">{gross:,.2f}</td>
-<td style="padding: 12px; border-bottom: 1px solid #ddd; text-align: right; color: #d32f2f;">({r['ca']:,.2f})</td>
-<td style="padding: 12px; border-bottom: 1px solid #ddd; text-align: right; font-weight: bold; color: #1b5e20;">{r['net']:,.2f}</td>
+<td>{r.get('name', 'Worker')}</td>
+<td>{role_display}</td>
+<td>{float(r.get('days', 0) or 0):.1f}</td>
+<td>PHP {gross:,.2f}</td>
+<td style="color: #d32f2f;">(PHP {ca:,.2f})</td>
+<td style="font-weight: bold; color: #1b5e20;">PHP {net:,.2f}</td>
 </tr>"""
 
     if expense_records:
@@ -1529,48 +700,64 @@ body {{ font-family: 'Inter', sans-serif !important; background-color: #f0f4f0 !
 <tr>
 <td colspan="6" style="padding: 12px 0;"></td>
 </tr>
-<tr style="background-color: #388e3c; color: white; text-transform: uppercase; font-size: 14px;">
-<th colspan="5" style="padding: 10px; text-align: left;">Expense Description</th>
-<th style="padding: 10px; text-align: right;">Amount</th>
+<tr>
+<th colspan="5">Expense Description</th>
+<th>Amount</th>
 </tr>"""
         for e in expense_records:
+            name = e.get('item', 'Payroll Expense')
+            amount = float(e.get('price', 0) or 0)
             html += f"""
 <tr>
-<td colspan="5" style="padding: 10px; border-bottom: 1px solid #ddd;">{e['item']}</td>
-<td style="padding: 10px; border-bottom: 1px solid #ddd; text-align: right; font-weight: bold;">{e['price']:,.2f}</td>
+<td class="expense-description" colspan="5">{name}</td>
+<td style="font-weight: bold;">PHP {amount:,.2f}</td>
 </tr>"""
 
     html += f"""
 </tbody>
 </table>
-<table style="width: 100%; border-collapse: collapse; margin-top: 20px; margin-bottom: 30px;">
-<tr style="border-top: 2px solid #bbb;">
-<td style="padding: 12px; font-weight: bold; text-align: right; font-size: 15px;">Subtotal Expenses:</td>
-<td style="padding: 12px; width: 180px; text-align: right; font-weight: bold; font-size: 15px; color: #333;">PHP {sub_total:,.2f}</td>
-</tr>"""
+<div class="summary-container">
+<div class="summary-table">
+<div class="grand-total">
+<div class="balance-info">
+<div class="balance-row material-row">
+<span>Labor Total:</span>
+<span>PHP {total_labor:,.2f}</span>
+</div>
+<div class="balance-row">
+<span>Payroll Expense Total:</span>
+<span>PHP {total_expenses:,.2f}</span>
+</div>
+<div class="balance-row">
+<span>Subtotal:</span>
+<span>PHP {sub_total:,.2f}</span>
+</div>
+"""
 
-    if remaining_money and remaining_money > 0:
+    if remaining_balance > 0:
         html += f"""
-<tr style="border-bottom: 2px solid #bbb;">
-<td style="padding: 12px; font-weight: bold; text-align: right; color: #d32f2f; font-size: 15px;">Remaining/Leftover Money:</td>
-<td style="padding: 12px; width: 180px; text-align: right; font-weight: bold; color: #d32f2f; font-size: 15px;">-PHP {remaining_money:,.2f}</td>
-</tr>"""
+<div class="balance-row" style="color: #a5d6a7;">
+<span>Remaining Money:</span>
+<span>PHP {remaining_balance:,.2f}</span>
+</div>"""
+    elif remaining_balance < 0:
+        html += f"""
+<div class="balance-row" style="color: #f3b3b3;">
+<span>Deduction:</span>
+<span>PHP {abs(remaining_balance):,.2f}</span>
+</div>"""
 
     html += f"""
-</table>
-<table style="width: 100%; border-collapse: collapse; margin-top: 20px;">
-<tr>
-<td></td>
-<td style="width: 350px; background: #1b5e20; color: white; padding: 20px; border-radius: 8px; text-align: right;">
-<span style="font-size: 14px; text-transform: uppercase; letter-spacing: 1px;">Final Output Amount</span><br>
-<span style="font-size: 32px; font-weight: bold; margin-top: 5px; display: inline-block;">PHP {grand_total:,.2f}</span>
-</td>
-</tr>
-</table>
-<div style="text-align: center; margin-top: 60px; border-top: 1px solid #eee; padding-top: 20px;">
-<p style="color: #999; font-size: 11px; letter-spacing: 1px; text-transform: uppercase;">
-THIS DOCUMENT WAS ELECTRONICALLY GENERATED AND IS VALID WITHOUT SIGNATURE.
-</p>
+<div class="final-balance-row">
+<span>FINAL PAYROLL</span>
+<span style="color: {balance_color};">PHP {grand_total:,.2f}</span>
+</div>
+</div>
+</div>
+</div>
+</div>
+<div class="footer">
+This document was electronically generated and is valid without signature.
 </div>
 </div>
 <script>
@@ -1590,9 +777,6 @@ function saveAsImage() {{
 
 
 def clear_all():
-    if not user_can_edit({"manager", "admin"}):
-        st.warning("Only managers can clear the workspace data.")
-        return
     st.session_state.records = []
     st.session_state.labor_records = []
     st.session_state.payroll_expenses = []
@@ -1601,8 +785,6 @@ def clear_all():
     st.session_state.budget_history = []
     st.session_state.remaining_money = 0.0
     st.session_state.receipt_archive = []
-    st.session_state.pop("client_notes", None)
-    st.session_state.pop("messages", None)
     for photo in st.session_state.get("scanner_photos", []):
         delete_scanner_photo(photo.get("file", ""))
     st.session_state.scanner_photos = []
@@ -1619,127 +801,101 @@ def persist_state():
     save_state(st.session_state)
 
 
-def build_dashboard_summary_payload():
-    budget = float(st.session_state.get("budget", 0) or 0)
-    used = float(get_total() or 0)
-    balance = float(get_balance() or 0)
-    monthly_summary = get_monthly_summary()
-    return {
-        "project": st.session_state.get("project", {}).get("name", "Ailyn House Project"),
-        "budget": budget,
-        "used": used,
-        "balance": balance,
-        "remaining_month": monthly_summary.get("remaining", 0.0),
-        "current_month": monthly_summary.get("month", ""),
-        "previous_month_delta": monthly_summary.get("delta_from_previous", 0.0),
-        "tasks_today": len([t for t in st.session_state.get("planner_tasks", []) if t.get("date_obj") == manila_now().strftime("%Y-%m-%d")]),
-        "tasks_upcoming": len([t for t in st.session_state.get("planner_tasks", []) if t.get("date_obj", "") >= manila_now().strftime("%Y-%m-%d")]),
-    }
+def total_materials():
+    return sum(float(r.get("amount", 0)) for r in st.session_state.records if r.get("type") == "material")
 
 
-def dashboard_summary_csv():
-    payload = build_dashboard_summary_payload()
-    lines = [
-        "Metric,Value",
-        f"Project,{payload['project']}",
-        f"Budget,{payload['budget']:.2f}",
-        f"Used,{payload['used']:.2f}",
-        f"Balance,{payload['balance']:.2f}",
-        f"Remaining this month,{payload['remaining_month']:.2f}",
-        f"Current month,{payload['current_month']}",
-        f"Month-over-month delta,{payload['previous_month_delta']:.2f}",
-        f"Tasks today,{payload['tasks_today']}",
-        f"Upcoming tasks,{payload['tasks_upcoming']}",
-    ]
-    return "\n".join(lines)
+def total_expenses():
+    return sum(float(r.get("amount", 0)) for r in st.session_state.records if r.get("type") == "expense")
 
 
-def add_audit_event(event_type, details=None, actor=None):
-    entry = {
-        "id": str(uuid.uuid4()),
-        "timestamp": manila_now().isoformat(),
-        "event_type": event_type,
-        "actor": actor or st.session_state.get("authenticated_user", "System"),
-        "role": st.session_state.get("current_user_role", "manager"),
-        "details": details or {},
-    }
-    st.session_state.audit_events = [entry] + list(st.session_state.get("audit_events", []))
-    LOGGER.info("%s | %s | %s | %s", event_type, entry["actor"], entry["role"], json.dumps(details or {}, default=str))
-    persist_state()
+def total_excess():
+    return sum(float(r.get("amount", 0)) for r in st.session_state.records if r.get("type") == "excess")
 
 
-def user_can_edit(allowed_roles=None):
-    allowed_roles = allowed_roles or {"manager", "admin"}
-    return st.session_state.get("current_user_role", "manager") in allowed_roles
+def get_total():
+    return total_materials() + total_expenses() - total_excess()
 
 
-def render_recent_activity(limit=8):
-    activity = st.session_state.get("audit_events", [])[:limit]
-    if not activity:
-        st.info("No recent activity yet.")
-        return
-    st.dataframe(
-        [
-            {
-                "Time": item.get("timestamp", "").replace("T", " ")[:16],
-                "Actor": item.get("actor", "System"),
-                "Role": item.get("role", "manager"),
-                "Event": item.get("event_type", ""),
-                "Details": json.dumps(item.get("details", {}), default=str),
-            }
-            for item in activity
-        ],
-        use_container_width=True,
-        hide_index=True,
+def get_balance():
+    return float(st.session_state.budget) - get_total()
+
+
+def monthly_spend(month=None):
+    month = month or manila_now().strftime("%Y-%m")
+    construction = sum(
+        float(record.get("amount", 0)) for record in st.session_state.records
+        if record.get("type") in {"material", "expense"} and month_key(record) == month
     )
-
-
-@st.dialog("Take Photo")
-def photo_camera_dialog():
-    st.markdown("""
-    <style>
-    div[role="dialog"] { background: #080b0c; border: 1px solid #33423d; border-radius: 24px; padding: 1rem 1rem .85rem; }
-    div[role="dialog"] [data-testid="stVerticalBlock"] { gap: 0.55rem; }
-    div[role="dialog"] h2 { color: #f4fff7; font-size: 1.35rem; letter-spacing: .01em; }
-    div[role="dialog"] [data-testid="stRadio"] label p { font-size: 12px; font-weight: 700; }
-    div[role="dialog"] [data-testid="stCaptionContainer"] p { color: #9fb0a6; font-size: 10px; }
-    div[role="dialog"] [data-testid="stCameraInput"] { width: 100%; }
-    div[role="dialog"] [data-testid="stCameraInput"] video,
-    div[role="dialog"] [data-testid="stCameraInput"] img { width: 100% !important; max-height: 52vh; object-fit: cover; border-radius: 14px; }
-    div[role="dialog"] button { min-height: 44px !important; font-size: 12px !important; }
-    @media (max-width: 600px) {
-        div[role="dialog"] { width: calc(100vw - 20px) !important; max-width: calc(100vw - 20px) !important; margin: 10px !important; padding: .8rem .7rem .7rem; }
-        div[role="dialog"] h2 { font-size: 1.15rem; }
-        div[role="dialog"] [data-testid="stRadio"] > div { gap: 4px !important; }
-        div[role="dialog"] [data-testid="stRadio"] label { padding-right: 4px !important; }
-        div[role="dialog"] [data-testid="stRadio"] label p { font-size: 11px; }
-        div[role="dialog"] [data-testid="stCameraInput"] video,
-        div[role="dialog"] [data-testid="stCameraInput"] img { max-height: 45vh; }
-        div[role="dialog"] [data-testid="stDataFrame"] { max-width: 100%; overflow-x: auto; }
-    }
-    </style>
-    """, unsafe_allow_html=True)
-    photo_category = st.selectbox(
-        "WORK CATEGORY",
-        ["General", "Before", "After", "Framing", "Electrical", "Plumbing", "Painting", "Inspection"],
-        key="camera_photo_category",
+    excess = sum(
+        float(record.get("amount", 0)) for record in st.session_state.records
+        if record.get("type") == "excess" and month_key(record) == month
     )
-    st.caption("Rear camera only. Allow camera access when your phone asks.")
-    photo = st.camera_input("TAKE PHOTO", key=f"modal_photo_scanner_{st.session_state.scanner_input_version}")
-    if photo:
-        photo_hash = hashlib.sha256(photo.getvalue()).hexdigest()
-        if st.session_state.get("scanned_photo_hash") != photo_hash:
-            st.session_state.scanned_photo_bytes = photo.getvalue()
-            st.session_state.scanned_photo_mime = photo.type or "image/jpeg"
-            try:
-                st.session_state.scanned_photo_text = scan_photo_text(photo)
-            except TESSERACT_NOT_FOUND_ERROR:
-                st.session_state.scanned_photo_text = "OCR is unavailable. Install Tesseract OCR on the server."
-            except RuntimeError as error:
-                st.session_state.scanned_photo_text = str(error)
-            except (OSError, ValueError):
-                st.session_state.scanned_photo_text = "The photo could not be read. Try taking it again."
-            st.session_state.scanned_photo_hash = photo_hash
+    labor = sum(float(record.get("net", 0)) for record in st.session_state.labor_records if month_key(record) == month)
+    payroll_expenses = sum(float(record.get("price", 0)) for record in st.session_state.payroll_expenses if month_key(record) == month)
+    return construction - excess + labor + payroll_expenses
+
+
+def monthly_construction_spend(month=None):
+    month = month or manila_now().strftime("%Y-%m")
+    construction = sum(
+        float(record.get("amount", 0)) for record in st.session_state.records
+        if record.get("type") in {"material", "expense"} and month_key(record) == month
+    )
+    excess = sum(
+        float(record.get("amount", 0)) for record in st.session_state.records
+        if record.get("type") == "excess" and month_key(record) == month
+    )
+    return construction - excess
+
+
+@st.dialog("Project Details", width="large")
+def project_settings_dialog():
+    project = st.session_state.project
+    statuses = ["Active", "Planning", "Paused", "Completed"]
+    with st.form("project_details_form"):
+        project_name = st.text_input("Project name", value=project.get("name", "Ailyn House Project"))
+        client_name = st.text_input("Client name", value=project.get("client", ""))
+        project_address = st.text_input("Project address", value=project.get("address", ""))
+        project_manager = st.text_input("Project manager", value=project.get("manager", ""))
+        project_status = st.selectbox("Status", statuses, index=statuses.index(project.get("status", "Active")) if project.get("status") in statuses else 0)
+        target_date_value = project.get("target_date")
+        target_date = st.date_input(
+            "Target date",
+            value=datetime.strptime(target_date_value, "%Y-%m-%d").date() if target_date_value else datetime.now(PHILIPPINES_TZ).date(),
+        )
+        submitted = st.form_submit_button("Save project details", use_container_width=True)
+    if submitted:
+        st.session_state.project = {
+            "name": project_name,
+            "client": client_name,
+            "address": project_address,
+            "manager": project_manager,
+            "status": project_status,
+            "target_date": target_date.isoformat(),
+        }
+        persist_state()
+        st.success("Project details updated.")
+
+
+@st.dialog("Photo Scanner", width="large")
+def photo_scanner_dialog():
+    photo_category = st.selectbox("Photo category", ["Material", "Expense"], index=0, key="photo_category_select")
+    uploaded_photo = st.file_uploader("Upload or capture a receipt photo", type=["png", "jpg", "jpeg", "webp"], key=f"receipt_photo_upload_{st.session_state.get('scanner_input_version', 0)}")
+
+    if uploaded_photo is not None:
+        try:
+            processed_bytes = normalize_photo_bytes(uploaded_photo.getvalue(), uploaded_photo.type or "image/jpeg")
+            st.session_state.scanned_photo_bytes = processed_bytes[0]
+            st.session_state.scanned_photo_mime = processed_bytes[1]
+            st.session_state.scanned_photo_hash = hashlib.sha256(processed_bytes[0]).hexdigest()
+            st.session_state.scanned_photo_text = scan_photo_text(type("Photo", (), {"getvalue": lambda self: processed_bytes[0]})())
+        except TESSERACT_NOT_FOUND_ERROR:
+            st.session_state.scanned_photo_text = "OCR is unavailable. Install Tesseract OCR on the server."
+        except RuntimeError as error:
+            st.session_state.scanned_photo_text = str(error)
+        except (OSError, ValueError):
+            st.session_state.scanned_photo_text = "The photo could not be read. Try taking it again."
 
     if st.session_state.get("scanned_photo_bytes"):
         view_col, delete_col = st.columns(2)
@@ -1762,8 +918,10 @@ def photo_camera_dialog():
                 st.session_state.scanned_photo_text = ""
                 st.session_state.scanner_input_version += 1
                 st.rerun()
+
         if st.session_state.get("show_scanned_photo"):
             st.image(st.session_state.scanned_photo_bytes, caption="Captured photo", use_container_width=True)
+
         save_col, retake_col = st.columns(2)
         with save_col:
             if st.button("SAVE FILE", use_container_width=True, key="modal_save_photo"):
@@ -1771,11 +929,18 @@ def photo_camera_dialog():
                 if not any(photo.get("hash") == photo_hash for photo in st.session_state.scanner_photos):
                     photo_id = str(uuid.uuid4())
                     relative_path = save_scanner_photo(st.session_state.scanned_photo_bytes, st.session_state.get("scanned_photo_mime", "image/jpeg"), photo_id)
-                    st.session_state.scanner_photos.append({"id": photo_id, "hash": photo_hash, "file": relative_path, "tag": photo_category, "saved_at": manila_now().isoformat()})
+                    st.session_state.scanner_photos.append({
+                        "id": photo_id,
+                        "hash": photo_hash,
+                        "file": relative_path,
+                        "tag": photo_category,
+                        "saved_at": manila_now().isoformat(),
+                    })
                     persist_state()
                     st.success("Photo saved to the project archive.")
                 else:
                     st.info("This photo is already saved.")
+
         with retake_col:
             if st.button("RETAKE", use_container_width=True, key="modal_retake_photo"):
                 st.session_state.scanned_photo_bytes = None
@@ -1784,6 +949,7 @@ def photo_camera_dialog():
                 st.session_state.show_scanned_photo = False
                 st.session_state.scanner_input_version += 1
                 st.rerun()
+
         scanned_text = st.session_state.get("scanned_photo_text", "")
         if scanned_text:
             if scanned_text.startswith("OCR is unavailable") or scanned_text.startswith("The photo could not be read"):
@@ -1823,24 +989,59 @@ def photo_camera_dialog():
                         )
                         if saved:
                             st.success("Receipt saved to the Excel ledger.")
+
             with st.expander("View scanned text", expanded=False):
                 st.text_area("Recognized text", value=scanned_text, height=120, key="modal_scanned_text", disabled=True, label_visibility="collapsed")
+
             if not scanned_text.startswith("OCR is unavailable") and not scanned_text.startswith("The photo could not be read") and st.button("USE SCAN IN MATERIAL ENTRY", use_container_width=True, key="modal_use_scanned_material"):
                 st.session_state.material_name = scanned_fields["name"]
                 st.session_state.material_price = scanned_fields["price"] or None
                 st.session_state.material_qty = scanned_fields["qty"]
                 st.session_state.material_delivery = scanned_fields["delivery"] or None
                 set_view("material")
+
     if st.button("CLOSE CAMERA", use_container_width=True, key="close_photo_dialog"):
         st.session_state.scanner_open = False
         st.session_state.show_scanned_photo = False
         st.rerun()
 
 
+def install_update(uploaded_file, signature):
+    """Validate and atomically install an uploaded app upgrade after a backup."""
+    source = uploaded_file.getvalue()
+    if not source:
+        raise ValueError("The uploaded upgrade file is empty.")
+    try:
+        ast.parse(source.decode("utf-8"), filename=uploaded_file.name)
+    except (UnicodeDecodeError, SyntaxError) as error:
+        raise ValueError(f"The upgrade was rejected: {error}") from None
+    if not UPDATE_SIGNING_KEY:
+        raise ValueError("Updates are disabled until AILYN_UPDATE_SIGNING_KEY is configured.")
+    expected_signature = hmac.new(
+        UPDATE_SIGNING_KEY.encode("utf-8"), source, hashlib.sha256
+    ).hexdigest()
+    if not hmac.compare_digest(expected_signature, signature.strip()):
+        raise ValueError("The upgrade signature is invalid.")
+
+    backup_dir = os.path.join(APP_DIR, "backups")
+    os.makedirs(backup_dir, exist_ok=True)
+    backup_path = os.path.join(backup_dir, f"NELL.py.py.{int(time.time())}.bak")
+    temporary_path = None
+    try:
+        shutil.copy2(__file__, backup_path)
+        with tempfile.NamedTemporaryFile("wb", delete=False, dir=APP_DIR,
+                                         prefix=".nell-upgrade-") as temporary:
+            temporary.write(source)
+            temporary_path = temporary.name
+        os.replace(temporary_path, __file__)
+    except OSError as error:
+        if temporary_path and os.path.exists(temporary_path):
+            os.remove(temporary_path)
+        raise ValueError(f"The upgrade could not be installed: {error}") from None
+    return backup_path
+
+
 def record_budget_change(action, amount, previous_budget):
-    if not user_can_edit({"manager", "admin"}):
-        st.warning("Only managers can edit the project budget.")
-        return
     st.session_state.budget_history.append({
         "date": manila_now().strftime("%b %d, %Y %I:%M %p"),
         "action": action,
@@ -1848,7 +1049,6 @@ def record_budget_change(action, amount, previous_budget):
         "previous": float(previous_budget),
         "total": float(st.session_state.budget),
     })
-    add_audit_event("budget_changed", {"action": action, "amount": float(amount), "previous_budget": float(previous_budget), "new_budget": float(st.session_state.budget)})
     persist_state()
 
 
@@ -1868,7 +1068,10 @@ def calculate_expression(expression):
         if isinstance(node, ast.Expression):
             return evaluate(node.body)
         if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
-            return float(node.value)
+            value = float(node.value)
+            if value != value or abs(value) == float("inf"):
+                raise ValueError("Enter a valid arithmetic expression.")
+            return value
         if isinstance(node, ast.BinOp) and type(node.op) in CALCULATOR_OPERATORS:
             left = evaluate(node.left)
             right = evaluate(node.right)
@@ -1876,9 +1079,16 @@ def calculate_expression(expression):
                 raise ValueError("Cannot divide by zero.")
             if isinstance(node.op, ast.Pow) and abs(right) > 10:
                 raise ValueError("Exponent is limited to 10.")
-            return CALCULATOR_OPERATORS[type(node.op)](left, right)
+            result = CALCULATOR_OPERATORS[type(node.op)](left, right)
+            if result != result or abs(result) == float("inf"):
+                raise ValueError("Enter a valid arithmetic expression.")
+            return result
         if isinstance(node, ast.UnaryOp) and type(node.op) in CALCULATOR_OPERATORS:
-            return CALCULATOR_OPERATORS[type(node.op)](evaluate(node.operand))
+            operand = evaluate(node.operand)
+            result = CALCULATOR_OPERATORS[type(node.op)](operand)
+            if result != result or abs(result) == float("inf"):
+                raise ValueError("Enter a valid arithmetic expression.")
+            return result
         raise ValueError("Use numbers and +, -, *, /, or ** only.")
 
     try:
@@ -1899,18 +1109,26 @@ def budget_dialog():
 
     with apply_tab:
         with st.form("budget_apply_dialog_form", clear_on_submit=True):
-            amount = st.number_input("Amount to add", min_value=0.01, value=None,
-                                     placeholder="0.00")
+            amount_expression = st.text_input(
+                "Amount to add",
+                placeholder="10000 + 2500 - 500",
+                help="Enter a number or expression using +, -, *, /, and **.",
+            )
             submitted = st.form_submit_button("Apply Budget", use_container_width=True)
         if submitted:
-            if amount is not None:
-                previous_budget = float(st.session_state.budget)
-                st.session_state.budget = previous_budget + float(amount)
-                record_budget_change("Applied", amount, previous_budget)
-                st.success("Budget applied.")
-                st.rerun()
+            try:
+                amount = calculate_expression(amount_expression)
+            except ValueError as error:
+                st.warning(str(error))
             else:
-                st.warning("Enter an amount first.")
+                if amount <= 0:
+                    st.warning("The amount to add must be greater than zero.")
+                else:
+                    previous_budget = float(st.session_state.budget)
+                    st.session_state.budget = previous_budget + float(amount)
+                    record_budget_change("Applied", amount, previous_budget)
+                    st.success("Budget applied.")
+                    st.rerun()
 
     with edit_tab:
         with st.form("budget_edit_dialog_form"):
@@ -1958,16 +1176,43 @@ def budget_dialog():
 
 @st.dialog("Add Labor Account", width="small")
 def payroll_labor_dialog():
-    role = st.selectbox("Role", list(FULL_DAY_RATES), key="popup_labor_role")
+    custom_role_option = "__CUSTOM_ROLE__"
+    recorded_roles = list(dict.fromkeys(
+        str(record.get("role", ""))
+        for record in st.session_state.labor_records
+        if record.get("role")
+    ))
+    role_options = list(dict.fromkeys([*FULL_DAY_RATES, *recorded_roles, custom_role_option]))
+    selected_role = st.selectbox("Role", role_options, key="popup_labor_role")
+    if selected_role == custom_role_option:
+        role = st.text_input("Custom labor type", key="popup_custom_labor_type").strip().upper()
+        rate = st.number_input(
+            "Labor price (PHP/day)",
+            min_value=0.01,
+            value=None,
+            placeholder="Enter daily price",
+            key="popup_custom_labor_rate",
+        )
+        rate = float(rate) if rate is not None else None
+    else:
+        role = selected_role
+        rate = FULL_DAY_RATES.get(
+            role,
+            next(
+                (float(record["rate"]) for record in st.session_state.labor_records
+                 if record.get("role") == role and record.get("rate") is not None),
+                0.0,
+            ),
+        )
     worker = st.text_input("Worker name", key="popup_labor_worker")
     days = st.number_input("Worked days", min_value=0.0, value=None, placeholder="Enter days", key="popup_labor_days")
     cash_advance = st.number_input("Cash advance", min_value=0.0, value=0.0, step=50.0, key="popup_labor_ca")
     if st.button("SAVE LABOR ACCOUNT", use_container_width=True, key="popup_save_labor"):
         worked_days = float(days or 0.0)
-        if not worker.strip() or worked_days <= 0:
-            st.warning("Enter a worker name and valid worked days.")
+        if not worker.strip() or worked_days <= 0 or not role or rate is None or rate <= 0:
+            st.warning("Enter a worker name, valid worked days, labor type, and daily price.")
             return
-        gross_pay, full_pay, partial_pay = calculate_labor_pay(worked_days, role)
+        gross_pay, full_pay, partial_pay = calculate_labor_pay(worked_days, role, rate)
         st.session_state.labor_records.append({
             "id": str(uuid.uuid4()),
             "date": manila_now().strftime("%b %d, %Y"),
@@ -1975,7 +1220,7 @@ def payroll_labor_dialog():
             "name": worker.strip().upper(),
             "role": role,
             "days": worked_days,
-            "rate": FULL_DAY_RATES[role],
+            "rate": rate,
             "gross_pay": gross_pay,
             "full_pay": full_pay,
             "partial_pay": partial_pay,
@@ -2030,51 +1275,46 @@ def payroll_report_dialog():
 
 
 def add_tx(name, price, qty, delivery, ttype, sender, record_date=None, details=None):
-    if not user_can_edit({"manager", "staff"}):
-        st.warning("You do not have permission to add project records.")
-        return False
     try:
-        validated = validate_transaction_input(name, price, qty, delivery, ttype)
-    except ValueError as error:
-        st.warning(str(error))
+        p = float(price or 0.0)
+    except (TypeError, ValueError):
+        p = 0.0
+    try:
+        q = max(0, int(float(qty or 0)))
+    except (TypeError, ValueError):
+        q = 0
+    try:
+        d = float(delivery or 0.0)
+    except (TypeError, ValueError):
+        d = 0.0
+    if p <= 0 or q <= 0:
         return False
-
-    date_value = record_date or manila_now().date()
-    date_label = date_value.strftime("%b %d, %Y") if hasattr(date_value, "strftime") else manila_now().strftime("%b %d, %Y")
-    duplicate_record = any(
-        record.get("type") == ttype
-        and record.get("name", "").upper() == validated["name"]
-        and float(record.get("amount", 0) or 0) == validated["amount"]
-        and record.get("date", "") == date_label
-        for record in st.session_state.records
-    )
-    if duplicate_record:
-        st.warning("This exact record already exists. Duplicate entries were blocked.")
-        return False
-
+    amount = (p * q) + d if ttype == "material" else p
+    if isinstance(record_date, str):
+        try:
+            selected_date = datetime.strptime(record_date, "%b %d, %Y").date()
+        except ValueError:
+            try:
+                selected_date = datetime.fromisoformat(record_date).date()
+            except ValueError:
+                selected_date = manila_now().date()
+    elif hasattr(record_date, "strftime"):
+        selected_date = record_date.date() if hasattr(record_date, "date") else record_date
+    else:
+        selected_date = manila_now().date()
     st.session_state.records.append({
         "id": str(time.time()),
-        "date": date_label,
-        "recorded_at": datetime.combine(date_value, datetime.min.time(), PHILIPPINES_TZ).isoformat(),
-        "name": validated["name"],
-        "price": validated["price"],
-        "qty": validated["qty"],
-        "delivery": validated["delivery"],
-        "amount": float(validated["amount"]),
+        "date": selected_date.strftime("%b %d, %Y"),
+        "recorded_at": datetime.combine(selected_date, datetime.min.time(), PHILIPPINES_TZ).isoformat(),
+        "name": (name or "ITEM").upper(),
+        "price": p,
+        "qty": q,
+        "delivery": d,
+        "amount": float(amount),
         "type": ttype,
-        "sender": sender,
+        "sender": sender or "",
         **(details or {}),
     })
-    add_audit_event(
-        "transaction_added",
-        {
-            "type": ttype,
-            "name": validated["name"],
-            "amount": float(validated["amount"]),
-            "date": date_label,
-            "sender": sender,
-        },
-    )
     persist_state()
     return True
 
@@ -2091,14 +1331,8 @@ st.markdown("""
 *{box-sizing:border-box}
 html,body,[class*="css"]{font-family:'Manrope',sans-serif}
 .stApp{
-  background-color:#04180f;
-  background-image:
-    linear-gradient(135deg, rgba(3,30,18,.62), rgba(10,85,45,.54)),
-    url("https://images.unsplash.com/photo-1600585154340-be6161a56a0c");
-  background-repeat:no-repeat;
-  background-position:center center;
-  background-size:cover;
-  background-attachment:fixed;
+  background:url("https://images.unsplash.com/photo-1600585154340-be6161a56a0c") no-repeat center center fixed;
+  background-size:cover;background-position:center;
 }
 .stApp:before{
   content:"";position:fixed;inset:0;z-index:0;pointer-events:none;
@@ -2144,6 +1378,9 @@ section[data-testid="stSidebar"]>div{padding:22px 14px 30px!important} section[d
 .sidebar-brand:after{content:"";position:absolute;inset:-80% 35%;background:rgba(255,255,255,.09);transform:rotate(25deg);animation:scan 7s linear infinite}
 .brand-row{position:relative;z-index:1;display:flex;align-items:center;gap:14px}.brand-logo{width:62px;height:62px;object-fit:contain;filter:drop-shadow(0 8px 16px rgba(0,0,0,.32));transition:.25s ease}.sidebar-brand:hover .brand-logo{transform:translateY(-4px) scale(1.06);filter:drop-shadow(0 14px 26px rgba(114,247,176,.30))}.brand-copy{min-width:0}.brand-title{font-family:'Outfit';font-size:17px;font-weight:900;letter-spacing:.06em;line-height:1.02;color:#fff!important}.brand-title span{display:block}.brand-sub{font-size:9px;color:#8ff1b4!important;letter-spacing:.16em;text-transform:uppercase;margin-top:7px;font-weight:800}
 section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h3{font-family:'Outfit';font-size:10px!important;letter-spacing:.18em;text-transform:uppercase;color:#72f7b0!important;margin:20px 5px 9px!important;display:flex;align-items:center;gap:9px} section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h3:before{content:'•';font-size:20px;line-height:0;color:#45f39a;text-shadow:0 0 12px rgba(69,243,154,.8)} section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h3:after{content:'';height:1px;flex:1;background:linear-gradient(90deg,rgba(114,247,176,.35),transparent)}section[data-testid="stSidebar"] hr{border-color:rgba(170,255,198,.10)!important;margin:10px 4px!important}.sidebar-gap{height:8px}.sidebar-live{font-size:9px;letter-spacing:.14em;color:#7feeb0!important;font-weight:800;text-align:center;margin:-4px 0 10px;text-shadow:0 0 12px rgba(114,247,176,.18)}
+.sidebar-section-label{margin:20px 6px 10px;color:#72f7b0!important;font-size:10px!important;line-height:1.3!important;letter-spacing:.18em!important;text-transform:uppercase;font-weight:900;font-family:'Outfit',sans-serif!important;display:flex;align-items:center;gap:9px}
+.sidebar-section-label:before{content:'•';font-size:20px;line-height:0;color:#45f39a;text-shadow:0 0 12px rgba(69,243,154,.8)}
+.sidebar-section-label:after{content:'';height:1px;flex:1;background:linear-gradient(90deg,rgba(114,247,176,.35),transparent)}
 section[data-testid="stSidebar"] button{min-height:52px!important;margin:7px 0!important;padding:0 16px!important;border-radius:18px!important;text-align:left!important;background:linear-gradient(145deg,rgba(18,82,48,.48),rgba(2,31,18,.42))!important;border:1px solid rgba(114,247,176,.15)!important;box-shadow:0 7px 0 rgba(1,12,7,.55),0 14px 28px rgba(0,0,0,.24),inset 0 1px 0 rgba(255,255,255,.10)!important;transition:transform .18s cubic-bezier(.2,.8,.2,1),box-shadow .18s,border-color .18s,background .18s!important;backdrop-filter:blur(14px) saturate(135%)!important;-webkit-backdrop-filter:blur(14px) saturate(135%)!important}
 section[data-testid="stSidebar"] button:hover{transform:translate3d(5px,-3px,0)!important;background:linear-gradient(145deg,rgba(28,116,67,.72),rgba(5,47,27,.56))!important;border-color:rgba(114,247,176,.58)!important;box-shadow:0 10px 0 rgba(1,12,7,.70),0 20px 36px rgba(0,0,0,.34),0 0 28px rgba(70,230,132,.16),inset 0 1px 0 rgba(255,255,255,.18)!important}
 section[data-testid="stSidebar"] button:active{transform:translate3d(2px,4px,0)!important;box-shadow:0 2px 0 rgba(1,12,7,.9),0 6px 12px rgba(0,0,0,.3)!important}
@@ -2152,32 +1389,6 @@ section[data-testid="stSidebar"] button p{font-family:'Manrope'!important;font-w
 button,.stDownloadButton>button,.stFormSubmitButton>button{position:relative!important;overflow:hidden!important;min-height:46px!important;border-radius:16px!important;color:#f5fff8!important;font-weight:800!important;background:linear-gradient(145deg,rgba(25,92,54,.88),rgba(5,33,19,.94))!important;border:1px solid rgba(173,255,201,.22)!important;box-shadow:0 6px 0 rgba(2,17,10,.78),0 13px 27px rgba(0,0,0,.25),inset 0 1px 0 rgba(255,255,255,.13)!important;transition:all .17s ease!important}
 button:hover,.stDownloadButton>button:hover,.stFormSubmitButton>button:hover{transform:translateY(-3px)!important;border-color:rgba(114,247,176,.58)!important;box-shadow:0 9px 0 rgba(2,17,10,.78),0 20px 34px rgba(0,0,0,.35),0 0 25px rgba(114,247,176,.13),inset 0 1px 0 rgba(255,255,255,.2)!important}
 button:active,.stDownloadButton>button:active,.stFormSubmitButton>button:active{transform:translateY(3px)!important;box-shadow:0 2px 0 rgba(2,17,10,.8),0 5px 10px rgba(0,0,0,.28)!important}
-/* glass tabs, forms, uploaders and data panels */
-div[data-testid="stTabs"] [role="tablist"]{display:flex;flex-wrap:wrap;gap:8px;padding:7px;border-radius:18px;background:rgba(3,25,15,.72);border:1px solid rgba(163,255,194,.14);box-shadow:inset 0 4px 14px rgba(0,0,0,.16)}
-div[data-testid="stTabs"] [role="tab"]{padding:10px 14px;border-radius:12px;border:1px solid transparent;background:transparent;color:#cfe6d7;font-weight:800;letter-spacing:.06em;text-transform:uppercase;transition:all .18s ease}
-div[data-testid="stTabs"] [role="tab"][aria-selected="true"]{background:linear-gradient(145deg,rgba(28,114,65,.86),rgba(6,35,20,.9));border-color:rgba(114,247,176,.36);box-shadow:0 8px 18px rgba(0,0,0,.18),0 0 20px rgba(114,247,176,.10)}
-div[data-testid="stForm"]{background:linear-gradient(145deg,rgba(9,37,24,.68),rgba(4,22,13,.78));border:1px solid rgba(163,255,194,.12);border-radius:22px;padding:16px;box-shadow:inset 0 1px 0 rgba(255,255,255,.06)}
-div[data-testid="stFileUploaderDropzone"]{background:linear-gradient(145deg,rgba(11,52,33,.72),rgba(4,23,14,.76))!important;border:1px solid rgba(163,255,194,.18)!important;border-radius:18px!important;box-shadow:inset 0 4px 18px rgba(0,0,0,.18)!important}
-[data-testid="stFileUploaderDropzone"] div{color:#eafaf0!important}
-div[data-testid="stVerticalBlockBorderWrapper"]{border-radius:22px!important}
-div[data-testid="stDataFrame"]{background:rgba(7,34,22,.46)!important;border-radius:18px!important;border:1px solid rgba(163,255,194,.18)!important;overflow:hidden}
-[data-testid="stDataFrame"] .stDataFrameContainer{background:transparent!important}
-/* system-wide content architecture */
-div[data-testid="stMain"]{overflow-x:hidden}
-div[data-testid="stMain"] > div{padding-top:8px!important}
-div[data-testid="stVerticalBlockBorderWrapper"],div[data-testid="stVerticalBlock"] > div[data-testid="stVerticalBlockBorderWrapper"]{background:linear-gradient(145deg,rgba(10,42,26,.78),rgba(4,25,16,.68))!important;border:1px solid rgba(163,255,194,.18)!important;border-radius:22px!important;box-shadow:inset 0 1px 0 rgba(255,255,255,.06),0 16px 34px rgba(0,0,0,.20)!important}
-div[data-testid="stVerticalBlockBorderWrapper"] > div{border-radius:22px!important}
-div[data-testid="stMain"] h1,div[data-testid="stMain"] h2,div[data-testid="stMain"] h3,div[data-testid="stMain"] h4{font-family:'Outfit',sans-serif!important;letter-spacing:.02em!important;color:#f5fff8!important}
-div[data-testid="stMain"] h2{font-size:26px!important;font-weight:900!important;margin-bottom:8px!important}
-div[data-testid="stMain"] h3{font-size:18px!important;font-weight:800!important}
-div[data-testid="stMain"] .stMarkdownContainer p,div[data-testid="stMain"] .stMarkdownContainer li,div[data-testid="stMain"] .stMarkdownContainer span{color:#dcefe5!important}
-div[data-testid="stMaterialValue"]{color:#f5fff8!important}
-div[data-testid="stExpander"]{background:rgba(5,29,17,.58)!important;border:1px solid rgba(163,255,194,.15)!important;border-radius:20px!important;box-shadow:0 10px 25px rgba(0,0,0,.18)!important;overflow:hidden!important}
-div[data-testid="stExpander"] summary{padding:14px 16px!important;border-radius:18px!important;background:linear-gradient(145deg,rgba(17,79,47,.80),rgba(5,31,19,.74))!important;border-bottom:1px solid rgba(163,255,194,.16)!important;color:#f5fff8!important;font-weight:800!important;letter-spacing:.06em!important;text-transform:uppercase}
-div[data-testid="stExpander"] summary:hover{background:linear-gradient(145deg,rgba(26,109,62,.82),rgba(6,38,22,.82))!important}
-div[data-testid="stExpander"] > div{padding:14px 16px!important;background:rgba(6,31,20,.38)!important}
-div[data-testid="stCheckbox"]{padding:8px 10px;border-radius:14px;background:rgba(255,255,255,.02);border:1px solid rgba(163,255,194,.06)}
-div[data-testid="stRadio"],div[data-testid="stSelectbox"],div[data-testid="stNumberInput"],div[data-testid="stTextInput"],div[data-testid="stTextArea"],div[data-testid="stDateInput"]{border-radius:16px!important}
 /* glass input fields */
 div[data-baseweb="input"],div[data-baseweb="base-input"],textarea,div[data-baseweb="select"]>div{background:rgba(3,25,15,.78)!important;border:1px solid rgba(163,255,194,.18)!important;border-radius:15px!important;color:#fff!important;min-height:48px!important;box-shadow:inset 0 4px 15px rgba(0,0,0,.23),0 4px 12px rgba(0,0,0,.12)!important}
 input,textarea{color:#fff!important;-webkit-text-fill-color:#fff!important}input:focus,textarea:focus,div[data-baseweb="input"]:focus-within,div[data-baseweb="select"]>div:focus-within{border-color:#72f7b0!important;box-shadow:0 0 0 3px rgba(114,247,176,.08),0 0 24px rgba(114,247,176,.14),inset 0 4px 15px rgba(0,0,0,.2)!important}label{font-weight:700!important;color:#c8e8d2!important}
@@ -2202,8 +1413,7 @@ input,textarea{color:#fff!important;-webkit-text-fill-color:#fff!important}input
 @media(max-width:900px){.block-container{padding:18px 14px 30px!important;margin:10px!important}.headbar-card{padding:16px}.headbar-title{font-size:24px!important}.headbar-subtitle{margin-left:92px}.hero-title{font-size:32px}.donut-wrap{flex-direction:column;align-items:flex-start}.donut{width:170px;height:170px;flex-basis:170px}.donut:after{inset:42px}.schedule{align-items:flex-start;flex-wrap:wrap}.open-planner{margin-left:0}}
 @media(max-width:600px){.headbar-card{display:block}.headbar-title{font-size:21px!important;gap:10px}.headbar-title img{width:52px;height:52px}.headbar-subtitle{margin-left:62px;font-size:8px}.headbar-time{margin-top:12px;display:inline-block}.hero-row{align-items:flex-start}.hero-logo{width:60px;height:60px}.hero-title{font-size:25px}.hero-sub{font-size:9px;letter-spacing:.14em}.dash-section{padding:16px}.tx-row{gap:8px}.tx-right{font-size:11px}.open-planner{width:100%;text-align:center}.sidebar-brand{padding:14px}}
 @media(prefers-reduced-motion:reduce){*,*:before,*:after{animation:none!important;transition:none!important}}
-
-    /* UHD 4K rendering helpers */
+/* UHD 4K rendering helpers */
 img{image-rendering:auto;-webkit-font-smoothing:antialiased;text-rendering:geometricPrecision}
 html,body,[class*="css"],button,input,textarea,select{ -webkit-font-smoothing:antialiased!important; -moz-osx-font-smoothing:grayscale!important; text-rendering:geometricPrecision!important; }
 .stApp,.block-container,section[data-testid="stSidebar"],section[data-testid="stSidebar"] *{ text-rendering:geometricPrecision!important; }
@@ -2519,6 +1729,48 @@ section[data-testid="stSidebar"] [data-testid="stSidebarCollapseButton"],
 </style>
 """, unsafe_allow_html=True)
 
+st.markdown("""
+<style>
+/* Emerald glass finish: keep the existing project background unchanged. */
+:root {
+    --emerald-edge: rgba(184, 255, 216, .42);
+    --emerald-glow: rgba(72, 255, 161, .18);
+    --emerald-surface: rgba(4, 42, 25, .62);
+}
+.block-container,
+.dash-section,
+[data-testid="stMetric"],
+[data-testid="stExpander"],
+.sidebar-brand,
+.sidebar-budget-card {
+    background: linear-gradient(145deg, rgba(10, 84, 47, .58), var(--emerald-surface)) !important;
+    border-color: var(--emerald-edge) !important;
+    box-shadow: 0 22px 48px rgba(0, 12, 6, .34), inset 0 1px 0 rgba(255, 255, 255, .18), 0 0 24px var(--emerald-glow) !important;
+    backdrop-filter: blur(24px) saturate(165%) !important;
+    -webkit-backdrop-filter: blur(24px) saturate(165%) !important;
+}
+.block-container h1, .block-container h2, .block-container h3,
+.section-title, .schedule-title, [data-testid="stMetricValue"] {
+    color: #f4fff8 !important;
+    text-shadow: 0 2px 14px rgba(0, 0, 0, .36);
+}
+.block-container p, .block-container label, .section-head span,
+.tx-type, .tx-date, .schedule-muted {
+    color: #d5f6e1 !important;
+}
+button, .stDownloadButton > button, .stFormSubmitButton > button {
+    background: linear-gradient(145deg, rgba(18, 132, 70, .86), rgba(2, 48, 26, .94)) !important;
+    border-color: rgba(177, 255, 211, .52) !important;
+    box-shadow: 0 7px 0 rgba(1, 20, 10, .84), 0 16px 30px rgba(0, 0, 0, .30), inset 0 1px 0 rgba(255, 255, 255, .22) !important;
+}
+div[data-baseweb="input"], div[data-baseweb="select"] > div, textarea {
+    background: rgba(1, 30, 16, .78) !important;
+    border-color: rgba(177, 255, 211, .34) !important;
+    box-shadow: inset 0 5px 16px rgba(0, 0, 0, .30), 0 0 18px rgba(72, 255, 161, .08) !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
 if st.session_state.dark_mode:
     st.markdown("""
     <style>
@@ -2563,527 +1815,1408 @@ st.markdown("""
 
 st.markdown("""
 <style>
+@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@500;600;700;800;900&family=Rajdhani:wght@500;600;700&display=swap');
+
 :root {
-  --brand-bg-1: #04180f;
-  --brand-bg-2: #0c2d1d;
-  --brand-panel-top: rgba(17, 77, 47, 0.9);
-  --brand-panel-mid: rgba(7, 35, 22, 0.92);
-  --brand-panel-bottom: rgba(4, 22, 13, 0.96);
-  --brand-glass: rgba(11, 43, 30, 0.64);
-  --brand-glass-strong: rgba(15, 53, 36, 0.82);
-  --brand-edge: rgba(172, 255, 205, 0.22);
-  --brand-edge-soft: rgba(172, 255, 205, 0.14);
-  --brand-accent: #72f7b0;
-  --brand-accent-2: #96e7ff;
-  --brand-warm: #ffb38a;
-  --brand-strong: #0ed472;
-  --brand-muted: #b5d9c4;
-  --brand-text: #f4fff6;
-  --brand-text-soft: #cfe6d7;
-  --brand-shadow: rgba(0, 0, 0, 0.38);
+    --glass-green: rgba(77, 255, 171, 0.11);
+    --glass-green-strong: rgba(77, 255, 171, 0.19);
+    --glass-edge: rgba(177, 255, 218, 0.34);
+    --glass-light: rgba(225, 255, 239, 0.14);
 }
 
-/* Global luxury shell */
-.stApp {
-  background:
-    linear-gradient(135deg, rgba(2, 20, 12, 0.76), rgba(7, 48, 30, 0.62)),
-    url("https://images.unsplash.com/photo-1600585154340-be6161a56a0c") center/cover fixed;
+html, body, button, input, textarea, select, [class*="css"] {
+    font-family: 'Akira Expanded', 'Orbitron', 'Rajdhani', sans-serif !important;
+    letter-spacing: .015em;
+}
+.block-container h1, .block-container h2, .block-container h3,
+.dashboard-heading-title, .section-title, .schedule-title,
+.brand-title, .budget-title {
+    font-family: 'Akira Expanded', 'Orbitron', sans-serif !important;
+    letter-spacing: .045em !important;
 }
 
-.block-container {
-  background: linear-gradient(180deg, rgba(4, 25, 16, 0.58), rgba(5, 19, 12, 0.55));
-  border: 1px solid var(--brand-edge);
-  border-radius: 28px;
-  backdrop-filter: blur(24px) saturate(145%);
-  -webkit-backdrop-filter: blur(24px) saturate(145%);
-  box-shadow: 0 30px 90px rgba(0, 0, 0, 0.38), inset 0 1px 0 rgba(255,255,255,0.08);
+section[data-testid="stSidebar"],
+section[data-testid="stSidebar"] > div,
+.block-container,
+.dash-section,
+[data-testid="stMetric"],
+[data-testid="stExpander"],
+.sidebar-brand,
+.sidebar-budget-card {
+    background: linear-gradient(135deg, rgba(10, 75, 46, .34), rgba(4, 38, 25, .24)) !important;
+    border-color: var(--glass-edge) !important;
+    box-shadow: 0 18px 42px rgba(0, 24, 13, .22), inset 0 1px 0 var(--glass-light) !important;
+    backdrop-filter: blur(24px) saturate(145%) !important;
+    -webkit-backdrop-filter: blur(24px) saturate(145%) !important;
 }
 
-/* Global premium surfaces */
+.dash-section,
 [data-testid="stMetric"] {
-  background: linear-gradient(145deg, rgba(16, 72, 44, 0.78), rgba(6, 28, 18, 0.86)) !important;
-  border: 1px solid rgba(163, 255, 194, 0.18);
-  border-radius: 22px !important;
-  box-shadow: 0 14px 32px rgba(0,0,0,0.24), inset 0 1px 0 rgba(255,255,255,0.08);
-  min-height: 122px;
+    position: relative !important;
+    overflow: hidden !important;
+    isolation: isolate;
+    transition: transform .28s cubic-bezier(.2,.8,.2,1), border-color .28s ease, box-shadow .28s ease !important;
+}
+.dash-section::before,
+[data-testid="stMetric"]::before,
+.sidebar-brand::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    pointer-events: none;
+    background: linear-gradient(112deg, transparent 18%, rgba(217, 255, 235, .14) 42%, transparent 62%);
+    transform: translateX(-135%);
+    animation: glassLightSweep 8s ease-in-out infinite;
+}
+.dash-section:hover,
+[data-testid="stMetric"]:hover {
+    transform: translateY(-4px) !important;
+    border-color: rgba(143, 255, 198, .64) !important;
+    box-shadow: 0 24px 50px rgba(0, 45, 23, .28), 0 0 28px rgba(90, 255, 174, .15), inset 0 1px 0 rgba(240, 255, 246, .22) !important;
+}
+.integrated-control-strip { margin: 18px 0 2px !important; padding: 18px 20px !important; }
+.integrated-control-strip .section-head span { color: #a9f8ca !important; font-size: 10px; letter-spacing: .12em; }
+.integrated-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)) 1.25fr; gap: 10px; align-items: stretch; }
+.integrated-item, .integrated-total { display: flex; align-items: center; gap: 10px; min-width: 0; padding: 13px 12px; border: 1px solid rgba(176,255,216,.17); border-radius: 14px; background: rgba(133,255,191,.07); }
+.integrated-item small, .integrated-total small { display: block; color: #a8d9bb; font-size: 9px; letter-spacing: .11em; font-weight: 700; white-space: nowrap; }
+.integrated-item strong { display: block; margin-top: 5px; color: #f5fff8; font-family: 'Orbitron', sans-serif; font-size: 14px; white-space: nowrap; }
+.integrated-icon { display: grid; place-items: center; width: 32px; height: 32px; flex: 0 0 32px; color: #8effc0; border: 1px solid rgba(142,255,192,.3); border-radius: 10px; background: rgba(113,255,177,.11); box-shadow: 0 0 16px rgba(113,255,177,.12); }
+.integrated-total { display: block; border-color: rgba(255,188,126,.3); background: linear-gradient(135deg, rgba(255,185,115,.11), rgba(113,255,177,.08)); }
+.integrated-total strong { display: block; margin-top: 4px; color: #ffd0a4; font-family: 'Orbitron', sans-serif; font-size: 18px; }
+.integrated-total span { display: block; margin-top: 5px; color: #b9d9c5; font-size: 10px; }
+@media (max-width: 1100px) { .integrated-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .integrated-total { grid-column: span 2; } }
+@media (max-width: 600px) { .integrated-grid { grid-template-columns: 1fr; } .integrated-total { grid-column: auto; } .integrated-item strong { font-size: 13px; } }
+
+section[data-testid="stSidebar"] .stButton > button,
+section[data-testid="stSidebar"] [data-testid="stExpander"] summary {
+    background: rgba(45, 173, 108, .13) !important;
+    border-color: rgba(160, 255, 205, .28) !important;
+    box-shadow: inset 0 1px 0 rgba(240,255,246,.14), 0 10px 24px rgba(0, 45, 23, .16) !important;
+    transition: transform .24s ease, background .24s ease, box-shadow .24s ease, border-color .24s ease !important;
+}
+section[data-testid="stSidebar"] .stButton > button:hover,
+section[data-testid="stSidebar"] [data-testid="stExpander"] summary:hover {
+    background: rgba(94, 255, 177, .24) !important;
+    box-shadow: 0 0 24px rgba(105, 255, 184, .18), inset 0 1px 0 rgba(240,255,246,.24) !important;
 }
 
-[data-testid="stMetric"] label {
-  letter-spacing: 0.16em !important;
-  font-size: 10px !important;
-  text-transform: uppercase;
-  color: var(--brand-muted) !important;
-}
-
-[data-testid="stMetricValue"] {
-  font-size: 28px !important;
-  color: var(--brand-text) !important;
-}
-
-/* Buttons and inputs */
-button, .stDownloadButton > button, .stFormSubmitButton > button {
-  background: linear-gradient(145deg, rgba(26, 101, 59, 0.9), rgba(5, 37, 22, 0.96)) !important;
-  border: 1px solid rgba(163, 255, 194, 0.2) !important;
-  border-radius: 16px !important;
-  box-shadow: 0 8px 0 rgba(2, 17, 10, 0.78), 0 14px 32px rgba(0,0,0,0.22), inset 0 1px 0 rgba(255,255,255,0.08) !important;
-  transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
-}
-
-button:hover, .stDownloadButton > button:hover, .stFormSubmitButton > button:hover {
-  transform: translateY(-2px);
-  border-color: rgba(114, 247, 176, 0.54) !important;
-  box-shadow: 0 10px 0 rgba(2, 17, 10, 0.82), 0 20px 34px rgba(0,0,0,0.3), 0 0 24px rgba(114,247,176,0.12), inset 0 1px 0 rgba(255,255,255,0.12) !important;
-}
-
-input, textarea, div[data-baseweb="input"], div[data-baseweb="select"] > div {
-  border-radius: 15px !important;
-  background: rgba(7, 34, 22, 0.82) !important;
-  border: 1px solid rgba(163,255,194,0.18) !important;
-  color: var(--brand-text) !important;
-  box-shadow: inset 0 4px 15px rgba(0,0,0,0.18);
-}
-
-input:focus, textarea:focus, div[data-baseweb="input"]:focus-within, div[data-baseweb="select"] > div:focus-within {
-  border-color: rgba(114,247,176,0.82) !important;
-  box-shadow: 0 0 0 3px rgba(114,247,176,0.08), 0 0 18px rgba(114,247,176,0.12), inset 0 4px 15px rgba(0,0,0,0.18);
-}
-
-.stAlert {
-  background: rgba(7, 31, 21, 0.8) !important;
-  border: 1px solid rgba(163,255,194,0.18) !important;
-  border-radius: 18px !important;
-}
-
-/* Sidebar */
-section[data-testid="stSidebar"] {
-  background: linear-gradient(180deg, rgba(1, 13, 8, 0.94), rgba(3, 24, 14, 0.9)) !important;
-  border-right: 1px solid rgba(114,247,176,0.12) !important;
-  backdrop-filter: blur(22px) saturate(140%);
-  -webkit-backdrop-filter: blur(22px) saturate(140%);
-}
-
+/* Emerald construction console: deep green glass with a controlled floating lift. */
+section[data-testid="stSidebar"],
 section[data-testid="stSidebar"] > div {
-  padding: 20px 16px 26px !important;
+    background:
+        radial-gradient(circle at 12% 6%, rgba(74, 255, 164, .16), transparent 28%),
+        linear-gradient(160deg, rgba(2, 53, 29, .96), rgba(1, 24, 14, .98) 56%, rgba(0, 12, 8, 1)) !important;
+}
+section[data-testid="stSidebar"] .sidebar-brand,
+section[data-testid="stSidebar"] .sidebar-budget-card,
+section[data-testid="stSidebar"] [data-testid="stExpander"] summary,
+section[data-testid="stSidebar"] .stButton > button {
+    font-family: 'Bank Gothic', 'Rajdhani', 'Orbitron', sans-serif !important;
+    background: linear-gradient(135deg, rgba(15, 118, 66, .28), rgba(2, 51, 28, .38) 52%, rgba(0, 24, 13, .52)) !important;
+    border-color: rgba(104, 255, 171, .34) !important;
+}
+section[data-testid="stSidebar"] .stButton > button,
+section[data-testid="stSidebar"] [data-testid="stExpander"] summary {
+    min-height: 50px !important;
+    padding: 12px 15px !important;
+    font-size: 12px !important;
+    font-weight: 700 !important;
+    letter-spacing: .035em !important;
+    line-height: 1.15 !important;
+    text-shadow: 0 1px 10px rgba(115, 255, 181, .12);
+    animation: sidebarFloat 6s ease-in-out infinite;
+}
+section[data-testid="stSidebar"] .stButton > button p,
+section[data-testid="stSidebar"] [data-testid="stExpander"] summary,
+section[data-testid="stSidebar"] .sidebar-live,
+section[data-testid="stSidebar"] .sidebar-offline,
+section[data-testid="stSidebar"] .budget-title,
+section[data-testid="stSidebar"] .stCaption {
+    font-family: 'Bank Gothic', 'Rajdhani', 'Orbitron', sans-serif !important;
+    letter-spacing: .045em !important;
+}
+section[data-testid="stSidebar"] .stButton > button p { font-size: 12px !important; }
+section[data-testid="stSidebar"] [data-testid="stExpander"] summary { font-size: 11px !important; text-transform: uppercase; }
+section[data-testid="stSidebar"] .sidebar-live { font-size: 10px !important; color: #8dffc2 !important; }
+section[data-testid="stSidebar"] .brand-title { font-size: 18px !important; letter-spacing: .075em !important; }
+section[data-testid="stSidebar"] .brand-sub { font-family: 'Bank Gothic', 'Rajdhani', sans-serif !important; font-size: 10px !important; letter-spacing: .12em !important; }
+section[data-testid="stSidebar"] .budget-title { font-size: 13px !important; color: #b1ffd0 !important; }
+section[data-testid="stSidebar"] .stButton > button:nth-child(odd) { animation-delay: -.8s; }
+section[data-testid="stSidebar"] .stButton > button:nth-child(even) { animation-delay: -1.6s; }
+button,
+[role="button"],
+section[data-testid="stSidebar"] [data-testid="stExpander"] summary {
+    font-family: 'Ethnocentric', 'Orbitron', 'Rajdhani', sans-serif !important;
+    font-weight: 800 !important;
+    letter-spacing: .035em !important;
+    text-transform: uppercase;
+}
+button:not([data-testid="stSidebarCollapseButton"]),
+[role="button"],
+section[data-testid="stSidebar"] [data-testid="stExpander"] summary {
+    position: relative !important;
+    border-radius: 12px 26px 12px 26px !important;
+    clip-path: polygon(0 16%, 5% 0, 95% 0, 100% 16%, 100% 84%, 95% 100%, 5% 100%, 0 84%);
+    transition: transform .2s cubic-bezier(.2,.8,.2,1), background .2s ease, box-shadow .2s ease, filter .2s ease !important;
+}
+button:not([data-testid="stSidebarCollapseButton"]):hover,
+[role="button"]:hover,
+section[data-testid="stSidebar"] [data-testid="stExpander"] summary:hover {
+    filter: brightness(1.14) saturate(1.18) !important;
+    box-shadow: 0 0 0 1px rgba(126,255,190,.48), 0 0 26px rgba(73,255,163,.22), inset 0 1px 0 rgba(240,255,246,.22) !important;
+}
+button:not([data-testid="stSidebarCollapseButton"]):focus-visible,
+[role="button"]:focus-visible,
+section[data-testid="stSidebar"] [data-testid="stExpander"] summary:focus-visible {
+    outline: 2px solid #b8ffd5 !important;
+    outline-offset: 3px !important;
+}
+section[data-testid="stSidebar"] .stButton > button::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background: linear-gradient(105deg, transparent 25%, rgba(202, 255, 225, .12) 48%, transparent 70%);
+    transform: translateX(-120%);
+    animation: sidebarLightPass 7s ease-in-out infinite;
+}
+@keyframes sidebarFloat {
+    0%, 100% { transform: translateY(0); }
+    50% { transform: translateY(-2px); }
+}
+@keyframes sidebarLightPass {
+    0%, 58% { transform: translateX(-120%); opacity: 0; }
+    68% { opacity: 1; }
+    84%, 100% { transform: translateX(120%); opacity: 0; }
+}
+@media (max-width: 700px) {
+    section[data-testid="stSidebar"] .stButton > button { min-height: 47px !important; padding: 10px 12px !important; font-size: 11px !important; }
+    section[data-testid="stSidebar"] .stButton > button p { font-size: 11px !important; }
+    section[data-testid="stSidebar"] .brand-title { font-size: 15px !important; }
 }
 
-section[data-testid="stSidebar"] button {
-  min-height: 52px !important;
-  margin: 7px 0 !important;
-  border-radius: 18px !important;
-  background: linear-gradient(145deg, rgba(19, 80, 49, 0.7), rgba(3, 31, 18, 0.75)) !important;
-  border: 1px solid rgba(114,247,176,0.16) !important;
-  box-shadow: 0 10px 22px rgba(0,0,0,0.16), inset 0 1px 0 rgba(255,255,255,0.06) !important;
+@keyframes glassLightSweep {
+    0%, 48% { transform: translateX(-135%); opacity: 0; }
+    58% { opacity: 1; }
+    82%, 100% { transform: translateX(135%); opacity: 0; }
+}
+@media (hover: none), (pointer: coarse) {
+    .dash-section:active,
+    [data-testid="stMetric"]:active,
+    section[data-testid="stSidebar"] .stButton > button:active,
+    section[data-testid="stSidebar"] [data-testid="stExpander"] summary:active {
+        transform: none !important;
+        background: rgba(105, 255, 184, .23) !important;
+        border-color: rgba(196, 255, 222, .72) !important;
+        box-shadow: 0 0 32px rgba(105, 255, 184, .32), inset 0 1px 0 rgba(240,255,246,.26) !important;
+        filter: brightness(1.12) saturate(1.16) !important;
+    }
+}
+@media (prefers-reduced-motion: reduce) {
+    .dash-section::before, [data-testid="stMetric"]::before, .sidebar-brand::before,
+    section[data-testid="stSidebar"] .stButton > button,
+    section[data-testid="stSidebar"] .stButton > button::after,
+    section[data-testid="stSidebar"] [data-testid="stExpander"] summary { animation: none !important; }
 }
 
-section[data-testid="stSidebar"] button:hover {
-  transform: translateX(2px) translateY(-2px);
-  border-color: rgba(114,247,176,0.55) !important;
+/* Full automotive emerald system: one shape language across every surface. */
+:root {
+    --emerald-0: #01130b;
+    --emerald-1: #022a18;
+    --emerald-2: #075b31;
+    --emerald-3: #13a85d;
+    --emerald-light: #8dffc2;
+    --emerald-glass: rgba(15, 116, 67, .20);
+    --emerald-glass-dark: rgba(1, 27, 15, .54);
+}
+.stApp {
+    background:
+        radial-gradient(circle at 8% 14%, rgba(46, 255, 157, .16), transparent 27%),
+        radial-gradient(circle at 92% 78%, rgba(0, 181, 101, .14), transparent 30%),
+        linear-gradient(135deg, var(--emerald-0) 0%, var(--emerald-1) 48%, #000d08 100%) !important;
+}
+.stApp::before {
+    background: linear-gradient(125deg, rgba(0, 255, 143, .08), transparent 34%, rgba(0, 104, 55, .14) 72%, transparent) !important;
+    animation: systemAurora 14s ease-in-out infinite alternate;
+}
+.block-container,
+.dash-section,
+[data-testid="stMetric"],
+[data-testid="stExpander"],
+.cal-card,
+.welcome-card,
+.ops-panel,
+.newdash-panel,
+.integrated-item,
+.integrated-total,
+.sidebar-brand,
+.sidebar-budget-card {
+    border-radius: 10px 28px 10px 28px !important;
+    background: linear-gradient(135deg, rgba(13, 107, 60, .22), rgba(2, 44, 24, .34) 52%, rgba(0, 18, 10, .48)) !important;
+    border: 1px solid rgba(124, 255, 182, .28) !important;
+    box-shadow: 0 18px 42px rgba(0, 19, 10, .28), inset 0 1px 0 rgba(224, 255, 238, .13) !important;
+    backdrop-filter: blur(24px) saturate(150%) !important;
+    -webkit-backdrop-filter: blur(24px) saturate(150%) !important;
+}
+.block-container {
+    background: linear-gradient(135deg, rgba(1, 31, 17, .48), rgba(2, 68, 36, .20)) !important;
+    border-color: rgba(142, 255, 196, .22) !important;
+}
+.dash-section,
+[data-testid="stMetric"],
+.cal-card,
+.ops-panel,
+.newdash-panel {
+    animation: surfaceFloat 8s ease-in-out infinite;
+}
+.dash-section:nth-of-type(2n),
+[data-testid="stMetric"]:nth-of-type(2n),
+.cal-card:nth-child(2n),
+.ops-panel:nth-child(2n) { animation-delay: -2.4s; }
+.dash-section:nth-of-type(3n),
+[data-testid="stMetric"]:nth-of-type(3n),
+.cal-card:nth-child(3n) { animation-delay: -4.8s; }
+.section-head,
+.newdash-panel-head,
+.ops-panel-head { border-bottom-color: rgba(141, 255, 194, .22) !important; }
+div[data-baseweb="input"],
+div[data-baseweb="base-input"],
+textarea,
+div[data-baseweb="select"] > div,
+input {
+    border-radius: 9px 20px 9px 20px !important;
+    background: linear-gradient(135deg, rgba(6, 74, 40, .34), rgba(0, 24, 13, .55)) !important;
+    border-color: rgba(132, 255, 188, .30) !important;
+}
+.stAlert,
+[data-testid="stNotification"] {
+    border-radius: 9px 24px 9px 24px !important;
+    background: linear-gradient(135deg, rgba(12, 115, 63, .25), rgba(0, 37, 20, .46)) !important;
+    border-color: rgba(141, 255, 194, .32) !important;
+}
+table, [data-testid="stDataFrame"] {
+    border-radius: 9px 24px 9px 24px !important;
+    overflow: hidden !important;
+    border: 1px solid rgba(128, 255, 185, .24) !important;
+    box-shadow: 0 15px 35px rgba(0, 22, 12, .22) !important;
+}
+@keyframes systemAurora {
+    from { filter: hue-rotate(0deg) brightness(1); transform: scale(1); }
+    to { filter: hue-rotate(12deg) brightness(1.08); transform: scale(1.025); }
+}
+@keyframes surfaceFloat {
+    0%, 100% { transform: translateY(0); }
+    50% { transform: translateY(-3px); }
+}
+@media (hover: none), (pointer: coarse) {
+    .dash-section:active,
+    [data-testid="stMetric"]:active,
+    .cal-card:active,
+    .ops-panel:active,
+    .newdash-panel:active,
+    .integrated-item:active,
+    .integrated-total:active {
+        transform: none !important;
+        background: linear-gradient(135deg, rgba(55, 229, 139, .30), rgba(3, 71, 37, .40)) !important;
+        border-color: rgba(192, 255, 220, .70) !important;
+        box-shadow: 0 0 34px rgba(74, 255, 164, .28), inset 0 1px 0 rgba(239, 255, 246, .26) !important;
+    }
+}
+@media (prefers-reduced-motion: reduce) {
+    .stApp::before,
+    .dash-section,
+    [data-testid="stMetric"],
+    .cal-card,
+    .ops-panel,
+    .newdash-panel { animation: none !important; }
 }
 
-/* Dataframes */
-div[data-testid="stDataFrame"] {
-  background: rgba(7, 34, 22, 0.4) !important;
-  border-radius: 18px !important;
-  border: 1px solid rgba(163,255,194,0.18) !important;
-  overflow: hidden;
+/* Luxury finish: preserve all existing dimensions while changing the surface language. */
+:root {
+    --lux-jade: #063d27;
+    --lux-emerald: #0b7b4a;
+    --lux-highlight: #a8ffd0;
+    --lux-champagne: #e8c98b;
+    --lux-shadow: rgba(0, 20, 12, .34);
+}
+.stApp {
+    background:
+        radial-gradient(circle at 18% 8%, rgba(117, 255, 186, .14), transparent 24%),
+        radial-gradient(circle at 84% 88%, rgba(232, 201, 139, .09), transparent 26%),
+        linear-gradient(140deg, #01150c 0%, #032e1d 46%, #001009 100%) !important;
+}
+.block-container,
+.dash-section,
+[data-testid="stMetric"],
+[data-testid="stExpander"],
+.cal-card,
+.ops-panel,
+.newdash-panel,
+.integrated-item,
+.integrated-total,
+.sidebar-brand,
+.sidebar-budget-card {
+    background: linear-gradient(145deg, rgba(19, 113, 70, .20), rgba(2, 42, 26, .34) 55%, rgba(0, 18, 10, .52)) !important;
+    border-color: rgba(168, 255, 208, .30) !important;
+    box-shadow: 0 18px 42px var(--lux-shadow), inset 0 1px 0 rgba(242, 255, 247, .15) !important;
+}
+.section-head span,
+.integrated-control-strip .section-head span,
+.dashboard-heading-sub,
+.sidebar-live { color: var(--lux-highlight) !important; }
+.integrated-total { border-color: rgba(232, 201, 139, .42) !important; }
+.integrated-total strong { color: var(--lux-champagne) !important; }
+.cal-date-badge,
+.cal-status-tag,
+.newdash-status,
+.ops-status { border-color: rgba(232, 201, 139, .35) !important; }
+section[data-testid="stSidebar"] .stButton > button,
+section[data-testid="stSidebar"] [data-testid="stExpander"] summary {
+    background: linear-gradient(135deg, rgba(14, 117, 69, .24), rgba(2, 47, 28, .42)) !important;
+    border-color: rgba(168, 255, 208, .34) !important;
+}
+button:hover,
+[role="button"]:hover,
+section[data-testid="stSidebar"] [data-testid="stExpander"] summary:hover {
+    background: linear-gradient(135deg, rgba(31, 157, 93, .34), rgba(3, 70, 41, .48)) !important;
+    border-color: rgba(191, 255, 220, .68) !important;
+}
+@media (hover: none), (pointer: coarse) {
+    button:active,
+    [role="button"]:active,
+    section[data-testid="stSidebar"] [data-testid="stExpander"] summary:active {
+        background: linear-gradient(135deg, rgba(54, 192, 121, .34), rgba(7, 80, 46, .48)) !important;
+        border-color: rgba(221, 255, 232, .78) !important;
+    }
 }
 
-/* New dashboard architecture */
-.dashboard-intro {
-  position: relative;
-  overflow: hidden;
-  margin-bottom: 18px;
-  padding: 22px 24px;
-  border-radius: 26px;
-  background: linear-gradient(135deg, rgba(16, 70, 41, 0.82), rgba(4, 27, 16, 0.76));
-  border: 1px solid rgba(163,255,194,0.18);
-  box-shadow: 0 20px 42px rgba(0,0,0,0.28), inset 0 1px 0 rgba(255,255,255,0.08);
+    /* Dashboard-only type treatment. Sizes stay controlled by the existing layout. */
+    .block-container:has(.dashboard-heading),
+    .block-container:has(.dashboard-heading) button,
+    .block-container:has(.dashboard-heading) input,
+    .block-container:has(.dashboard-heading) textarea,
+    .block-container:has(.dashboard-heading) [class*="dash"],
+    .block-container:has(.dashboard-heading) [class*="ops"],
+    .block-container:has(.dashboard-heading) [class*="integrated"] {
+        font-family: 'Akira Expanded', 'Orbitron', 'Rajdhani', sans-serif !important;
+        font-weight: 700 !important;
+        letter-spacing: .035em !important;
+    }
+    .block-container:has(.dashboard-heading) .dashboard-heading-title,
+    .block-container:has(.dashboard-heading) .section-title,
+    .block-container:has(.dashboard-heading) .schedule-title,
+    .block-container:has(.dashboard-heading) [data-testid="stMetricValue"] {
+        font-family: 'Akira Expanded', 'Orbitron', 'Rajdhani', sans-serif !important;
+        font-weight: 800 !important;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown("""
+<style>
+/* Final typography contract: preserve existing sizes and layout dimensions. */
+html, body, button, input, textarea, select, label, [class*="css"] {
+    font-family: 'Akira Expanded', 'Orbitron', 'Rajdhani', sans-serif !important;
+    font-weight: 700 !important;
 }
-
-.dashboard-intro:before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  background: linear-gradient(110deg, transparent 0%, rgba(255,255,255,0.08) 42%, transparent 54%);
-  transform: translateX(-120%);
-  animation: scan-glow 8s linear infinite;
+button, [role="button"], [data-testid="stExpander"] summary,
+section[data-testid="stSidebar"] .stButton > button p {
+    font-family: 'Akira Expanded', 'Orbitron', 'Rajdhani', sans-serif !important;
+    font-weight: 800 !important;
 }
-
-.dashboard-intro-inner {
-  position: relative;
-  z-index: 1;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 16px;
-  flex-wrap: wrap;
+.dashboard-heading-title, .section-title, .schedule-title,
+.brand-title, .brand-sub, .budget-title, .sidebar-live,
+.integrated-item, .integrated-total, .tx-name, .tx-type, .tx-date,
+[data-testid="stMetricValue"], [data-testid="stMetricLabel"] {
+    font-family: 'Akira Expanded', 'Orbitron', 'Rajdhani', sans-serif !important;
+    font-weight: 700 !important;
 }
-
-.dashboard-brand {
-  display: flex;
-  align-items: center;
-  gap: 14px;
+.dashboard-action-rail {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin: 22px 0 8px;
+    padding: 12px 16px;
+    border-left: 3px solid #9fffc7;
+    border-top: 1px solid rgba(168, 255, 208, .25);
+    border-bottom: 1px solid rgba(168, 255, 208, .16);
+    background: linear-gradient(90deg, rgba(7, 79, 43, .28), rgba(2, 31, 17, .08));
+    clip-path: polygon(0 0, 99% 0, 100% 35%, 99% 100%, 0 100%);
 }
-
-.dashboard-brand img {
-  width: 56px;
-  height: 56px;
-  object-fit: contain;
+.dashboard-action-copy span {
+    display: block;
+    color: #c2ffdb;
+    font-family: 'Akira Expanded', 'Orbitron', sans-serif;
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: .13em;
 }
-
-.dashboard-brand h1 {
-  margin: 0;
-  font-size: clamp(24px, 2vw, 36px);
-  font-weight: 900;
-  letter-spacing: 0.06em;
-  color: var(--brand-text);
-}
-
-.dashboard-brand small {
-  display: block;
-  margin-top: 4px;
-  letter-spacing: 0.18em;
-  text-transform: uppercase;
-  font-size: 10px;
-  font-weight: 800;
-  color: var(--brand-accent);
-}
-
-.dashboard-meta {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-  align-items: center;
-  justify-content: flex-end;
-}
-
-.status-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 12px;
-  border-radius: 999px;
-  background: rgba(114,247,176,0.08);
-  border: 1px solid rgba(114,247,176,0.2);
-  color: var(--brand-text-soft);
-  font-size: 11px;
-  font-weight: 800;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-}
-
-.status-pill .dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--brand-accent);
-  box-shadow: 0 0 14px rgba(114,247,176,0.6);
-}
-
-.top-nav-shell {
-  position: relative;
-  overflow: hidden;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  gap: 18px;
-  margin: 0 0 18px;
-  padding: 18px 20px;
-  border-radius: 26px;
-  background: linear-gradient(145deg, rgba(17, 73, 45, 0.82), rgba(6, 31, 18, 0.72));
-  border: 1px solid rgba(163,255,194,0.18);
-  box-shadow: 0 18px 36px rgba(0,0,0,0.26), inset 0 1px 0 rgba(255,255,255,0.08);
-}
-
-.top-nav-shell:before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  background: linear-gradient(110deg, transparent 0%, rgba(255,255,255,0.06) 42%, transparent 54%);
-  transform: translateX(-120%);
-  animation: scan-glow 8s linear infinite;
-}
-
-.top-nav-brand, .top-nav-meta {
-  position: relative;
-  z-index: 1;
-  display: flex;
-  align-items: center;
-  gap: 14px;
-}
-
-.top-nav-logo {
-  width: 54px;
-  height: 54px;
-  object-fit: contain;
-  filter: drop-shadow(0 8px 16px rgba(0,0,0,0.24));
-}
-
-.top-nav-title {
-  color: #f5fff8;
-  font-family: 'Outfit', sans-serif;
-  font-size: clamp(18px, 1.6vw, 24px);
-  font-weight: 900;
-  letter-spacing: 0.06em;
-}
-
-.top-nav-subtitle {
-  color: #8fe0bb;
-  font-size: 10px;
-  font-weight: 900;
-  letter-spacing: 0.16em;
-  text-transform: uppercase;
-}
-
-.top-nav-status {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 12px;
-  border-radius: 999px;
-  background: rgba(114,247,176,0.08);
-  border: 1px solid rgba(114,247,176,0.20);
-  color: #dffae9;
-  font-size: 10px;
-  font-weight: 900;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-}
-
-.nav-status-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: #72f7b0;
-  box-shadow: 0 0 14px rgba(114,247,176,0.6);
-}
-
-.top-nav-date {
-  color: #dcefe5;
-  font-size: 11px;
-  font-weight: 800;
-  letter-spacing: 0.06em;
-}
-
-.nav-spacer {
-  height: 8px;
-}
-
-.workspace-toolbar {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-  margin-bottom: 18px;
-}
-
-.module-shell {
-  position: relative;
-  overflow: hidden;
-  margin: 0 0 18px;
-  padding: 18px 20px 16px;
-  border-radius: 24px;
-  background: linear-gradient(145deg, rgba(15, 68, 41, 0.82), rgba(4, 26, 16, 0.72));
-  border: 1px solid rgba(163,255,194,0.18);
-  box-shadow: 0 18px 36px rgba(0,0,0,0.26), inset 0 1px 0 rgba(255,255,255,0.08);
-}
-
-.module-shell:before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  background: linear-gradient(110deg, transparent 0%, rgba(255,255,255,0.06) 42%, transparent 54%);
-  transform: translateX(-120%);
-  animation: scan-glow 8s linear infinite;
-}
-
-.module-shell-header {
-  position: relative;
-  z-index: 1;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  flex-wrap: wrap;
-}
-
-.module-shell-copy {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.module-shell-kicker {
-  color: #8fe0bb;
-  font-size: 10px;
-  font-weight: 900;
-  letter-spacing: 0.18em;
-  text-transform: uppercase;
-}
-
-.module-shell-title {
-  margin: 0;
-  color: #f5fff8;
-  font-size: clamp(24px, 2vw, 32px);
-  font-weight: 900;
-  letter-spacing: 0.02em;
-}
-
-.module-shell-badge {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  padding: 8px 12px;
-  border-radius: 999px;
-  background: rgba(114,247,176,0.08);
-  border: 1px solid rgba(114,247,176,0.24);
-  color: #dffae9;
-  font-size: 10px;
-  font-weight: 900;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-}
-
-.module-shell-subtitle {
-  position: relative;
-  z-index: 1;
-  margin: 10px 0 0;
-  color: #cfe6d7;
-  font-size: 13px;
-  line-height: 1.5;
-}
-
-.workspace-chip {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  padding: 10px 14px;
-  border-radius: 14px;
-  background: rgba(8, 35, 23, 0.66);
-  border: 1px solid rgba(163,255,194,0.16);
-  color: var(--brand-text-soft);
-  font-size: 11px;
-  font-weight: 800;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-}
-
-.glass-panel {
-  position: relative;
-  overflow: hidden;
-  padding: 18px;
-  border-radius: 22px;
-  background: linear-gradient(145deg, rgba(10, 42, 26, 0.82), rgba(5, 25, 15, 0.7));
-  border: 1px solid rgba(163,255,194,0.18);
-  box-shadow: 0 16px 32px rgba(0,0,0,0.22), inset 0 1px 0 rgba(255,255,255,0.08);
-}
-
-.section-heading {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  margin-bottom: 14px;
-}
-
-.section-heading h3 {
-  margin: 0;
-  font-size: 12px;
-  letter-spacing: 0.18em;
-  text-transform: uppercase;
-  color: var(--brand-accent);
-}
-
-.section-heading span {
-  color: var(--brand-muted);
-  font-size: 10px;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-}
-
-.highlight-list {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.highlight-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 10px 12px;
-  border-radius: 12px;
-  background: rgba(255,255,255,0.02);
-  border: 1px solid rgba(163,255,194,0.1);
-}
-
-.highlight-row strong {
-  color: var(--brand-text);
-  font-size: 13px;
-}
-
-.highlight-row span {
-  color: var(--brand-text-soft);
-  font-size: 12px;
-}
-
-.alert-strip {
-  padding: 12px 14px;
-  border-radius: 14px;
-  margin-bottom: 16px;
-  font-size: 12px;
-  font-weight: 700;
-  border: 1px solid rgba(163,255,194,0.14);
-}
-
-.alert-strip.warning {
-  background: rgba(228, 171, 74, 0.1);
-  border-color: rgba(228, 171, 74, 0.3);
-  color: #ffe0a6;
-}
-
-.alert-strip.danger {
-  background: rgba(217, 93, 93, 0.12);
-  border-color: rgba(217, 93, 93, 0.32);
-  color: #ffc1b1;
-}
-
-.alert-strip.success {
-  background: rgba(76, 198, 122, 0.08);
-  border-color: rgba(76, 198, 122, 0.28);
-  color: #d6f6e0;
-}
-
-@keyframes scan-glow {
-  0%, 55% { transform: translateX(-120%); }
-  80%, 100% { transform: translateX(180%); }
-}
-
-@media (max-width: 900px) {
-  .block-container {
-    padding-left: 18px !important;
-    padding-right: 18px !important;
-  }
-}
-
-@media (max-width: 640px) {
-  .dashboard-intro {
-    padding: 18px 16px;
-  }
-
-  .dashboard-intro-inner {
-    align-items: flex-start;
-  }
-
-  .dashboard-meta {
-    justify-content: flex-start;
-  }
+.dashboard-action-copy small {
+    display: block;
+    margin-top: 4px;
+    color: #9bcbb0;
+    font-family: 'Akira Expanded', 'Orbitron', sans-serif;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: .04em;
 }
 </style>
 """, unsafe_allow_html=True)
 
-render_top_navigation()
+st.markdown("""
+<style>
+/* Preserve the original project background; let the emerald glass reveal it. */
+.stApp,
+[data-testid="stAppViewContainer"],
+[data-testid="stAppViewContainer"] > .main,
+[data-testid="stAppViewContainer"] .main .block-container {
+    background-color: transparent !important;
+}
+.stApp {
+    background-image:
+        linear-gradient(115deg, rgba(2, 12, 8, .30), rgba(3, 27, 17, .42)),
+        url("https://images.unsplash.com/photo-1600585154340-be6161a56a0c") !important;
+    background-size: cover !important;
+    background-position: center !important;
+    background-attachment: fixed !important;
+}
+.block-container,
+.dash-section,
+[data-testid="stMetric"],
+[data-testid="stExpander"],
+.cal-card,
+.ops-panel,
+.newdash-panel,
+.integrated-item,
+.integrated-total,
+.sidebar-brand,
+.sidebar-budget-card {
+    background: linear-gradient(135deg, rgba(9, 102, 57, .16), rgba(1, 34, 19, .22)) !important;
+    backdrop-filter: blur(18px) saturate(135%) !important;
+    -webkit-backdrop-filter: blur(18px) saturate(135%) !important;
+}
+section[data-testid="stSidebar"],
+section[data-testid="stSidebar"] > div {
+    background: linear-gradient(160deg, rgba(1, 34, 19, .72), rgba(0, 15, 9, .78)) !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# === CLIENT DRAGGABLE SIDEBAR — FINAL FIX ===
+# This block changes sidebar geometry only. The existing project background,
+# images, colors, logo, and theme are intentionally untouched.
+st.markdown("""
+<style>
+section[data-testid="stSidebar"] {
+    --ailyn-sidebar-width: 340px;
+    width: var(--ailyn-sidebar-width) !important;
+    min-width: 230px !important;
+    max-width: 560px !important;
+    box-sizing: border-box !important;
+    overflow: visible !important;
+    transition: width .04s linear !important;
+}
+section[data-testid="stSidebar"] > div,
+section[data-testid="stSidebar"] [data-testid="stSidebarContent"] {
+    width: 100% !important;
+    min-width: 0 !important;
+    max-width: 100% !important;
+    box-sizing: border-box !important;
+}
+/* Wide invisible hit area + sharp visible edge. */
+section[data-testid="stSidebar"]::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    right: -10px;
+    width: 20px;
+    height: 100%;
+    cursor: ew-resize;
+    pointer-events: auto;
+    touch-action: none;
+    user-select: none;
+    z-index: 2147483646;
+    background: transparent;
+}
+section[data-testid="stSidebar"]::before {
+    content: "";
+    position: absolute;
+    top: 50%;
+    right: -3px;
+    width: 5px;
+    height: 92px;
+    transform: translateY(-50%);
+    border-radius: 3px;
+    background: #ffffff;
+    border: 1px solid #06130b;
+    box-shadow: 0 0 0 1px #8fffc1, 0 0 16px rgba(143,255,193,.95);
+    pointer-events: none;
+    touch-action: none;
+    z-index: 2147483647;
+}
+html.ailyn-resizing, html.ailyn-resizing * {
+    cursor: ew-resize !important;
+    user-select: none !important;
+}
+/* When collapsed, do not leave our width behind. */
+section[data-testid="stSidebar"][aria-expanded="false"] {
+    width: 0 !important;
+    min-width: 0 !important;
+    max-width: 0 !important;
+    border-right: 0 !important;
+    box-shadow: none !important;
+}
+section[data-testid="stSidebar"][aria-expanded="false"]::before,
+section[data-testid="stSidebar"][aria-expanded="false"]::after { display: none !important; }
+</style>
+""", unsafe_allow_html=True)
+
+# Streamlit can sanitize scripts placed in markdown. st.components.v1.html gives
+# the resize handler an actual browser execution context and lets it target the
+# parent Streamlit document.
+st.components.v1.html("""
+<script>
+(function () {
+  const MIN = 230, MAX = 560, DEFAULT = 340, KEY = 'ailyn_sidebar_width_v3';
+  let sidebar = null, dragging = false, startX = 0, startWidth = DEFAULT;
+
+  function doc() {
+    try { return window.parent.document; } catch (e) { return null; }
+  }
+  function getSidebar() {
+    const d = doc();
+    return d ? d.querySelector('section[data-testid="stSidebar"]') : null;
+  }
+  function isCollapsed(el) { return !el || el.getAttribute('aria-expanded') === 'false'; }
+  function clamp(n) { return Math.max(MIN, Math.min(MAX, Math.round(n))); }
+  function readSaved() {
+    try {
+      const n = Number(window.parent.localStorage.getItem(KEY));
+      return Number.isFinite(n) ? clamp(n) : DEFAULT;
+    } catch (e) { return DEFAULT; }
+  }
+  function applyWidth(n, save) {
+    sidebar = getSidebar();
+    if (!sidebar || isCollapsed(sidebar)) return;
+    const w = clamp(n);
+    const d = doc();
+    d.documentElement.style.setProperty('--ailyn-sidebar-width', w + 'px');
+    sidebar.style.setProperty('width', w + 'px', 'important');
+    sidebar.style.setProperty('min-width', w + 'px', 'important');
+    sidebar.style.setProperty('max-width', w + 'px', 'important');
+    if (save) {
+      try { window.parent.localStorage.setItem(KEY, String(w)); } catch (e) {}
+    }
+  }
+  function onDown(e) {
+    sidebar = getSidebar();
+    if (!sidebar || isCollapsed(sidebar)) return;
+    const r = sidebar.getBoundingClientRect();
+    if (e.clientX < r.right - 14 || e.clientX > r.right + 14) return;
+    dragging = true;
+    startX = e.clientX;
+    startWidth = r.width;
+        if (e.pointerId !== undefined && e.target && e.target.setPointerCapture) {
+            try { e.target.setPointerCapture(e.pointerId); } catch (error) {}
+        }
+    const d = doc();
+    d.documentElement.classList.add('ailyn-resizing');
+    e.preventDefault();
+    e.stopPropagation();
+  }
+  function onMove(e) {
+    if (!dragging) return;
+    applyWidth(startWidth + (e.clientX - startX), true);
+    e.preventDefault();
+  }
+  function onUp() {
+    if (!dragging) return;
+    dragging = false;
+    const d = doc();
+    if (d) d.documentElement.classList.remove('ailyn-resizing');
+  }
+  function init() {
+    const d = doc();
+    sidebar = getSidebar();
+    if (!d || !sidebar) return;
+    if (!isCollapsed(sidebar)) applyWidth(readSaved(), false);
+    if (!d.__ailynSidebarResizeBound) {
+      d.__ailynSidebarResizeBound = true;
+      d.addEventListener('pointerdown', onDown, true);
+      d.addEventListener('pointermove', onMove, true);
+      d.addEventListener('pointerup', onUp, true);
+      d.addEventListener('pointercancel', onUp, true);
+    d.defaultView.addEventListener('blur', onUp);
+    }
+    if (!d.__ailynSidebarResizeObserver) {
+      d.__ailynSidebarResizeObserver = new MutationObserver(function () {
+        const el = getSidebar();
+        if (!el) return;
+        sidebar = el;
+        if (isCollapsed(el)) {
+          el.style.removeProperty('width');
+          el.style.removeProperty('min-width');
+          el.style.removeProperty('max-width');
+          onUp();
+        } else if (!dragging) {
+          applyWidth(readSaved(), false);
+        }
+      });
+      d.__ailynSidebarResizeObserver.observe(d.body, {
+        subtree: true, childList: true, attributes: true,
+        attributeFilter: ['aria-expanded']
+      });
+    }
+  }
+  [100, 500, 1200, 2500].forEach(ms => setTimeout(init, ms));
+})();
+</script>
+""", height=0, scrolling=False)
+
+st.markdown("""
+<style>
+/* Final visual polish for the sidebar boundary; resize behavior stays unchanged. */
+section[data-testid="stSidebar"] {
+    border-right: 1px solid rgba(164, 255, 204, .18) !important;
+    box-shadow: 14px 0 34px rgba(0, 18, 10, .28), 1px 0 0 rgba(184, 255, 216, .08) !important;
+}
+section[data-testid="stSidebar"]::before {
+    width: 3px !important;
+    height: 72px !important;
+    right: -2px !important;
+    background: linear-gradient(180deg, rgba(220, 255, 234, .82), rgba(93, 241, 158, .58), rgba(220, 255, 234, .82)) !important;
+    border: 1px solid rgba(215, 255, 231, .42) !important;
+    box-shadow: 0 0 10px rgba(104, 255, 175, .38), 0 0 22px rgba(104, 255, 175, .14) !important;
+    opacity: .78 !important;
+}
+section[data-testid="stAppViewContainer"] > .main {
+    filter: drop-shadow(-10px 0 22px rgba(0, 18, 10, .10));
+}
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown("""
+<style>
+/* Sharp contrast system: explicit text, edge, and focus colors. */
+.block-container,
+.block-container p,
+.block-container label,
+.block-container [data-testid="stMarkdownContainer"],
+section[data-testid="stSidebar"] {
+    color: #f4fff8 !important;
+}
+.block-container h1,
+.block-container h2,
+.block-container h3,
+.block-container h4,
+.dashboard-heading-title,
+.section-title,
+.tx-name,
+.schedule-title,
+[data-testid="stMetricValue"] {
+    color: #ffffff !important;
+    text-shadow: 0 2px 12px rgba(0, 0, 0, .68) !important;
+}
+.block-container p,
+.block-container label,
+.dashboard-welcome,
+.section-head span,
+.tx-type,
+.tx-date,
+.schedule-muted,
+section[data-testid="stSidebar"] .stCaption {
+    color: #d8f7e5 !important;
+}
+button,
+.stDownloadButton > button,
+.stFormSubmitButton > button,
+section[data-testid="stSidebar"] [data-testid="stExpander"] summary {
+    color: #ffffff !important;
+    border: 1px solid rgba(164, 255, 204, .58) !important;
+    text-shadow: 0 1px 8px rgba(0, 0, 0, .72) !important;
+}
+button:hover,
+.stDownloadButton > button:hover,
+.stFormSubmitButton > button:hover,
+section[data-testid="stSidebar"] [data-testid="stExpander"] summary:hover {
+    border-color: #baffd6 !important;
+    filter: brightness(1.16) contrast(1.08) !important;
+}
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible,
+[role="slider"]:focus-visible {
+    outline: 2px solid #d4ffe4 !important;
+    outline-offset: 3px !important;
+    box-shadow: 0 0 0 4px rgba(67, 255, 157, .24), 0 0 24px rgba(67, 255, 157, .32) !important;
+}
+div[data-baseweb="input"],
+div[data-baseweb="select"] > div,
+textarea {
+    background: rgba(0, 15, 9, .82) !important;
+    border-color: rgba(164, 255, 204, .46) !important;
+    color: #ffffff !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown("""
+<style>
+/* Deep emerald transparent glass: preserve the existing main background. */
+.block-container {
+    background: linear-gradient(145deg, rgba(2, 46, 27, .46), rgba(0, 13, 8, .34)) !important;
+    border: 1px solid rgba(176, 255, 211, .28) !important;
+    box-shadow: 0 34px 80px rgba(0, 0, 0, .52), inset 0 1px 0 rgba(238, 255, 245, .16), inset 0 -22px 36px rgba(0, 0, 0, .20) !important;
+    backdrop-filter: blur(28px) saturate(155%) !important;
+    -webkit-backdrop-filter: blur(28px) saturate(155%) !important;
+}
+.dash-section,
+[data-testid="stMetric"],
+[data-testid="stExpander"],
+.cal-card,
+.ops-panel,
+.newdash-panel {
+    background: linear-gradient(145deg, rgba(5, 72, 40, .54), rgba(0, 18, 11, .42) 58%, rgba(0, 8, 5, .34)) !important;
+    border: 1px solid rgba(153, 255, 199, .34) !important;
+    box-shadow: 0 20px 42px rgba(0, 0, 0, .48), 0 3px 0 rgba(0, 26, 15, .56), inset 0 1px 0 rgba(239, 255, 245, .20), inset 0 -16px 28px rgba(0, 0, 0, .18) !important;
+    backdrop-filter: blur(24px) saturate(160%) !important;
+    -webkit-backdrop-filter: blur(24px) saturate(160%) !important;
+}
+section[data-testid="stSidebar"],
+section[data-testid="stSidebar"] > div {
+    background: linear-gradient(155deg, rgba(0, 42, 24, .92), rgba(0, 9, 6, .94)) !important;
+    border-right: 1px solid rgba(126, 255, 187, .38) !important;
+    box-shadow: 18px 0 58px rgba(0, 0, 0, .58), inset -1px 0 0 rgba(196, 255, 219, .14) !important;
+    backdrop-filter: blur(26px) saturate(155%) !important;
+    -webkit-backdrop-filter: blur(26px) saturate(155%) !important;
+}
+.dash-section::after,
+[data-testid="stMetric"]::after,
+[data-testid="stExpander"]::after,
+.sidebar-brand::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    border-radius: inherit;
+    background: linear-gradient(125deg, rgba(237, 255, 245, .13), transparent 25%, transparent 72%, rgba(70, 255, 160, .06));
+    mix-blend-mode: screen;
+}
+</style>
+""", unsafe_allow_html=True)
+
+with st.sidebar:
+    st.markdown(f"""
+    <div class="sidebar-brand">
+      <div class="brand-row">
+        <img class="brand-logo" src="{AILYN_LOGO_DATA}" alt="Ailyn Construction Logo">
+        <div class="brand-copy">
+        <div class="brand-title"><span>AILYN HOUSE</span><span>PROJECT</span></div>
+          <div class="brand-sub">Official Project Control</div>
+        </div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+    st.markdown(
+        f"<div class='sidebar-live'><span>●</span> &nbsp; LIVE SYSTEM &nbsp; • &nbsp; "
+        f"{manila_now().strftime('%I:%M %p  |  %b %d')}</div>",
+        unsafe_allow_html=True
+    )
+
+    # Workspace sizing controls: fine slider controls only.
+    
+    
+
+    if st.button("📊 DASHBOARD", use_container_width=True, key="side_dashboard"):
+        set_view("home")
+
+    st.markdown("<div class='sidebar-budget-card'><div class='budget-title'>BUDGET CONTROL</div></div>",
+                unsafe_allow_html=True)
+    if st.button("💰 APPLY BUDGET", use_container_width=True, key="side_budget"):
+        budget_dialog()
+
+    with st.expander("🏗️ PROJECT CONTROL", expanded=False):
+        if st.button("📝 NEW WORK ENTRY", use_container_width=True, key="side_new_work"):
+            set_view("planner_input")
+        if st.button("📅 SCHEDULE & PROGRESS", use_container_width=True, key="side_schedule"):
+            set_view("planner_output")
+
+    with st.expander("🏠 PROJECT DETAILS", expanded=False):
+        project = st.session_state.project
+        st.caption(f"Status: {project.get('status', 'Active')}")
+        if st.button("⚙️ EDIT PROJECT DETAILS", use_container_width=True, key="side_project_details"):
+            project_settings_dialog()
+
+    with st.expander("💰 FINANCIAL OPERATIONS", expanded=False):
+        if st.button("🧱 MATERIAL ENTRY", use_container_width=True, key="side_material"):
+            set_view("material")
+        if st.button("🧾 EXPENSE ENTRY", use_container_width=True, key="side_expense"):
+            set_view("expense")
+        if st.button("🏦 CASH & DEPOSITS", use_container_width=True, key="side_excess"):
+            set_view("excess")
+        if st.button("📒 FINANCIAL LEDGER", use_container_width=True, key="side_ledger"):
+            set_view("ledger")
+        if st.button("📈 FINANCIAL REPORT", use_container_width=True, key="side_financial_report"):
+            set_view("export")
+        if st.button("🔒 MONTHLY CLOSING", use_container_width=True, key="side_monthly_close"):
+            set_view("monthly_close")
+
+    with st.expander("👷 PAYROLL OPERATIONS", expanded=False):
+        if st.button("👷 LABOR ACCOUNT", use_container_width=True, key="side_labor"):
+            set_view("add_labor")
+        if st.button("💳 PAYROLL EXPENSE", use_container_width=True, key="side_payroll_expense"):
+            set_view("add_payroll_expense")
+        if st.button("🪙 REMAINING MONEY", use_container_width=True, key="side_payroll_remaining"):
+            set_view("payroll_remaining")
+        if st.button("👥 LABOR ACCOUNTS", use_container_width=True, key="side_payroll_ledger"):
+            set_view("payroll_ledger")
+        if st.button("📋 PAYROLL REPORT", use_container_width=True, key="side_payroll_report"):
+            set_view("payroll_export")
+        if st.button("🗃️ RECEIPTS ARCHIVE", use_container_width=True, key="side_archive"):
+            set_view("receipt_archive")
+
+    with st.expander("⚙️ ADMINISTRATION", expanded=False):
+        if st.button("🔐 ADMIN CONSOLE", use_container_width=True, key="side_admin"):
+            set_view("update")
+
+    st.markdown("<div class='sidebar-divider'></div>", unsafe_allow_html=True)
+    if st.button("🔄 RESET SYSTEM", use_container_width=True, key="side_restart"):
+        clear_all()
+        st.session_state.welcome_seen = True
+        st.session_state.view = "home"
+        st.rerun()
+
+# Dynamic workspace sizing. The sidebar sliders above act like draggable split-pane controls.
+_workspace_width = int(st.session_state.get("workspace_width", 1200))
+_sidebar_width = int(st.session_state.get("sidebar_width", 330))
+st.markdown(f"""
+<style>
+/* ================================================================
+   DYNAMIC RESIZABLE WORKSPACE
+   Small -> Wide -> Ultra-wide, controlled from the sidebar.
+   ================================================================ */
+section[data-testid="stSidebar"] {{
+  width: {_sidebar_width}px !important;
+  min-width: {_sidebar_width}px !important;
+}}
+section[data-testid="stSidebar"] > div {{
+  width: {_sidebar_width}px !important;
+  min-width: {_sidebar_width}px !important;
+}}
+[data-testid="stAppViewContainer"] > .main .block-container {{
+  width: min(calc(100vw - {_sidebar_width + 48}px), {_workspace_width}px) !important;
+  max-width: {_workspace_width}px !important;
+  margin-left: auto !important;
+  margin-right: auto !important;
+  transition: width .18s ease, max-width .18s ease;
+}}
+@media (max-width: 900px) {{
+  section[data-testid="stSidebar"] {{
+    width: min(88vw, {_sidebar_width}px) !important;
+    min-width: min(88vw, {_sidebar_width}px) !important;
+  }}
+  [data-testid="stAppViewContainer"] > .main .block-container {{
+    width: calc(100vw - 28px) !important;
+    max-width: calc(100vw - 28px) !important;
+  }}
+}}
+/* Make the sizing controls feel like a split-pane handle. */
+section[data-testid="stSidebar"] [data-testid="stSlider"] {{
+  padding-bottom: 4px;
+}}
+section[data-testid="stSidebar"] [role="slider"] {{
+  cursor: ew-resize !important;
+}}
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown("""
+<style>
+/* Final spacing pass: one consistent vertical rhythm across every view. */
+.block-container {
+    padding: 6px 32px 48px !important;
+    margin-top: 0 !important;
+}
+section[data-testid="stAppViewContainer"] > .main,
+section[data-testid="stAppViewContainer"] > .main > div {
+    padding-top: 0 !important;
+    margin-top: 0 !important;
+}
+.block-container > div {
+    gap: 14px !important;
+}
+div[data-testid="stHorizontalBlock"] {
+    gap: 18px !important;
+    margin-bottom: 14px !important;
+}
+div[data-testid="stVerticalBlock"] > div[data-testid="element-container"] {
+    margin-bottom: 8px !important;
+}
+div[data-testid="stForm"] {
+    padding: 20px 22px 12px !important;
+    margin: 10px 0 18px !important;
+    border-radius: 18px !important;
+}
+div[data-testid="stMetric"] {
+    margin-bottom: 10px !important;
+}
+div[data-testid="stDataFrame"] {
+    margin: 12px 0 22px !important;
+}
+section[data-testid="stSidebar"] .stButton {
+    margin: 0 0 8px !important;
+}
+section[data-testid="stSidebar"] [data-testid="stExpander"] {
+    margin: 8px 0 14px !important;
+}
+section[data-testid="stSidebar"] hr {
+    margin: 16px 4px !important;
+}
+@media (max-width: 900px) {
+    .block-container {
+        padding: 4px 16px 36px !important;
+    }
+    div[data-testid="stHorizontalBlock"] {
+        gap: 12px !important;
+        margin-bottom: 10px !important;
+    }
+    div[data-testid="stForm"] {
+        padding: 16px 14px 8px !important;
+        margin-bottom: 14px !important;
+    }
+}
+@media (max-width: 600px) {
+    .block-container {
+        padding: 4px 12px 30px !important;
+    }
+    div[data-testid="stHorizontalBlock"] {
+        display: block !important;
+    }
+    div[data-testid="stHorizontalBlock"] > div {
+        margin-bottom: 12px !important;
+    }
+}
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown("""
+<style>
+/* Clear 3D glass finish: preserve the background while using 75% dark surfaces. */
+:root {
+    --glass-dark: rgba(4, 12, 9, .50);
+    --glass-dark-soft: rgba(7, 19, 14, .50);
+    --glass-edge: rgba(214, 255, 231, .24);
+    --glass-edge-bright: rgba(190, 255, 215, .48);
+    --glass-shadow: rgba(0, 0, 0, .58);
+}
+.stApp {
+    background-color: #07110c !important;
+    background-blend-mode: normal !important;
+}
+.stApp:before {
+    background:
+        linear-gradient(115deg, rgba(0, 0, 0, .34), rgba(0, 8, 4, .48)) !important;
+}
+.block-container,
+.dash-section,
+[data-testid="stMetric"],
+[data-testid="stExpander"],
+.cal-card,
+.ops-panel,
+.newdash-panel,
+div[data-testid="stForm"] {
+    background: linear-gradient(145deg, rgba(17, 31, 24, .50), rgba(2, 8, 6, .50)) !important;
+    border: 1px solid var(--glass-edge) !important;
+    box-shadow:
+        0 22px 46px var(--glass-shadow),
+        0 5px 0 rgba(0, 0, 0, .32),
+        inset 0 1px 0 rgba(255, 255, 255, .22),
+        inset 0 -18px 30px rgba(0, 0, 0, .20) !important;
+    backdrop-filter: blur(22px) saturate(125%) !important;
+    -webkit-backdrop-filter: blur(22px) saturate(125%) !important;
+}
+.block-container {
+    background: linear-gradient(145deg, rgba(17, 27, 22, .50), rgba(2, 7, 5, .50)) !important;
+    border-radius: 26px !important;
+}
+.dash-section,
+[data-testid="stMetric"],
+[data-testid="stExpander"],
+.cal-card,
+div[data-testid="stForm"] {
+    border-radius: 18px !important;
+}
+.dash-section::before,
+[data-testid="stMetric"]::before,
+[data-testid="stExpander"]::before,
+.cal-card::before,
+div[data-testid="stForm"]::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    border-radius: inherit;
+    background: linear-gradient(125deg, rgba(255, 255, 255, .12), transparent 24%, transparent 72%, rgba(107, 255, 167, .06));
+    opacity: .9;
+}
+section[data-testid="stSidebar"],
+section[data-testid="stSidebar"] > div {
+    background: linear-gradient(155deg, rgba(13, 23, 18, .50), rgba(1, 6, 4, .50)) !important;
+    border-right: 1px solid var(--glass-edge-bright) !important;
+    box-shadow: 18px 0 56px rgba(0, 0, 0, .62), inset -1px 0 0 rgba(255, 255, 255, .12) !important;
+    backdrop-filter: blur(24px) saturate(120%) !important;
+    -webkit-backdrop-filter: blur(24px) saturate(120%) !important;
+}
+.sidebar-brand,
+.sidebar-budget-card {
+    background: linear-gradient(145deg, rgba(22, 39, 29, .50), rgba(2, 9, 6, .50)) !important;
+    border-color: var(--glass-edge) !important;
+    box-shadow: 0 16px 34px rgba(0, 0, 0, .52), inset 0 1px 0 rgba(255, 255, 255, .18) !important;
+}
+button,
+.stDownloadButton > button,
+.stFormSubmitButton > button {
+    background: linear-gradient(145deg, rgba(30, 66, 45, .86), rgba(3, 17, 10, .90)) !important;
+    border-color: rgba(201, 255, 222, .34) !important;
+    box-shadow: 0 6px 0 rgba(0, 0, 0, .52), 0 13px 25px rgba(0, 0, 0, .34), inset 0 1px 0 rgba(255, 255, 255, .20) !important;
+}
+button:hover,
+.stDownloadButton > button:hover,
+.stFormSubmitButton > button:hover {
+    border-color: var(--glass-edge-bright) !important;
+    filter: brightness(1.12) !important;
+}
+div[data-baseweb="input"],
+div[data-baseweb="base-input"],
+textarea,
+div[data-baseweb="select"] > div {
+    background: rgba(1, 7, 5, .50) !important;
+    border-color: rgba(198, 255, 219, .30) !important;
+    box-shadow: inset 0 4px 16px rgba(0, 0, 0, .42), 0 3px 10px rgba(0, 0, 0, .22) !important;
+}
+[data-testid="stMetricValue"],
+.section-title,
+.tx-name,
+.schedule-title,
+.block-container h1,
+.block-container h2,
+.block-container h3 {
+    text-shadow: 0 2px 14px rgba(0, 0, 0, .78) !important;
+}
+@media (max-width: 600px) {
+    .block-container {
+        background: linear-gradient(145deg, rgba(17, 27, 22, .50), rgba(2, 7, 5, .50)) !important;
+    }
+}
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown("""
+<style>
+/* Final app shell: consistent 8px rhythm and measured proportions. */
+:root {
+    --space-1: 4px;
+    --space-2: 8px;
+    --space-3: 12px;
+    --space-4: 16px;
+    --space-5: 24px;
+    --space-6: 32px;
+    --surface: rgba(8, 18, 13, .50);
+    --surface-raised: rgba(14, 30, 21, .52);
+    --line: rgba(216, 255, 231, .22);
+    --text: #f4fff8;
+    --muted: #b7d0bf;
+}
+
+html, body, [class*="css"] {
+    font-family: 'Manrope', sans-serif !important;
+    letter-spacing: 0 !important;
+}
+.stApp {
+    overflow-x: hidden !important;
+}
+section[data-testid="stAppViewContainer"] > .main {
+    padding-top: 0 !important;
+}
+[data-testid="stAppViewContainer"] > .main .block-container {
+    width: min(100% - 40px, 1480px) !important;
+    max-width: 1480px !important;
+    padding: var(--space-2) 0 var(--space-6) !important;
+    margin: 0 auto !important;
+}
+
+/* Streamlit's generated vertical wrappers are the actual page rhythm. */
+[data-testid="stVerticalBlock"] {
+    gap: var(--space-3) !important;
+}
+[data-testid="stHorizontalBlock"] {
+    gap: var(--space-4) !important;
+    align-items: stretch !important;
+}
+[data-testid="element-container"] {
+    margin: 0 !important;
+}
+[data-testid="stMarkdownContainer"] p {
+    margin: 0 0 var(--space-2) !important;
+    line-height: 1.5 !important;
+}
+h1, h2, h3, h4 {
+    margin: var(--space-3) 0 var(--space-2) !important;
+    line-height: 1.15 !important;
+}
+
+/* Shared surface proportions. */
+.dash-section,
+[data-testid="stMetric"],
+[data-testid="stExpander"],
+.cal-card,
+div[data-testid="stForm"] {
+    min-width: 0 !important;
+    border-radius: 16px !important;
+}
+.dash-section {
+    padding: var(--space-5) !important;
+}
+[data-testid="stMetric"] {
+    min-height: 108px !important;
+    padding: var(--space-4) !important;
+}
+[data-testid="stMetricLabel"] {
+    line-height: 1.3 !important;
+}
+
+/* Forms need breathing room without becoming oversized panels. */
+div[data-testid="stForm"] {
+    padding: var(--space-5) !important;
+    margin: var(--space-2) 0 var(--space-4) !important;
+    border: 1px solid var(--line) !important;
+}
+div[data-testid="stForm"] [data-testid="stVerticalBlock"] {
+    gap: var(--space-3) !important;
+}
+div[data-testid="stFormSubmitButton"],
+div[data-testid="stButton"] {
+    margin-top: var(--space-1) !important;
+}
+button,
+.stDownloadButton > button,
+.stFormSubmitButton > button {
+    min-height: 44px !important;
+    padding: 0 var(--space-4) !important;
+    border-radius: 12px !important;
+    line-height: 1.2 !important;
+}
+div[data-baseweb="input"],
+div[data-baseweb="select"] > div,
+textarea {
+    min-height: 44px !important;
+    border-radius: 10px !important;
+}
+
+/* Tables and data surfaces align to the same edge as their headings. */
+[data-testid="stDataFrame"],
+[data-testid="stTable"] {
+    width: 100% !important;
+    margin: var(--space-3) 0 var(--space-4) !important;
+    border-radius: 12px !important;
+    overflow: hidden !important;
+}
+[data-testid="stAlert"] {
+    margin: var(--space-3) 0 !important;
+    border-radius: 12px !important;
+}
+hr {
+    margin: var(--space-4) 0 !important;
+    border-color: rgba(216, 255, 231, .16) !important;
+}
+
+/* Sidebar: compact, aligned controls with deliberate section separation. */
+section[data-testid="stSidebar"] > div {
+    padding: var(--space-5) var(--space-4) var(--space-6) !important;
+}
+section[data-testid="stSidebar"] [data-testid="stVerticalBlock"] {
+    gap: var(--space-2) !important;
+}
+section[data-testid="stSidebar"] button {
+    min-height: 48px !important;
+    height: auto !important;
+    margin: 0 0 var(--space-2) !important;
+    padding: 0 var(--space-3) !important;
+    border-radius: 12px !important;
+}
+section[data-testid="stSidebar"] [data-testid="stExpander"] {
+    margin: var(--space-2) 0 !important;
+    border-radius: 12px !important;
+}
+
+@media (max-width: 900px) {
+    [data-testid="stAppViewContainer"] > .main .block-container {
+        width: calc(100% - 24px) !important;
+        padding: var(--space-2) 0 var(--space-5) !important;
+    }
+    [data-testid="stHorizontalBlock"] {
+        gap: var(--space-3) !important;
+    }
+    .dash-section,
+    div[data-testid="stForm"] {
+        padding: var(--space-4) !important;
+    }
+}
+@media (max-width: 600px) {
+    [data-testid="stHorizontalBlock"] {
+        display: block !important;
+    }
+    [data-testid="stHorizontalBlock"] > div {
+        width: 100% !important;
+        margin-bottom: var(--space-3) !important;
+    }
+    [data-testid="stMetric"] {
+        min-height: 88px !important;
+    }
+    section[data-testid="stSidebar"] > div {
+        padding: var(--space-4) var(--space-3) var(--space-5) !important;
+    }
+}
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown("""
+<style>
+/* UHD finish: stable geometry, smooth motion, and one measured visual rhythm. */
+*, *::before, *::after {
+    box-sizing: border-box !important;
+}
+html {
+    -webkit-font-smoothing: antialiased !important;
+    -moz-osx-font-smoothing: grayscale !important;
+    text-rendering: optimizeLegibility !important;
+}
+.stApp, .stApp * {
+    scroll-behavior: smooth;
+}
+.stApp button,
+.stApp input,
+.stApp textarea,
+.stApp select,
+.stApp [data-testid="stMetric"],
+.stApp [data-testid="stExpander"],
+.stApp .dash-section,
+.stApp .cal-card,
+.stApp div[data-testid="stForm"] {
+    transition:
+        background-color .22s ease,
+        border-color .22s ease,
+        box-shadow .22s ease,
+        color .22s ease,
+        opacity .22s ease,
+        transform .22s cubic-bezier(.2, .8, .2, 1) !important;
+}
+.stApp button:hover,
+.stApp [data-testid="stMetric"]:hover,
+.stApp .dash-section:hover,
+.stApp .cal-card:hover {
+    transform: translateY(-2px) !important;
+}
+.stApp button:active {
+    transform: translateY(1px) !important;
+}
+.stApp button,
+.stApp .stDownloadButton > button,
+.stApp .stFormSubmitButton > button {
+    min-height: 46px !important;
+    max-height: 54px !important;
+    white-space: normal !important;
+}
+.stApp input,
+.stApp textarea,
+.stApp [data-baseweb="input"],
+.stApp [data-baseweb="base-input"],
+.stApp [data-baseweb="select"] > div {
+    min-height: 46px !important;
+}
+.stApp textarea {
+    min-height: 96px !important;
+    padding-top: 12px !important;
+}
+.stApp [data-testid="stMetric"] {
+    min-height: 112px !important;
+    display: flex !important;
+    flex-direction: column !important;
+    justify-content: center !important;
+}
+.stApp [data-testid="stMetricLabel"] {
+    min-height: 28px !important;
+    display: flex !important;
+    align-items: center !important;
+}
+.stApp [data-testid="stMetricValue"] {
+    line-height: 1.1 !important;
+    white-space: nowrap !important;
+}
+.stApp [data-testid="stDataFrame"],
+.stApp [data-testid="stTable"] {
+    min-height: 0 !important;
+    box-shadow: 0 12px 28px rgba(0, 0, 0, .24) !important;
+}
+.stApp .dashboard-heading,
+.stApp .dashboard-welcome,
+.stApp .dash-section,
+.stApp .cal-grid,
+.stApp .ledger-entry {
+    margin-top: 0 !important;
+}
+.stApp .dashboard-heading {
+    padding-top: 4px !important;
+    margin-bottom: 16px !important;
+}
+.stApp .dashboard-welcome {
+    margin-bottom: 20px !important;
+}
+.stApp .dash-section,
+.stApp .cal-card,
+.stApp div[data-testid="stForm"] {
+    padding: 20px !important;
+}
+.stApp .cal-grid {
+    gap: 20px !important;
+}
+section[data-testid="stSidebar"] button:hover {
+    transform: translateX(2px) translateY(-1px) !important;
+}
+@media (max-width: 900px) {
+    [data-testid="stAppViewContainer"] > .main .block-container {
+        width: calc(100% - 24px) !important;
+    }
+    .stApp .dash-section,
+    .stApp .cal-card,
+    .stApp div[data-testid="stForm"] {
+        padding: 16px !important;
+    }
+}
+@media (max-width: 600px) {
+    .stApp [data-testid="stMetric"] {
+        min-height: 92px !important;
+    }
+    .stApp .dashboard-heading {
+        margin-bottom: 12px !important;
+    }
+    .stApp button,
+    .stApp .stDownloadButton > button,
+    .stApp .stFormSubmitButton > button {
+        min-height: 44px !important;
+    }
+}
+@media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+        scroll-behavior: auto !important;
+        transition: none !important;
+        animation: none !important;
+    }
+}
+</style>
+""", unsafe_allow_html=True)
 
 view = st.session_state.view
 
@@ -3094,423 +3227,165 @@ if view == "home":
     material = float(total_materials() or 0)
     expenses = float(total_expenses() or 0)
     excess = float(total_excess() or 0)
-    chart_total = max(material + expenses + excess, 1.0)
+    payroll_labor = sum(float(record.get("net", 0) or 0) for record in st.session_state.labor_records)
+    payroll_expenses = sum(float(record.get("price", 0) or 0) for record in st.session_state.payroll_expenses)
+    payroll_total = payroll_labor + payroll_expenses
+    total_operating_spend = used + payroll_total
+    worker_count = len(st.session_state.labor_records)
+    chart_total = max(material + expenses, 1.0)
     p1 = material / chart_total * 360
     p2 = p1 + expenses / chart_total * 360
-    p3 = p2 + excess / chart_total * 360
+    p3 = 360
     today_key = manila_now().strftime("%Y-%m-%d")
     today_tasks = [t for t in st.session_state.planner_tasks if t.get("date_obj") == today_key]
     upcoming_tasks = [t for t in st.session_state.planner_tasks if t.get("date_obj", "") >= today_key]
 
+    st.markdown(f"""
+    <div class="dashboard-heading">
+    <img src="{AILYN_LOGO_DATA}" alt="Ailyn Construction Logo">
+      <div>
+        <div class="dashboard-heading-title">AILYN HOUSE PROJECT</div>
+        <div class="dashboard-heading-sub">PROJECT MANAGEMENT SYSTEM</div>
+      </div>
+    </div>
+    <div class="dashboard-welcome">🛡️ &nbsp; Welcome back, <b>{st.session_state.project.get("name", "Ailyn House Project")}</b> &nbsp;|&nbsp; Manage your construction project efficiently.</div>
+    """, unsafe_allow_html=True)
     project = st.session_state.project
+    if project.get("client") or project.get("address") or project.get("target_date"):
+        st.caption(
+            f"Client: {project.get('client') or 'Not set'}  |  Site: {project.get('address') or 'Not set'}  |  "
+            f"Target: {project.get('target_date') or 'Not set'}  |  Status: {project.get('status', 'Active')}"
+        )
+    # Dashboard switcher: client can choose which dashboard to open.
+    dash_overview_col, dash_material_col, dash_payroll_col = st.columns(3)
+    with dash_overview_col:
+        if st.button("📊 OVERVIEW", key="dashboard_overview", use_container_width=True):
+            set_view("home")
+    with dash_material_col:
+        if st.button("🧱 RAW MATERIAL DASHBOARD", key="dashboard_material", use_container_width=True):
+            set_view("material_dashboard")
+    with dash_payroll_col:
+        if st.button("👷 PAYROLL DASHBOARD", key="dashboard_payroll", use_container_width=True):
+            set_view("payroll_dashboard")
+
     overdue_tasks = [
         task for task in st.session_state.planner_tasks
         if task.get("date_obj", "") < manila_now().strftime("%Y-%m-%d")
         and task.get("status") != "Completed"
     ]
-    monthly_summary = get_monthly_summary()
-    current_month_name = datetime.strptime(monthly_summary["month"], "%Y-%m").strftime("%b %Y")
-    previous_month_name = datetime.strptime(monthly_summary["previous_month"], "%Y-%m").strftime("%b %Y")
-    budget_alert = budget_alert_status(budget, used)
-
-    st.markdown(
-        """
-        <style>
-        .desktop-workspace-shell {
-            position: relative;
-            overflow: hidden;
-            padding: 18px 18px 14px;
-            margin-bottom: 18px;
-            border-radius: 24px;
-            background: linear-gradient(145deg, rgba(247,250,253,0.96), rgba(234,239,245,0.9));
-            border: 1px solid rgba(133, 154, 175, 0.32);
-            box-shadow: 0 18px 36px rgba(31, 55, 82, 0.12), inset 0 1px 0 rgba(255,255,255,0.8);
-        }
-        .desktop-workspace-shell:before {
-            content: "";
-            position: absolute;
-            inset: 0;
-            background: linear-gradient(110deg, transparent 0%, rgba(255,255,255,0.06) 42%, transparent 54%);
-            transform: translateX(-120%);
-            animation: scan-glow 8s linear infinite;
-        }
-        .desktop-workspace-header {
-            position: relative;
-            z-index: 1;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 16px;
-            flex-wrap: wrap;
-            margin-bottom: 18px;
-        }
-        .desktop-workspace-title {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-        }
-        .desktop-workspace-title img {
-            width: 52px;
-            height: 52px;
-            object-fit: contain;
-            border-radius: 16px;
-        }
-        .desktop-workspace-copy h2 {
-            margin: 0;
-            color: #1a2d3d;
-            font-size: clamp(20px, 1.8vw, 28px);
-            font-weight: 900;
-            letter-spacing: 0.03em;
-        }
-        .desktop-workspace-copy small {
-            display: block;
-            margin-top: 4px;
-            color: #4f6e86;
-            font-size: 10px;
-            font-weight: 900;
-            letter-spacing: 0.16em;
-            text-transform: uppercase;
-        }
-        .desktop-workspace-meta {
-            display: flex;
-            align-items: center;
-            flex-wrap: wrap;
-            gap: 10px;
-        }
-        .desktop-workspace-meta .status-pill {
-            margin: 0;
-        }
-        .desktop-section-label {
-            position: relative;
-            z-index: 1;
-            margin: 0 0 12px;
-            color: #8fe0bb;
-            font-size: 10px;
-            font-weight: 900;
-            letter-spacing: 0.18em;
-            text-transform: uppercase;
-        }
-        .desktop-launcher-grid {
-            position: relative;
-            z-index: 1;
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
-            gap: 14px;
-        }
-        .desktop-launcher-card {
-            position: relative;
-            overflow: hidden;
-            padding: 16px;
-            border-radius: 18px;
-            background: linear-gradient(145deg, rgba(255,255,255,0.96), rgba(237,244,250,0.86));
-            border: 1px solid rgba(133, 154, 175, 0.3);
-            box-shadow: 0 14px 29px rgba(31,55,82,0.10), inset 0 1px 0 rgba(255,255,255,0.7);
-            height: 100%;
-        }
-        .desktop-launcher-card:hover {
-            border-color: rgba(163,255,194,0.34);
-            transform: translateY(-2px);
-        }
-        .desktop-launcher-icon {
-            width: 38px;
-            height: 38px;
-            border-radius: 12px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            background: rgba(114,247,176,0.1);
-            border: 1px solid rgba(114,247,176,0.24);
-            color: #72f7b0;
-            font-size: 18px;
-            font-weight: 900;
-            margin-bottom: 12px;
-        }
-        .desktop-launcher-card .category {
-            color: #466984;
-            font-size: 9px;
-            font-weight: 900;
-            letter-spacing: 0.14em;
-            text-transform: uppercase;
-            margin-bottom: 7px;
-        }
-        .desktop-launcher-card .title {
-            color: #1b2f3d;
-            font-size: 15px;
-            font-weight: 900;
-            margin-bottom: 6px;
-        }
-        .desktop-launcher-card .desc {
-            color: #4d6476;
-            font-size: 11px;
-            line-height: 1.45;
-            margin-bottom: 12px;
-        }
-        .desktop-launcher-card button {
-            width: 100%;
-        }
-        @media (max-width: 700px) {
-            .desktop-workspace-header {
-                align-items: flex-start;
-            }
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    st.markdown("<div class='desktop-workspace-shell'>", unsafe_allow_html=True)
-
-    st.markdown(
-        f"""
-        <div class='desktop-workspace-header'>
-            <div class='desktop-workspace-title'>
-                <img src="{AILYN_LOGO_DATA}" alt="Ailyn Construction Logo">
-                <div class='desktop-workspace-copy'>
-                    <h2>AILYN HOUSE PROJECT</h2>
-                    <small>Premium Workspace</small>
-                </div>
-            </div>
-            <div class='desktop-workspace-meta'>
-                <div class='status-pill'><span class='dot'></span>{project.get('status', 'Active').upper()} PROJECT</div>
-                <div class='status-pill'>{current_month_name.upper()}</div>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    st.caption(
-        f"Client: {project.get('client') or 'Not set'}  |  Site: {project.get('address') or 'Not set'}  |  "
-        f"Target: {project.get('target_date') or 'Not set'}  |  Manager: {project.get('manager') or 'Not set'}"
-    )
-
-    if budget_alert["severity"] == "danger":
-        st.markdown("<div class='alert-strip danger'>" + budget_alert["message"] + "</div>", unsafe_allow_html=True)
-    elif budget_alert["severity"] == "warning":
-        st.markdown("<div class='alert-strip warning'>" + budget_alert["message"] + "</div>", unsafe_allow_html=True)
-    elif budget_alert["severity"] == "info":
-        st.markdown("<div class='alert-strip success'>" + budget_alert["message"] + "</div>", unsafe_allow_html=True)
+    if balance < 0:
+        st.error(f"Budget warning: project is over budget by PHP {abs(balance):,.2f}.")
     if overdue_tasks:
-        st.markdown(f"<div class='alert-strip warning'>{len(overdue_tasks)} scheduled task(s) are overdue.</div>", unsafe_allow_html=True)
+        st.warning(f"{len(overdue_tasks)} scheduled task(s) are overdue.")
 
-    desktop_query = str(st.session_state.get("desktop_command_search", "")).strip().lower()
-    launchers = get_desktop_launchers()
-    filtered_launchers = []
-    if desktop_query:
-        filtered_launchers = [
-            item for item in launchers
-            if desktop_query in item["label"].lower()
-            or desktop_query in item["category"].lower()
-            or desktop_query in item["description"].lower()
-        ]
-    else:
-        filtered_launchers = launchers
-
-    if filtered_launchers:
-        grouped_launchers = {}
-        for item in filtered_launchers:
-            grouped_launchers.setdefault(item["category"], []).append(item)
-
-        st.markdown("<div class='desktop-section-label'>Workspace launcher</div>", unsafe_allow_html=True)
-        for category, items in grouped_launchers.items():
-            st.markdown(f"<div class='desktop-section-label'>{category}</div>", unsafe_allow_html=True)
-            cat_cols = st.columns(min(4, len(items)))
-            for index, item in enumerate(items):
-                with cat_cols[index]:
-                    st.markdown(
-                        f"""
-                        <div class='desktop-launcher-card'>
-                            <div class='desktop-launcher-icon'>{item['icon']}</div>
-                            <div class='category'>{item['category']}</div>
-                            <div class='title'>{item['label']}</div>
-                            <div class='desc'>{item['description']}</div>
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
-                    if st.button("Open", key=f"desktop_launcher_{item['target']}", use_container_width=True):
-                        set_view(item["target"])
-    else:
-        st.info("No launcher matches your search. Try payroll, reports, planner, settings, or tools.")
-
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    home_shortcuts = [
-        {"target": "home", "label": "Dashboard", "description": "Open the desktop workspace", "icon": "◈"},
-        {"target": "payroll_dashboard", "label": "Payroll", "description": "Labor, payroll, and payout controls", "icon": "💼"},
-        {"target": "material", "label": "Materials", "description": "Track incoming materials", "icon": "📦"},
-        {"target": "ledger", "label": "Ledger", "description": "Review construction and account entries", "icon": "📒"},
-        {"target": "export", "label": "Reports", "description": "Generate financial and construction reports", "icon": "📑"},
-        {"target": "planner_output", "label": "Calendar", "description": "View the project planner", "icon": "🗓"},
-        {"target": "client_portal", "label": "Clients", "description": "Open client-facing updates", "icon": "👥"},
-        {"target": "settings", "label": "Settings", "description": "Open system and workspace settings", "icon": "⚙"},
-    ]
-
-    st.markdown("<div class='desktop-section-label'>Desktop shortcuts</div>", unsafe_allow_html=True)
-    home_shortcut_cols = st.columns(min(6, len(home_shortcuts)))
-    for index, item in enumerate(home_shortcuts):
-        with home_shortcut_cols[index]:
-            st.markdown(
-                f"""
-                <div class='desktop-pinned-tile'>
-                    <div class='desktop-pinned-icon'>{item['icon']}</div>
-                    <div class='desktop-pinned-label'>{item['label']}</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            if st.button("Open", key=f"home_desktop_tile_{item['target']}", use_container_width=True):
-                set_view(item["target"])
-
-    summary_col1, summary_col2, summary_col3, summary_col4 = st.columns(4)
-    with summary_col1:
-        st.metric("Budget", f"₱{budget:,.2f}")
-    with summary_col2:
-        st.metric("Expenses", f"₱{used:,.2f}")
-    with summary_col3:
-        st.metric("Balance", f"₱{balance:,.2f}")
-    with summary_col4:
-        st.metric("Upcoming", f"{len(upcoming_tasks)}")
-
-    left, center, right = st.columns([1.2, 1.3, 1.1])
-
-    with left:
-        st.markdown(
-            f"""
-            <div class="glass-panel">
-                <div class="section-heading">
-                    <h3>Expense Mix</h3>
-                    <span>Live</span>
-                </div>
-                <div style="display:flex;align-items:center;gap:18px;flex-wrap:wrap;">
-                    <div class="donut" style="--p1:{p1}deg;--p2:{p2}deg;--p3:{p3}deg; width:160px; height:160px; flex:0 0 160px;">
-                        <div class="donut-center">₱{used:,.0f}<small>Total</small></div>
-                    </div>
-                    <div class="highlight-list" style="flex:1; min-width:180px;">
-                        <div class="highlight-row"><span>Materials</span><strong>₱{material:,.2f}</strong></div>
-                        <div class="highlight-row"><span>Expenses</span><strong>₱{expenses:,.2f}</strong></div>
-                        <div class="highlight-row"><span>Excess</span><strong>₱{excess:,.2f}</strong></div>
-                    </div>
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        st.metric("TOTAL BUDGET", f"₱{budget:,.2f}")
+    with m2:
+        st.metric("TOTAL EXPENSES", f"₱{used:,.2f}")
+    with m3:
+        st.metric("REMAINING BALANCE", f"₱{balance:,.2f}")
+    with m4:
+        st.metric(
+            f"PROJECT SPENT THIS MONTH ({manila_now().strftime('%b %Y').upper()})",
+            f"₱{monthly_construction_spend():,.2f}",
         )
 
-    with center:
-        trend_rows = monthly_trend_summary(st.session_state.records, st.session_state.labor_records, st.session_state.payroll_expenses, months=6)
-        st.markdown(
-            """
-            <div class="glass-panel">
-                <div class="section-heading">
-                    <h3>Monthly Trend</h3>
-                    <span>Last 6 months</span>
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        if trend_rows:
-            st.dataframe(
-                trend_rows,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Month": st.column_config.TextColumn("Month"),
-                    "Materials": st.column_config.NumberColumn("Materials", format="₱%.2f"),
-                    "Construction": st.column_config.NumberColumn("Construction", format="₱%.2f"),
-                    "Labor": st.column_config.NumberColumn("Labor", format="₱%.2f"),
-                    "Payroll": st.column_config.NumberColumn("Payroll", format="₱%.2f"),
-                    "Total": st.column_config.NumberColumn("Total", format="₱%.2f"),
-                },
-            )
-        else:
-            st.info("No monthly activity yet.")
+    # ============================================================
+    # PRIMARY WORKSPACES — directly under dashboard metrics
+    # ============================================================
+    action_material, action_payroll = st.columns(2, gap="large")
+    with action_material:
+        if st.button("◇  MATERIALS", key="dashboard_materials_workspace_top", use_container_width=True):
+            set_view("material")
+    with action_payroll:
+        if st.button("♙  PAYROLL", key="dashboard_payroll_workspace_top", use_container_width=True):
+            set_view("payroll_ledger")
 
-    with right:
-        recent = list(reversed(st.session_state.records))[:5]
-        recent_html = ""
-        if recent:
-            for r in recent:
-                recent_html += f"""
-                <div class="highlight-row">
-                    <div>
-                        <strong>{r.get('name', 'Transaction')}</strong><br>
-                        <span>{str(r.get('type', '')).title()} • {r.get('date', '')}</span>
-                    </div>
-                    <strong>₱{float(r.get('amount', 0)):,.2f}</strong>
-                </div>
-                """
-        else:
-            recent_html = "<div class='highlight-row'><span>No transactions yet.</span></div>"
+    # Clean dashboard summary: keep detailed operations in the sidebar.
+    st.markdown("### 📊 OPERATIONS SUMMARY")
+    op1, op2, op3, op4 = st.columns(4)
+    with op1:
+        st.metric("MATERIALS", f"₱{material:,.2f}")
+    with op2:
+        st.metric("OPERATING EXPENSES", f"₱{expenses:,.2f}")
+    with op3:
+        st.metric("LABOR PAYROLL", f"₱{payroll_labor:,.2f}")
+    with op4:
+        st.metric("PAYROLL EXPENSES", f"₱{payroll_expenses:,.2f}")
 
-        st.markdown(
-            f"""
-            <div class="glass-panel">
-                <div class="section-heading">
-                    <h3>Recent Activity</h3>
-                    <span>Latest 5</span>
-                </div>
-                <div class="highlight-list">{recent_html}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+    st.markdown(f"""
+    <div class="dash-section">
+      <div class="section-head"><div class="section-title" style="margin:0">TOTAL OPERATING SPEND</div><span>CONSTRUCTION + PAYROLL</span></div>
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:20px;flex-wrap:wrap;padding:16px 4px 4px">
+        <div><div style="font-size:28px;font-weight:900">₱{total_operating_spend:,.2f}</div><div style="font-size:12px;color:#7b867f;margin-top:4px">{worker_count} worker(s) active in payroll</div></div>
+        <div style="font-size:12px;color:#7b867f">Use the dashboard buttons above or the sidebar for detailed operations.</div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
 
     st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
-
-    overview_left, overview_right = st.columns([1.3, 1])
-    with overview_left:
-        st.markdown(
-            f"""
-            <div class="glass-panel">
-                <div class="section-heading">
-                    <h3>Monthly Overview</h3>
-                    <span>{current_month_name}</span>
-                </div>
-                <div class="highlight-list">
-                    <div class="highlight-row"><span>Materials</span><strong>₱{monthly_summary['materials']:,.2f}</strong></div>
-                    <div class="highlight-row"><span>Construction</span><strong>₱{monthly_summary['construction']:,.2f}</strong></div>
-                    <div class="highlight-row"><span>Labor</span><strong>₱{monthly_summary['labor']:,.2f}</strong></div>
-                    <div class="highlight-row"><span>Payroll</span><strong>₱{monthly_summary['payroll']:,.2f}</strong></div>
-                    <div class="highlight-row"><span>Remaining</span><strong>₱{monthly_summary['remaining']:,.2f}</strong></div>
-                </div>
+    left, right = st.columns([1.05, 1])
+    with left:
+        st.markdown(f"""
+        <div class="dash-section">
+          <div class="section-head"><div class="section-title" style="margin:0">EXPENSES OVERVIEW</div><span style="font-size:11px;color:#7b867f;font-weight:700">THIS PROJECT</span></div>
+          <div class="donut-wrap">
+            <div class="donut" style="--p1:{p1}deg;--p2:{p2}deg;--p3:{p3}deg"><div class="donut-center">₱{used:,.0f}<small>Net Expenses</small></div></div>
+            <div class="legend">
+              <div class="legend-row"><span><i class="dot" style="background:#075c28"></i>Materials</span><b>₱{material:,.2f}</b></div>
+              <div class="legend-row"><span><i class="dot" style="background:#e0aa25"></i>Expenses</span><b>₱{expenses:,.2f}</b></div>
+              <div class="legend-row"><span><i class="dot" style="background:#e85d4a"></i>Excess deduction</span><b>-₱{excess:,.2f}</b></div>
             </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    with overview_right:
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+    with right:
+        tx = list(reversed(st.session_state.records))[:5]
+        tx_html = ""
+        if tx:
+            for r in tx:
+                icon = "🛒" if r.get("type") == "material" else "▣" if r.get("type") == "expense" else "+"
+                tx_html += f'''<div class="tx-row"><div class="tx-left"><div class="tx-icon">{icon}</div><div><div class="tx-name">{r.get("name", "Transaction")}</div><div class="tx-type">{str(r.get("type", "")).title()}</div></div></div><div class="tx-right">₱{float(r.get("amount", 0)):,.2f}<div class="tx-date">{r.get("date", "")}</div></div></div>'''
+        else:
+            tx_html = '<div style="padding:30px 0;color:#7a857e;text-align:center">No transactions yet.</div>'
         st.markdown(
-            f"""
-            <div class="glass-panel">
-                <div class="section-heading">
-                    <h3>Task Summary</h3>
-                    <span>Live status</span>
-                </div>
-                <div class="highlight-list">
-                    <div class="highlight-row"><span>Today</span><strong>{len(today_tasks)}</strong></div>
-                    <div class="highlight-row"><span>Upcoming</span><strong>{len(upcoming_tasks)}</strong></div>
-                    <div class="highlight-row"><span>Overdue</span><strong>{len(overdue_tasks)}</strong></div>
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+            f'''<div class="dash-section"><div class="section-head"><div class="section-title" style="margin:0">RECENT TRANSACTIONS</div><span style="font-size:11px;color:#7b867f">LATEST 5</span></div>{tx_html}</div>''',
+            unsafe_allow_html=True)
 
-    if monthly_summary["delta_from_previous"] > 0:
-        st.info(f"This month is PHP {monthly_summary['delta_from_previous']:,.2f} higher than {previous_month_name}.")
-    elif monthly_summary["delta_from_previous"] < 0:
-        st.success(f"This month is PHP {abs(monthly_summary['delta_from_previous']):,.2f} lower than {previous_month_name}.")
+    st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
+    st.markdown(f"""
+    <div class="dash-section">
+      <div class="schedule">
+        <div class="schedule-icon">▦</div>
+        <div><div class="schedule-title">TODAY'S SCHEDULE</div><div style="font-weight:800;font-size:13px;margin-top:4px">{manila_now().strftime('%B %d, %Y (%A)')}</div><div class="schedule-muted">{len(today_tasks)} task(s) scheduled for today.</div></div>
+        <div style="width:1px;height:58px;background:#dfe8e1;margin:0 12px"></div>
+        <div><div class="schedule-title">UPCOMING TASKS</div><div style="font-weight:800;font-size:13px;margin-top:4px">{len(upcoming_tasks)} task(s) planned</div><div class="schedule-muted">Stay on track and manage your construction tasks.</div></div>
+        <div style="margin-left:auto"><div class="open-planner">▣ &nbsp; Open Planner</div></div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+    if st.button("OPEN CONSTRUCTION PLANNER", use_container_width=True):
+        set_view("planner_output")
+
 
 elif view == "payroll_dashboard":
-    render_module_shell("Payroll Dashboard", "Payroll control center for labor accounts, payroll expenses, and final payouts.", "PAYROLL")
     payroll_labor = sum(float(record.get("net", 0)) for record in st.session_state.labor_records)
     payroll_expenses = sum(float(record.get("price", 0)) for record in st.session_state.payroll_expenses)
     payroll_total = payroll_labor + payroll_expenses
     payroll_remaining = float(st.session_state.remaining_money or 0)
     payroll_output = payroll_total - payroll_remaining
 
+    st.markdown(f"""
+        <div class="dashboard-heading">
+            <img src="{AILYN_LOGO_DATA}" alt="Ailyn Construction Logo">
+            <div>
+                <div class="dashboard-heading-title">PAYROLL DASHBOARD</div>
+                <div class="dashboard-heading-sub">AILYN HOUSE PROJECT | AILYN HOUSE</div>
+            </div>
+        </div>
+        <div class="dashboard-welcome">Payroll control center for labor accounts, payroll expenses, and final payouts.</div>
+    """, unsafe_allow_html=True)
     st.caption("A focused view of labor, payroll expenses, and the current payout.")
     p1, p2, p3, p4 = st.columns(4)
     with p1:
@@ -3527,7 +3402,11 @@ elif view == "payroll_dashboard":
     with left:
         st.subheader("Role summary")
         role_rows = []
-        for role in FULL_DAY_RATES:
+        payroll_roles = list(dict.fromkeys([
+            *FULL_DAY_RATES,
+            *(str(record.get("role")) for record in st.session_state.labor_records if record.get("role")),
+        ]))
+        for role in payroll_roles:
             role_records = [r for r in st.session_state.labor_records if r.get("role") == role]
             role_rows.append({
                 "Role": role,
@@ -3558,600 +3437,186 @@ elif view == "payroll_dashboard":
         st.info("No labor accounts yet. Add the first worker from Payroll Operations.")
 
 elif view == "planner_input":
-    render_module_shell("Planner Input", "Select the exact day from the monthly calendar, then enter the work details and save the work task.", "PLANNER")
-
-    # ================================================================
-    # ACCURATE MONTHLY CALENDAR
-    # Uses Python's calendar.monthrange/monthcalendar with Sunday as
-    # the first column. Every cell is a real date in the displayed month.
-    # ================================================================
-    import calendar as _calendar
-    from datetime import date as _date, timedelta as _timedelta
-
-    if "planner_calendar_year" not in st.session_state or "planner_calendar_month_num" not in st.session_state:
-        _today = manila_now().date()
-        st.session_state.planner_calendar_year = _today.year
-        st.session_state.planner_calendar_month_num = _today.month
-
-    if "planner_selected_date" not in st.session_state:
-        st.session_state.planner_selected_date = manila_now().date()
-
-    cal_year = int(st.session_state.planner_calendar_year)
-    cal_month = int(st.session_state.planner_calendar_month_num)
-
-    # Existing saved task dates
-    task_dates = {}
-    for task in st.session_state.get("planner_tasks", []):
-        try:
-            task_date = _date.fromisoformat(str(task.get("date_obj", "")))
-            task_dates.setdefault(task_date, []).append(task)
-        except (TypeError, ValueError):
-            pass
-
-    # ------------------------------------------------
-    # Month navigation — arithmetic is date-safe.
-    # ------------------------------------------------
-    nav_prev, nav_title, nav_next = st.columns([1, 6, 1])
-
-    with nav_prev:
-        if st.button("‹", key="planner_prev_month", use_container_width=True):
-            if cal_month == 1:
-                cal_year -= 1
-                cal_month = 12
-            else:
-                cal_month -= 1
-            st.session_state.planner_calendar_year = cal_year
-            st.session_state.planner_calendar_month_num = cal_month
-            st.rerun()
-
-    with nav_title:
-        st.markdown(
-            f"<div class='planner-month-title'>{_calendar.month_name[cal_month]} {cal_year}</div>",
-            unsafe_allow_html=True,
-        )
-
-    with nav_next:
-        if st.button("›", key="planner_next_month", use_container_width=True):
-            if cal_month == 12:
-                cal_year += 1
-                cal_month = 1
-            else:
-                cal_month += 1
-            st.session_state.planner_calendar_year = cal_year
-            st.session_state.planner_calendar_month_num = cal_month
-            st.rerun()
-
-    today = manila_now().date()
-
-    if st.button("TODAY", key="planner_today", use_container_width=True):
-        st.session_state.planner_calendar_year = today.year
-        st.session_state.planner_calendar_month_num = today.month
-        st.session_state.planner_selected_date = today
-        st.rerun()
-
-    # Normalize selected date so stale session-state values cannot create
-    # an invalid calendar selection.
-    try:
-        selected_date = st.session_state.planner_selected_date
-        if not isinstance(selected_date, _date):
-            selected_date = _date.fromisoformat(str(selected_date))
-    except (TypeError, ValueError):
-        selected_date = today
-        st.session_state.planner_selected_date = today
-
-    st.markdown(
-        f"<div class='planner-selected-info'>"
-        f"📅 SELECTED DATE: {selected_date.strftime('%A, %B %d, %Y')}"
-        f"</div>",
-        unsafe_allow_html=True,
-    )
-
-    # Calendar layout.
-    # Calendar(..., firstweekday=SUNDAY) returns complete Sunday-first weeks.
-    sunday_first_calendar = _calendar.Calendar(firstweekday=_calendar.SUNDAY)
-    month_weeks = sunday_first_calendar.monthdayscalendar(cal_year, cal_month)
-
-    # Integrity checks prevent silent off-by-one errors.
-    expected_days = _calendar.monthrange(cal_year, cal_month)[1]
-    rendered_days = [d for week in month_weeks for d in week if d]
-    if rendered_days != list(range(1, expected_days + 1)):
-        raise RuntimeError(
-            f"Planner calendar error for {cal_year}-{cal_month:02d}: "
-            f"rendered days do not match 1..{expected_days}."
-        )
-    if any(len(week) != 7 for week in month_weeks):
-        raise RuntimeError(
-            f"Planner calendar error for {cal_year}-{cal_month:02d}: "
-            "a calendar week does not contain exactly 7 columns."
-        )
-
-    st.markdown("""
-    <style>
-    .planner-calendar-wrap {
-        border: 1px solid rgba(163,255,194,.16);
-        border-radius: 16px;
-        overflow: hidden;
-        background: rgba(5,29,17,.55);
-        margin-bottom: 16px;
-    }
-    .planner-week-header {
-        display: grid;
-        grid-template-columns: repeat(7, minmax(0, 1fr));
-        background: rgba(114,247,176,.08);
-        border-bottom: 1px solid rgba(163,255,194,.12);
-    }
-    .planner-week-header div {
-        text-align: center;
-        padding: 10px 2px;
-        font-size: 10px;
-        font-weight: 900;
-        color: #a8dcb8;
-    }
-    .planner-empty-cell {
-        height: 66px;
-    }
-    .planner-day-cell {
-        min-height: 66px;
-        padding: 3px;
-    }
-    .planner-day-number {
-        font-size: 15px;
-        font-weight: 900;
-        line-height: 1;
-    }
-    .planner-day-dot {
-        font-size: 13px;
-        line-height: 1;
-        color: #72f7b0;
-    }
-    @media(max-width:600px) {
-        .planner-week-header div {
-            font-size: 8px;
-            padding: 8px 1px;
-        }
-        .planner-empty-cell,
-        .planner-day-cell {
-            min-height: 54px;
-            height: 54px;
-        }
-        .planner-day-number {
-            font-size: 13px;
-        }
-    }
-    </style>
-    """, unsafe_allow_html=True)
-
-    # Header is separate from the date buttons so the actual date grid
-    # always has exactly seven columns.
-    st.markdown(
-        "<div class='planner-calendar-wrap'>"
-        "<div class='planner-week-header'>"
-        "<div>SUN</div><div>MON</div><div>TUE</div><div>WED</div>"
-        "<div>THU</div><div>FRI</div><div>SAT</div>"
-        "</div></div>",
-        unsafe_allow_html=True,
-    )
-
-    # IMPORTANT: do not use a flat list of dates here.
-    # Render each real calendar week as exactly seven Streamlit columns.
-    for week_idx, week in enumerate(month_weeks):
-        cols = st.columns(7, gap="small")
-
-        for weekday_idx, day_num in enumerate(week):
-            with cols[weekday_idx]:
-                if day_num == 0:
-                    st.markdown(
-                        "<div class='planner-empty-cell'></div>",
-                        unsafe_allow_html=True,
-                    )
-                    continue
-
-                cell_date = _date(cal_year, cal_month, day_num)
-                is_selected = cell_date == selected_date
-                is_today = cell_date == today
-                has_task = cell_date in task_dates
-
-                # Keep the button label simple and deterministic.
-                if is_today and has_task:
-                    label = f"🟢 {day_num}\n•"
-                elif is_today:
-                    label = f"🟢 {day_num}"
-                elif has_task:
-                    label = f"{day_num}\n•"
-                else:
-                    label = str(day_num)
-
-                if st.button(
-                    label,
-                    key=f"planner_calendar_{cal_year}_{cal_month}_{week_idx}_{weekday_idx}_{day_num}",
-                    use_container_width=True,
-                ):
-                    st.session_state.planner_selected_date = cell_date
-                    st.rerun()
-
-    # Show the selected day and any existing tasks on that day.
-    selected_tasks = task_dates.get(selected_date, [])
-    if selected_tasks:
-        st.markdown("#### 📌 TASKS ALREADY SCHEDULED FOR THIS DATE")
-        for task in selected_tasks:
-            st.info(
-                f"{task.get('name', 'WORK TASK')} — "
-                f"{task.get('phase', 'Phase')} — "
-                f"{task.get('status', 'Not Started')}"
-            )
-
+    st.subheader("📅 PLANNER INPUT - ADD NEW WORK TASK")
+    st.caption("Select date details, work description, and optional photo proofs.")
     with st.form(key="planner_input_form", clear_on_submit=True):
-        work_description = st.text_area(
-            "Work Description / Task Details",
-            placeholder="Describe construction work..."
-        )
-        phase = st.selectbox(
-            "Construction Phase",
-            [
-                "Site Prep",
-                "Foundation",
-                "Framing & Masonry",
-                "Roofing",
-                "Plumbing & Electrical",
-                "Finishing",
-                "Inspection",
-            ],
-        )
-        uploaded_files = st.file_uploader(
-            "Upload Work Proof Photos (Optional)",
-            type=["jpg", "jpeg", "png"],
-            accept_multiple_files=True,
-        )
-        submitted = st.form_submit_button(
-            "💾 SAVE TASK TO PERMANENT STORAGE"
-        )
+        selected_date = st.date_input("Select Day, Month, and Year", value=manila_now().date())
+        work_description = st.text_area("Work Description / Task Details", placeholder="Describe construction work...")
+        phase = st.selectbox("Construction Phase",
+                             ["Site Prep", "Foundation", "Framing & Masonry", "Roofing", "Plumbing & Electrical",
+                              "Finishing", "Inspection"])
+        uploaded_files = st.file_uploader("Upload Work Proof Photos (Optional)", type=["jpg", "jpeg", "png"],
+                                          accept_multiple_files=True)
+        submitted = st.form_submit_button("💾 SAVE TASK TO PERMANENT STORAGE")
 
         if submitted:
             if work_description.strip():
                 photos_base64 = []
-
                 if uploaded_files:
                     for file in uploaded_files:
                         bytes_data = file.read()
-                        b64_str = base64.b64encode(bytes_data).decode("utf-8")
+                        b64_str = base64.b64encode(bytes_data).decode('utf-8')
                         mime_type = file.type or "image/png"
-                        photos_base64.append(
-                            f"data:{mime_type};base64,{b64_str}"
-                        )
-
-                # Save the exact selected calendar date.
+                        photos_base64.append(f"data:{mime_type};base64,{b64_str}")
                 st.session_state.planner_tasks.append({
                     "id": str(time.time()),
                     "day": selected_date.strftime("%d"),
                     "month": selected_date.strftime("%B"),
                     "year": selected_date.strftime("%Y"),
-                    "date_obj": selected_date.isoformat(),
+                    "date_obj": selected_date.strftime("%Y-%m-%d"),
                     "name": work_description.upper(),
                     "phase": phase,
                     "status": "Not Started",
-                    "photos": photos_base64,
+                    "photos": photos_base64
                 })
-
                 persist_state()
-                st.success(
-                    f"Task saved for {selected_date.strftime('%A, %B %d, %Y')}!"
-                )
+                st.success("Task & photos permanently saved!")
                 st.rerun()
             else:
                 st.warning("Please fill in the work description.")
+    st.divider()
+    if st.button("🏠 RETURN TO HOME", use_container_width=True):
+        set_view("home")
+
+elif view == "planner_output":
+    st.subheader("📋 PLANNER OUTPUT - WORK SCHEDULE CALENDAR")
+    tasks = st.session_state.planner_tasks
+    if not tasks:
+        st.info("No work scheduled yet.")
+    else:
+        sorted_tasks = sorted(tasks, key=lambda x: x.get('date_obj', ''))
+        cards_html = '<div class="cal-grid">'
+        for t in sorted_tasks:
+            badge_class = "badge-completed" if t['status'] == "Completed" else "badge-inprogress" if t[
+                                                                                                         'status'] == "In Progress" else "badge-notstarted"
+            photos_thumbs = ""
+            if t.get("photos"):
+                photos_thumbs = '<div class="card-photos">'
+                for p in t["photos"]:
+                    photos_thumbs += f'<img src="{p}" class="card-photo-thumb" />'
+                photos_thumbs += '</div>'
+            cards_html += f"""
+            <div class="cal-card">
+              <div class="cal-date-badge">📅 {t.get("month", "")} {t.get("day", "")}, {t.get("year", "")}</div>
+              <div class="cal-task-title">{t["name"]}</div>
+              <div class="cal-phase">🛠️ Phase: {t["phase"]}</div>
+              <div class="cal-status-tag {badge_class}">{t["status"]}</div>
+              {photos_thumbs}
+            </div>
+            """
+        cards_html += '</div>'
+        st.markdown(cards_html, unsafe_allow_html=True)
+        st.markdown("<div class='sidebar-gap'></div>", unsafe_allow_html=True)
+        st.subheader("⚙️ Task Management & Photo Inspector")
+
+        for t in list(sorted_tasks):
+            with st.expander(f"📌 {t.get('month')} {t.get('day')}, {t.get('year')} - {t['name']} ({t['status']})",
+                             expanded=False):
+                col1, col2 = st.columns([2, 1])
+                with col1:
+                    new_status = st.selectbox("Update Status", ["Not Started", "In Progress", "Completed"],
+                                              index=["Not Started", "In Progress", "Completed"].index(t["status"]),
+                                              key=f"st_{t['id']}")
+                    if new_status != t["status"]:
+                        t["status"] = new_status
+                        persist_state()
+                        st.rerun()
+                with col2:
+                    if st.button("❌ Delete Task", key=f"del_{t['id']}", use_container_width=True):
+                        st.session_state.planner_tasks = [x for x in st.session_state.planner_tasks if
+                                                          x["id"] != t["id"]]
+                        persist_state()
+                        st.rerun()
+
+                st.markdown("#### 📸 Work Gallery for this Day")
+                if t.get("photos"):
+                    img_cols = st.columns(4)
+                    for idx, photo_b64 in enumerate(list(t["photos"])):
+                        with img_cols[idx % 4]:
+                            st.image(photo_b64, use_container_width=True)
+                            if st.button("🗑️ Remove Photo", key=f"del_img_{t['id']}_{idx}", use_container_width=True):
+                                t["photos"].pop(idx)
+                                persist_state()
+                                st.rerun()
+                else:
+                    st.info("No photo proof attached for this work day yet.")
+
+                st.markdown("##### Add More Photos")
+                with st.form(key=f"upload_form_{t['id']}", clear_on_submit=True):
+                    new_photos = st.file_uploader("Upload Additional Photos", type=["jpg", "jpeg", "png"],
+                                                  accept_multiple_files=True, key=f"up_{t['id']}")
+                    add_photos_btn = st.form_submit_button("📤 UPLOAD PHOTOS")
+                    if add_photos_btn and new_photos:
+                        if "photos" not in t or t["photos"] is None:
+                            t["photos"] = []
+                        for f in new_photos:
+                            bytes_data = f.read()
+                            b64_str = base64.b64encode(bytes_data).decode('utf-8')
+                            mime_type = f.type or "image/png"
+                            t["photos"].append(f"data:{mime_type};base64,{b64_str}")
+                        persist_state()
+                        st.success("Photos added successfully!")
+                        st.rerun()
 
     st.divider()
     if st.button("🏠 RETURN TO HOME", use_container_width=True):
         set_view("home")
 
-
-elif view == "planner_output":
-    render_module_shell("Planner Output", "View the full monthly project calendar with scheduled work tasks and export it as a PNG image.", "PLANNER")
-
-    import calendar as _calendar
-    from datetime import date as _date
-
-    # Use the same exact Sunday-first Gregorian calculation as Planner Input.
-    if "planner_output_year" not in st.session_state or "planner_output_month" not in st.session_state:
-        _today = manila_now().date()
-        st.session_state.planner_output_year = _today.year
-        st.session_state.planner_output_month = _today.month
-
-    output_year = int(st.session_state.planner_output_year)
-    output_month = int(st.session_state.planner_output_month)
-
-    nav_prev, nav_title, nav_next = st.columns([1, 6, 1])
-    with nav_prev:
-        if st.button("‹", key="planner_output_prev_month", use_container_width=True):
-            if output_month == 1:
-                output_year -= 1
-                output_month = 12
-            else:
-                output_month -= 1
-            st.session_state.planner_output_year = output_year
-            st.session_state.planner_output_month = output_month
-            st.rerun()
-
-    with nav_title:
-        st.markdown(
-            f"<div class='planner-month-title'>{_calendar.month_name[output_month]} {output_year}</div>",
-            unsafe_allow_html=True,
-        )
-
-    with nav_next:
-        if st.button("›", key="planner_output_next_month", use_container_width=True):
-            if output_month == 12:
-                output_year += 1
-                output_month = 1
-            else:
-                output_month += 1
-            st.session_state.planner_output_year = output_year
-            st.session_state.planner_output_month = output_month
-            st.rerun()
-
-    if st.button("TODAY", key="planner_output_today", use_container_width=True):
-        today = manila_now().date()
-        st.session_state.planner_output_year = today.year
-        st.session_state.planner_output_month = today.month
-        st.rerun()
-
-    output_calendar = _calendar.Calendar(
-        firstweekday=_calendar.SUNDAY
-    ).monthdayscalendar(output_year, output_month)
-
-    # Build task lookup using the exact stored ISO date.
-    output_tasks = {}
-    for task in st.session_state.get("planner_tasks", []):
-        try:
-            task_date = _date.fromisoformat(str(task.get("date_obj", "")))
-            output_tasks.setdefault(task_date, []).append(task)
-        except (TypeError, ValueError):
-            continue
-
-    # ---------------------------------------------------------------
-    # Full calendar HTML used for BOTH on-screen display and PNG export.
-    # This avoids downloading only the visible Streamlit widgets.
-    # ---------------------------------------------------------------
-    import html as _html
-
-    today = manila_now().date()
-    month_name = _calendar.month_name[output_month]
-
-    rows_html = ""
-    for week in output_calendar:
-        rows_html += "<tr>"
-        for day_num in week:
-            if day_num == 0:
-                rows_html += "<td class='empty'></td>"
-                continue
-
-            cell_date = _date(output_year, output_month, day_num)
-            tasks = output_tasks.get(cell_date, [])
-            is_today = cell_date == today
-
-            task_html = ""
-            for task in tasks:
-                status = task.get("status", "Not Started")
-                phase = task.get("phase", "")
-                name = _html.escape(str(task.get("name", "WORK TASK")))
-                phase = _html.escape(str(phase))
-                status = _html.escape(str(status))
-
-                task_html += (
-                    f"<div class='task'>"
-                    f"<b>{name}</b>"
-                    f"<span>{phase}</span>"
-                    f"<small>{status}</small>"
-                    f"</div>"
-                )
-
-            today_class = " today" if is_today else ""
-            rows_html += (
-                f"<td class='day{today_class}'>"
-                f"<div class='day-number'>{day_num}</div>"
-                f"{task_html}"
-                f"</td>"
-            )
-        rows_html += "</tr>"
-
-    full_calendar_html = f"""
-    <div id="planner-export-calendar" class="export-calendar">
-      <div class="export-header">
-        <div class="export-brand">PROJECT WORK PLANNER</div>
-        <div class="export-title">{_html.escape(month_name)} {output_year}</div>
-        <div class="export-subtitle">FULL MONTH WORK SCHEDULE</div>
-      </div>
-      <table>
-        <thead>
-          <tr>
-            <th>SUNDAY</th>
-            <th>MONDAY</th>
-            <th>TUESDAY</th>
-            <th>WEDNESDAY</th>
-            <th>THURSDAY</th>
-            <th>FRIDAY</th>
-            <th>SATURDAY</th>
-          </tr>
-        </thead>
-        <tbody>{rows_html}</tbody>
-      </table>
-      <div class="export-footer">
-        Generated {today.strftime("%B %d, %Y")} • Scheduled tasks: {sum(len(v) for v in output_tasks.values())}
-      </div>
-    </div>
-    """
+elif view == "material_dashboard":
+    material_records = [r for r in st.session_state.records if r.get("type") == "material"]
+    material_total = sum(float(r.get("amount", 0) or 0) for r in material_records) - total_excess()
+    material_qty = sum(float(r.get("qty", 0) or 0) for r in material_records)
+    suppliers = len({str(r.get("sender") or r.get("supplier") or "").strip() for r in material_records if str(r.get("sender") or r.get("supplier") or "").strip()})
 
     st.markdown("""
-    <style>
-    .export-calendar {
-        width: 100%;
-        box-sizing: border-box;
-        background: #071b11;
-        color: #effff3;
-        border: 1px solid #28543b;
-        border-radius: 18px;
-        overflow: hidden;
-        font-family: Arial, Helvetica, sans-serif;
-    }
-    .export-header {
-        padding: 22px 24px 18px;
-        text-align: center;
-        border-bottom: 1px solid #28543b;
-    }
-    .export-brand {
-        font-size: 12px;
-        font-weight: 900;
-        letter-spacing: .16em;
-        color: #72f7b0;
-    }
-    .export-title {
-        font-size: 30px;
-        font-weight: 900;
-        margin-top: 5px;
-    }
-    .export-subtitle {
-        font-size: 11px;
-        letter-spacing: .12em;
-        color: #9bc8a9;
-        margin-top: 4px;
-    }
-    .export-calendar table {
-        width: 100%;
-        border-collapse: collapse;
-        table-layout: fixed;
-    }
-    .export-calendar th {
-        height: 38px;
-        padding: 5px;
-        text-align: center;
-        font-size: 10px;
-        letter-spacing: .08em;
-        color: #9bc8a9;
-        background: #0c2718;
-        border: 1px solid #28543b;
-    }
-    .export-calendar td {
-        vertical-align: top;
-        border: 1px solid #28543b;
-    }
-    .export-calendar td.day {
-        height: 115px;
-        padding: 7px;
-        background: #071b11;
-    }
-    .export-calendar td.empty {
-        height: 115px;
-        background: #04120b;
-    }
-    .day-number {
-        font-size: 17px;
-        font-weight: 900;
-        margin-bottom: 6px;
-    }
-    .today .day-number {
-        display: inline-block;
-        padding: 4px 8px;
-        border-radius: 999px;
-        background: #72f7b0;
-        color: #06150c;
-    }
-    .task {
-        margin-top: 5px;
-        padding: 6px;
-        border-left: 3px solid #72f7b0;
-        background: #0d2b1b;
-        border-radius: 5px;
-        overflow: hidden;
-    }
-    .task b {
-        display: block;
-        font-size: 10px;
-        line-height: 1.2;
-    }
-    .task span,
-    .task small {
-        display: block;
-        margin-top: 2px;
-        font-size: 8px;
-        color: #a9cbb3;
-    }
-    .export-footer {
-        padding: 10px 16px;
-        font-size: 9px;
-        color: #83a78e;
-        text-align: right;
-        border-top: 1px solid #28543b;
-    }
-    </style>
+    <div class="dashboard-heading">
+      <div>
+        <div class="dashboard-heading-title">RAW MATERIAL DASHBOARD</div>
+        <div class="dashboard-heading-sub">MATERIAL COST • QUANTITY • SUPPLIER MONITORING</div>
+      </div>
+    </div>
     """, unsafe_allow_html=True)
 
-    st.components.v1.html(
-        f"""
-        <!doctype html>
-        <html>
-        <head>
-          <meta charset="utf-8">
-          <meta name="viewport" content="width=device-width, initial-scale=1">
-          <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
-        </head>
-        <body style="margin:0;background:transparent;">
-          {full_calendar_html}
-          <div style="padding:12px 0;text-align:center;">
-            <button id="downloadPlannerCalendar"
-              style="border:0;border-radius:10px;padding:11px 18px;
-                     font-weight:900;cursor:pointer;background:#72f7b0;color:#06150c;">
-              ⬇ DOWNLOAD FULL CALENDAR IMAGE
-            </button>
-          </div>
-          <script>
-            document.getElementById("downloadPlannerCalendar").addEventListener("click", async function () {{
-              const calendar = document.getElementById("planner-export-calendar");
-              const canvas = await html2canvas(calendar, {{
-                scale: 2,
-                useCORS: true,
-                backgroundColor: "#071b11",
-                logging: false
-              }});
-              const link = document.createElement("a");
-              link.download = "planner-calendar-{output_year}-{output_month:02d}.png";
-              link.href = canvas.toDataURL("image/png");
-              link.click();
-            }});
-          </script>
-        </body>
-        </html>
-        """,
-        height=760,
-        scrolling=False,
-    )
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("TOTAL MATERIAL COST", f"₱{material_total:,.2f}")
+    with c2:
+        st.metric("TOTAL QUANTITY", f"{material_qty:,.2f}")
+    with c3:
+        st.metric("SUPPLIERS", str(suppliers))
 
-    st.markdown("### 📋 SCHEDULED TASKS")
-    if output_tasks:
-        visible = []
-        for task_date in sorted(output_tasks):
-            for task in output_tasks[task_date]:
-                visible.append({
-                    "Date": task_date.strftime("%B %d, %Y"),
-                    "Work": task.get("name", ""),
-                    "Phase": task.get("phase", ""),
-                    "Status": task.get("status", "Not Started"),
-                })
-        st.dataframe(visible, use_container_width=True, hide_index=True)
+    if material_records:
+        rows = []
+        for r in reversed(material_records):
+            rows.append({
+                "Date": r.get("date") or r.get("timestamp") or "",
+                "Material": r.get("name", ""),
+                "Supplier": r.get("sender") or r.get("supplier") or "Not set",
+                "Qty": r.get("qty", 0),
+                "Unit Price": r.get("price", 0),
+                "Delivery": r.get("delivery", 0),
+                "Amount": r.get("amount", 0),
+            })
+        st.dataframe(rows, use_container_width=True, hide_index=True)
     else:
-        st.info("No scheduled tasks yet.")
+        st.info("No raw material records yet. Use MATERIAL ENTRY from the sidebar to add materials.")
 
+    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+    if st.button("➕ MATERIAL ENTRY", use_container_width=True, key="material_dashboard_entry"):
+        set_view("material")
 
 elif view == "material":
-    render_module_shell("Material Entry", "Capture incoming materials, unit prices, delivery, and sender details for the active project record.", "OPERATIONS")
+    st.subheader("➕ ADD MATERIAL")
     with st.form(key="material_form", clear_on_submit=True):
         name = st.text_input("Material Name", key="material_name")
+        purchase_date = st.date_input("Purchase Date", value=manila_now().date(), key="material_purchase_date")
         price = st.number_input("Price", min_value=0.01, value=None, placeholder="0.00", key="material_price")
         qty = st.number_input("Qty", min_value=1, value=None, placeholder="1", key="material_qty")
         delivery = st.number_input("Delivery", min_value=0.0, value=None, placeholder="0.00", key="material_delivery")
         sender = st.selectbox("Sender", ["Garr", "Aily"])
         submitted = st.form_submit_button(label="SAVE MATERIAL")
         if submitted:
-            ok = add_tx(name, price, qty, delivery or 0.0, "material", sender)
+            ok = add_tx(name, price, qty, delivery or 0.0, "material", sender, record_date=purchase_date)
             if ok:
                 st.success("Saved! Ready for next order.")
                 st.rerun()
@@ -4162,7 +3627,7 @@ elif view == "material":
         set_view("home")
 
 elif view == "expense":
-    render_module_shell("Construction Expense", "Log project costs clearly and keep every expense tied to a build activity and sender.", "FINANCE")
+    st.subheader("➕ ADD CONSTRUCTION EXPENSE")
     with st.form(key="expense_form", clear_on_submit=True):
         name = st.text_input("Expense Name")
         amount = st.number_input("Amount", min_value=0.01, value=None, placeholder="0.00")
@@ -4180,7 +3645,7 @@ elif view == "expense":
         set_view("home")
 
 elif view == "excess":
-    render_module_shell("Excess / Deposit Entry", "Record surplus funds, deposits, or adjustments that should be separated from normal project costs.", "FINANCE")
+    st.subheader("➕ ADD EXCESS MONEY")
     with st.form(key="excess_form", clear_on_submit=True):
         name = st.text_input("Reason")
         amount = st.number_input("Amount", min_value=0.01, value=None, placeholder="0.00")
@@ -4210,7 +3675,7 @@ elif view == "excess":
         set_view("home")
 
 elif view == "ledger":
-    render_module_shell("Construction Ledger", "Review every project record in one place, search instantly, and update entries without leaving the ledger flow.", "LEDGER")
+    st.subheader("📖 CONSTRUCTION LEDGER")
     ledger_query = st.text_input("Search construction entries", key="construction_ledger_search").strip().lower()
     visible_records = [
         record for record in st.session_state.records
@@ -4289,28 +3754,55 @@ elif view == "ledger":
                 st.rerun()
 
 elif view == "add_labor":
-    render_module_shell("Labor Account", "Create a labor entry quickly using role-based presets and keep payroll calculations accurate.", "PAYROLL")
-    st.caption("Click a role button below to fast-select the work role for the new account.")
+    st.subheader("👷 ADD LABOR ACCOUNT")
+    st.caption("Choose a standard role or select CUSTOM to enter a labor type and daily price:")
 
-    col_r1, col_r2, col_r3 = st.columns(3)
+    col_r1, col_r2, col_r3, col_r4, col_custom = st.columns(5)
     with col_r1:
-        if st.button("LABOR\n₱500 / day", use_container_width=True):
+        if st.button(f"LABOR\n₱{FULL_DAY_RATES['Labor']:,.0f} / day", use_container_width=True):
             st.session_state.selected_role = "Labor"
     with col_r2:
-        if st.button("SKILL\n₱650 / day", use_container_width=True):
+        if st.button(f"SKILL\n₱{FULL_DAY_RATES['Skill']:,.0f} / day", use_container_width=True):
             st.session_state.selected_role = "Skill"
     with col_r3:
-        if st.button("FORMAN\n₱800 / day", use_container_width=True):
+        if st.button(f"FORMAN\n₱{FULL_DAY_RATES['Forman']:,.0f} / day", use_container_width=True):
             st.session_state.selected_role = "Forman"
 
+    with col_r4:
+        hed_rate = FULL_DAY_RATES.get("HED LABOR")
+        hed_rate_label = f"₱{hed_rate:,.0f}" if hed_rate is not None else "ENTER RATE"
+        if st.button(f"HED LABOR\n{hed_rate_label} / day", use_container_width=True):
+            st.session_state.selected_role = "HED LABOR"
+    with col_custom:
+        if st.button("CUSTOM\nSet type and price", use_container_width=True):
+            st.session_state.selected_role = "__CUSTOM_ROLE__"
+
     active_role = st.session_state.selected_role
+    is_custom_role = active_role == "__CUSTOM_ROLE__"
+    requires_custom_rate = is_custom_role or active_role == "HED LABOR"
+    displayed_role = "CUSTOM" if is_custom_role else active_role
+    displayed_rate = "Enter below" if requires_custom_rate else f"₱{FULL_DAY_RATES[active_role]:,.2f}/day"
     st.markdown(f"""
     <div class="pos-role-box">
-      CURRENTLY SELECTED ROLE: <span style="color:#4ade80; font-size:20px;">{active_role.upper()}</span> (₱{FULL_DAY_RATES[active_role]:,.2f}/day)
+      CURRENTLY SELECTED ROLE: <span style="color:#4ade80; font-size:20px;">{displayed_role.upper()}</span> ({displayed_rate})
     </div>
     """, unsafe_allow_html=True)
 
     with st.form(key="labor_input_form", clear_on_submit=True):
+        if requires_custom_rate:
+            custom_role_name = (
+                st.text_input("Custom Labor Type", placeholder="Enter work type")
+                if is_custom_role else active_role
+            )
+            custom_daily_rate = st.number_input(
+                "Labor Price (PHP/day)",
+                min_value=0.01,
+                value=None,
+                placeholder="Enter daily price",
+            )
+        else:
+            custom_role_name = ""
+            custom_daily_rate = None
         name = st.text_input("Worker Name")
         days = st.number_input("Worked Days / Point", min_value=0.0, value=None, placeholder="Enter days")
         ca = st.number_input("Cash Advance (C.A.)", min_value=0.0, value=None, placeholder="0.00")
@@ -4319,16 +3811,21 @@ elif view == "add_labor":
         if submitted:
             d = float(days or 0.0)
             c = float(ca or 0.0)
-            if d > 0 and name.strip():
-                gross_pay, full_pay, partial_pay = calculate_labor_pay(d, active_role)
+            role_name = custom_role_name.strip().upper() if is_custom_role else active_role
+            rate = (
+                float(custom_daily_rate)
+                if requires_custom_rate and custom_daily_rate is not None
+                else FULL_DAY_RATES.get(active_role, 0.0)
+            )
+            if d > 0 and name.strip() and role_name and rate > 0:
+                gross_pay, full_pay, partial_pay = calculate_labor_pay(d, role_name, rate)
                 net = gross_pay - c
-                rate = FULL_DAY_RATES.get(active_role, 0.0)
                 st.session_state.labor_records.append({
                     "id": str(uuid.uuid4()),
                     "date": manila_now().strftime("%b %d, %Y"),
                     "recorded_at": manila_now().isoformat(),
                     "name": name.upper(),
-                    "role": active_role,
+                    "role": role_name,
                     "days": d,
                     "rate": rate,
                     "gross_pay": gross_pay,
@@ -4336,13 +3833,13 @@ elif view == "add_labor":
                     "net": net
                 })
                 persist_state()
-                st.success(f"Record for {name.upper()} ({active_role}, {d:.1f} day) added. Net: PHP {net:,.2f}")
+                st.success(f"Record for {name.upper()} ({role_name}, {d:.1f} day) added. Net: PHP {net:,.2f}")
                 st.rerun()
             else:
                 st.warning("Please enter a worker name and valid worked days/points.")
 
 elif view == "add_payroll_expense":
-    render_module_shell("Payroll Expense", "Track extra payroll costs such as support expenses, additional payouts, and operational charges.", "PAYROLL")
+    st.subheader("➕ ADD PAYROLL EXPENSE")
     with st.form(key="payroll_expense_form", clear_on_submit=True):
         desc = st.text_input("Expense Description")
         amt = st.number_input("Amount", min_value=0.01, value=None, placeholder="0.00")
@@ -4363,7 +3860,7 @@ elif view == "add_payroll_expense":
                 st.warning("Please enter a valid amount.")
 
 elif view == "payroll_remaining":
-    render_module_shell("Remaining Money", "Set the amount still left after payroll calculations so the dashboard and reports remain accurate.", "PAYROLL")
+    st.subheader("⚙️ SET REMAINING MONEY")
     res = st.number_input("Leftover/Remaining money to subtract from total", min_value=0.0, value=None,
                           placeholder="0.00")
     if st.button("APPLY REMAINING MONEY", use_container_width=True):
@@ -4376,7 +3873,7 @@ elif view == "payroll_remaining":
             st.warning("Please enter an amount.")
 
 elif view == "payroll_ledger":
-    render_module_shell("Labor & Payroll Ledger", "Review labor accounts and payroll expense entries together, then edit or remove items when needed.", "LEDGER")
+    st.subheader("📋 LABOR & PAYROLL LEDGER")
     payroll_query = st.text_input("Search payroll entries", key="payroll_ledger_search").strip().lower()
     visible_labor = [record for record in st.session_state.labor_records if not payroll_query or payroll_query in str(record).lower()]
     visible_payroll_expenses = [record for record in st.session_state.payroll_expenses if not payroll_query or payroll_query in str(record).lower()]
@@ -4390,11 +3887,29 @@ elif view == "payroll_ledger":
             if st.session_state.editing_labor_index == i:
                 with st.form(key=f"edit_labor_form_{i}"):
                     edited_worker = st.text_input("Worker Name", value=r.get("name", ""))
+                    role_options = list(dict.fromkeys([
+                        *FULL_DAY_RATES,
+                        *(str(record.get("role")) for record in st.session_state.labor_records
+                          if record.get("role")),
+                    ]))
                     edited_role = st.selectbox(
                         "Role",
-                        list(FULL_DAY_RATES),
-                        index=list(FULL_DAY_RATES).index(r.get("role", "Labor")),
+                        role_options,
+                        index=role_options.index(r.get("role", "Labor")),
                     )
+                    if edited_role in FULL_DAY_RATES:
+                        edited_rate = FULL_DAY_RATES[edited_role]
+                    else:
+                        existing_rate = next(
+                            (float(record["rate"]) for record in st.session_state.labor_records
+                             if record.get("role") == edited_role and record.get("rate") is not None),
+                            float(r.get("rate", 0.0)),
+                        )
+                        edited_rate = st.number_input(
+                            "Labor Price (PHP/day)",
+                            min_value=0.01,
+                            value=existing_rate,
+                        )
                     edited_days = st.number_input(
                         "Worked Days / Point",
                         min_value=0.0,
@@ -4408,13 +3923,15 @@ elif view == "payroll_ledger":
                     save_labor = st.form_submit_button("SAVE EDIT")
                     cancel_labor = st.form_submit_button("CANCEL")
                 if save_labor:
-                    if edited_worker.strip() and edited_days > 0:
-                        gross_pay, full_pay, partial_pay = calculate_labor_pay(float(edited_days), edited_role)
+                    if edited_worker.strip() and edited_days > 0 and edited_rate > 0:
+                        gross_pay, full_pay, partial_pay = calculate_labor_pay(
+                            float(edited_days), edited_role, edited_rate
+                        )
                         r.update({
                             "name": edited_worker.strip().upper(),
                             "role": edited_role,
                             "days": float(edited_days),
-                            "rate": FULL_DAY_RATES[edited_role],
+                            "rate": float(edited_rate),
                             "gross_pay": gross_pay,
                             "full_pay": full_pay,
                             "partial_pay": partial_pay,
@@ -4490,7 +4007,7 @@ elif view == "payroll_ledger":
                 st.rerun()
 
 elif view == "export":
-    render_module_shell("Construction Report", "Prepare a polished construction receipt with saved title, printable layout, and export-ready delivery.", "REPORTS")
+    st.subheader("📄 EXPORT CONSTRUCTION REPORT")
     receipt_title = st.text_input("Receipt Title", value="OFFICIAL RECEIPT",
                                   placeholder="Enter a title for this receipt")
     html = build_html_report(st.session_state.records, st.session_state.budget, custom_title=receipt_title)
@@ -4516,7 +4033,7 @@ elif view == "export":
         set_view("receipt_archive")
 
 elif view == "payroll_export":
-    render_module_shell("Payroll Report", "Generate a clean labor and payroll summary, save it to the archive, and send it when needed.", "REPORTS")
+    st.subheader("📄 EXPORT PAYROLL REPORT")
     receipt_title = st.text_input("Receipt Title", value="OFFICIAL LABOR TALLY",
                                   placeholder="Enter a title for this receipt")
     html, total = generate_payroll_html(
@@ -4565,7 +4082,7 @@ elif view == "payroll_export":
             st.error(f"❌ EMAIL FAILED: {e}")
 
 elif view == "receipt_archive":
-    render_module_shell("Receipt Archive", "Access every saved report, export the complete ledger files, and manage your project records from one place.", "ARCHIVE")
+    st.subheader("📂 RECEIPT ARCHIVE | AILYN HOUSE")
     st.caption("Every saved receipt is preserved here and summarized in the complete Excel ledger.")
     st.metric(
         f"TOTAL SPENT THIS MONTH ({manila_now().strftime('%b %Y').upper()})",
@@ -4679,342 +4196,49 @@ elif view == "receipt_archive":
                     st.success(f"Deleted: {report_path.name}")
                     st.rerun()
 
-elif view == "client_portal":
-    project = st.session_state.project
-    budget = float(st.session_state.budget or 0)
-    spent = float(get_total() or 0)
-    balance = float(get_balance() or 0)
-    completed_tasks = sum(task.get("status") == "Completed" for task in st.session_state.planner_tasks)
-    total_tasks = len(st.session_state.planner_tasks)
-    progress = int(completed_tasks / total_tasks * 100) if total_tasks else 0
-    render_module_shell("Client Portal", f"{project.get('name', 'Ailyn House Project')} | {project.get('status', 'Active')} | Client view", "CLIENTS")
-    portal_metrics = st.columns(4)
-    with portal_metrics[0]:
-        st.metric("PROJECT PROGRESS", f"{progress}%")
-    with portal_metrics[1]:
-        st.metric("BUDGET", f"PHP {budget:,.0f}")
-    with portal_metrics[2]:
-        st.metric("SPENT", f"PHP {spent:,.0f}")
-    with portal_metrics[3]:
-        st.metric("BALANCE", f"PHP {balance:,.0f}")
-    st.progress(progress / 100, text=f"{completed_tasks} of {total_tasks} scheduled tasks completed")
-    overview_col, updates_col = st.columns([1.1, 0.9])
-    with overview_col:
-        st.markdown("### PROJECT DETAILS")
-        st.dataframe([{
-            "Client": project.get("client") or "Not set",
-            "Site": project.get("address") or "Not set",
-            "Target": project.get("target_date") or "Not set",
-            "Manager": project.get("manager") or "Not set",
-        }], use_container_width=True, hide_index=True)
-        st.markdown("### RECENT PROJECT PHOTOS")
-        client_photos = st.session_state.get("scanner_photos", [])[:6]
-        photo_columns = st.columns(3)
-        for index, photo in enumerate(client_photos):
-            photo_path = os.path.join(APP_DIR, photo.get("file", ""))
-            if os.path.isfile(photo_path):
-                with photo_columns[index % 3]:
-                    st.image(photo_path, use_container_width=True)
-                    st.caption(f"{photo.get('tag', 'General')} | {photo.get('saved_at', '')[:10]}")
-        if not client_photos:
-            st.info("Project photos will appear here after they are saved.")
-    with updates_col:
-        st.markdown("### SCHEDULE")
-        upcoming_tasks = sorted(st.session_state.planner_tasks, key=lambda task: task.get("date_obj", ""), reverse=False)[:8]
-        if upcoming_tasks:
-            st.dataframe([{"Date": task.get("date_obj", ""), "Work": task.get("description", task.get("name", "")), "Status": task.get("status", "Planned")} for task in upcoming_tasks], use_container_width=True, hide_index=True)
-        else:
-            st.info("No schedule updates yet.")
-        st.markdown("### CLIENT UPDATES")
-        client_notes = [note for note in st.session_state.client_notes if note.get("folder") in {"Client Approval", "Photo Comments"}]
-        if client_notes:
-            for note in client_notes[:6]:
-                st.markdown(f"**{note.get('folder', 'Update')}**  \n{note.get('text', '')}")
-                st.caption(note.get("created_at", "").replace("T", " ")[:16])
-        else:
-            st.info("No client updates yet.")
-    action_col, message_col = st.columns(2)
-    with action_col:
-        if st.button("OPEN MESSAGES & CALLS", use_container_width=True, key="portal_communications"):
-            set_view("communications")
-    with message_col:
-        if st.button("BACK TO DASHBOARD", use_container_width=True, key="portal_dashboard"):
-            set_view("home")
-
-elif view == "communications":
-    render_module_shell("Messages & Calls", "Keep project communication and client meetings in one place.", "COMMUNICATIONS")
-    message_tab, radio_tab, calls_tab = st.tabs(["MESSAGES", "PROJECT RADIO", "VOICE & VIDEO CALLS"])
-    with message_tab:
-        message_sender = st.text_input("Your name", value=st.session_state.app_settings.get("display_name", "") or "Project team", key="message_sender")
-        message_text = st.text_area("Message", placeholder="Write an update for the client...", height=90, key="message_text")
-        if st.button("SEND MESSAGE", use_container_width=True, key="send_message"):
-            if message_text.strip():
-                st.session_state.messages.insert(0, {"id": str(uuid.uuid4()), "sender": message_sender.strip() or "Project team", "text": message_text.strip(), "sent_at": manila_now().isoformat()})
-                persist_state()
-                st.rerun()
-            st.warning("Write a message before sending.")
-        if st.session_state.messages:
-            st.markdown("### Conversation")
-            for message in st.session_state.messages[:30]:
-                sent_at = message.get("sent_at", "").replace("T", " ")[:16]
-                st.markdown(f"**{message.get('sender', 'Project team')}**  \n{message.get('text', '')}")
-                st.caption(sent_at)
-                st.divider()
-        else:
-            st.info("No messages yet. Send the first project update.")
-    with radio_tab:
-        st.markdown("### Project radio")
-        st.caption("Use channels for quick site updates. Voice clips can be recorded on your phone and uploaded here.")
-        radio_channel = st.selectbox("Channel", ["General", "Site Team", "Safety", "Client Updates"], key="radio_channel")
-        radio_sender = st.text_input("Call sign", value=st.session_state.app_settings.get("display_name", "") or "Project team", key="radio_sender")
-        if st.button("PUSH TO TALK", use_container_width=True, key="radio_push_to_talk"):
-            st.session_state.radio_transmitting = not st.session_state.get("radio_transmitting", False)
-        if st.session_state.get("radio_transmitting"):
-            st.success("TRANSMITTING")
-        else:
-            st.info("Radio ready")
-        radio_text = st.text_input("Broadcast text", placeholder="Site update or urgent message", key="radio_text")
-        voice_clip = st.file_uploader("Voice clip (optional)", type=["mp3", "wav", "m4a", "ogg"], key="radio_voice_clip")
-        if st.button("BROADCAST", use_container_width=True, key="broadcast_radio"):
-            if radio_text.strip() or voice_clip:
-                radio_message = {"id": str(uuid.uuid4()), "kind": "radio", "channel": radio_channel, "sender": radio_sender.strip() or "Project team", "text": radio_text.strip(), "sent_at": manila_now().isoformat()}
-                if voice_clip:
-                    radio_message["audio"] = base64.b64encode(voice_clip.getvalue()).decode("ascii")
-                    radio_message["audio_type"] = voice_clip.type or "audio/mpeg"
-                st.session_state.messages.insert(0, radio_message)
-                st.session_state.radio_transmitting = False
-                persist_state()
-                st.rerun()
-            st.warning("Add text or a voice clip before broadcasting.")
-        radio_messages = [message for message in st.session_state.messages if message.get("kind") == "radio" and message.get("channel") == radio_channel]
-        if radio_messages:
-            st.markdown("### Channel activity")
-            for message in radio_messages[:20]:
-                st.markdown(f"**{message.get('sender', 'Project team')}** | {message.get('sent_at', '').replace('T', ' ')[:16]}  \n{message.get('text', '')}")
-                if message.get("audio"):
-                    st.audio(base64.b64decode(message["audio"]), format=message.get("audio_type", "audio/mpeg"))
-        else:
-            st.info("No broadcasts in this channel yet.")
-    with calls_tab:
-        meeting_url = st.session_state.app_settings.get("meeting_url", "")
-        st.markdown("### Client meeting room")
-        if meeting_url.startswith("https://"):
-            st.success("Secure meeting link is ready.")
-            call_video, call_voice = st.columns(2)
-            with call_video:
-                st.link_button("START VIDEO CALL", meeting_url, use_container_width=True)
-            with call_voice:
-                st.link_button("START VOICE CALL", meeting_url, use_container_width=True)
-            st.caption("Voice and video are provided by your secure meeting service.")
-        else:
-            st.info("Add an HTTPS Google Meet, Zoom, or Microsoft Teams link in Settings to enable calls.")
-    if st.button("BACK TO DASHBOARD", key="communications_back"):
+elif view == "monthly_close":
+    st.markdown("## 🔒 MONTHLY CLOSING")
+    st.caption("Review the current month's construction and payroll totals before closing the period.")
+    close_month = st.selectbox("Month", [manila_now().strftime("%Y-%m")], key="monthly_close_month")
+    construction = monthly_construction_spend(close_month)
+    total = monthly_spend(close_month)
+    payroll = total - construction
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("CONSTRUCTION SPEND", f"₱{construction:,.2f}")
+    with c2:
+        st.metric("PAYROLL / OTHER", f"₱{payroll:,.2f}")
+    with c3:
+        st.metric("TOTAL MONTHLY SPEND", f"₱{total:,.2f}")
+    st.warning("Monthly closing is a review screen. No records are deleted or changed by opening this page.")
+    if st.button("⬅️ BACK TO OVERVIEW", use_container_width=True, key="monthly_close_back"):
         set_view("home")
 
-elif view == "settings":
-    settings = st.session_state.app_settings
-    render_module_shell("Settings", "Manage your account, project preferences, notifications, and security.", "SYSTEM")
-    profile_tab, preference_tab, security_tab = st.tabs(["PROFILE", "PREFERENCES", "SECURITY"])
-    with profile_tab:
-        with st.form("account_profile_form"):
-            display_name = st.text_input("Display name", value=settings.get("display_name", ""), placeholder="Your name")
-            email = st.text_input("Email address", value=settings.get("email", ""), placeholder="name@example.com")
-            meeting_url = st.text_input("Secure voice/video meeting link", value=settings.get("meeting_url", ""), placeholder="https://meet.google.com/...")
-            if st.form_submit_button("SAVE PROFILE", use_container_width=True):
-                if email and ("@" not in email or "." not in email.rsplit("@", 1)[-1]):
-                    st.error("Enter a valid email address.")
-                else:
-                    settings.update({"display_name": display_name.strip(), "email": email.strip(), "meeting_url": meeting_url.strip()})
-                    add_audit_event("profile_updated", {"display_name": display_name.strip(), "email": email.strip()})
-                    persist_state()
-                    st.success("Profile saved.")
-    with preference_tab:
-        with st.form("app_preferences_form"):
-            dark_mode = st.checkbox("Dark mode", value=bool(st.session_state.dark_mode))
-            client_mode = st.checkbox("Client view mode", value=bool(settings.get("client_mode", False)), help="Use this preference when preparing a client-facing project view.")
-            email_notifications = st.checkbox("Email notifications", value=bool(settings.get("email_notifications", True)))
-            budget_alerts = st.checkbox("Budget alerts", value=bool(settings.get("budget_alerts", True)))
-            date_format = st.selectbox("Date format", ["%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y"], index=["%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y"].index(settings.get("date_format", "%Y-%m-%d")))
-            if st.form_submit_button("SAVE PREFERENCES", use_container_width=True):
-                st.session_state.dark_mode = dark_mode
-                settings.update({"client_mode": client_mode, "email_notifications": email_notifications, "budget_alerts": budget_alerts, "date_format": date_format})
-                add_audit_event("preferences_updated", {"budget_alerts": budget_alerts, "email_notifications": email_notifications, "date_format": date_format})
-                persist_state()
-                st.success("Preferences saved.")
-                st.rerun()
-    with security_tab:
-        st.markdown("### Account access")
-        if LOGIN_PASSWORD:
-            st.success("Workspace password login is enabled.")
-            if st.button("SIGN OUT", use_container_width=True, key="settings_sign_out"):
-                st.session_state.authenticated = False
-                st.rerun()
-        else:
-            st.info("Password login is disabled. Set AILYN_LOGIN_PASSWORD to protect this workspace.")
-
-        with st.form("role_access_form"):
-            role_options = ["manager", "staff", "viewer"]
-            current_role_index = role_options.index(st.session_state.get("current_user_role", "manager")) if st.session_state.get("current_user_role", "manager") in role_options else 0
-            current_user_role = st.selectbox("Current role", role_options, index=current_role_index, help="Manager can edit, staff can add records, viewer is read-only.")
-            if st.form_submit_button("SAVE ROLE", use_container_width=True):
-                st.session_state.current_user_role = current_user_role
-                add_audit_event("role_updated", {"role": current_user_role})
-                persist_state()
-                st.success("Role updated.")
-                st.rerun()
-
-        st.markdown("### Role permissions")
-        st.write("- Manager: full access, budgets, backups, settings")
-        st.write("- Staff: add records, view dashboards, export reports")
-        st.write("- Viewer: read-only dashboards and exports")
-        st.markdown("### Social login readiness")
-        google_ready = bool(os.getenv("GOOGLE_CLIENT_ID"))
-        facebook_ready = bool(os.getenv("FACEBOOK_APP_ID"))
-        st.write(f"Google login: {'Configured' if google_ready else 'Needs OAuth configuration'}")
-        st.write(f"Facebook login: {'Configured' if facebook_ready else 'Needs OAuth configuration'}")
-        st.caption("Social login requires provider credentials, redirect URLs, and HTTPS. Add those through your deployment secrets; never save client secrets in app data.")
-        st.markdown("### Data protection")
-        st.write(f"Database backups available: {history_count() > 0}")
-        if user_can_edit({"manager", "admin"}):
-            if st.button("CREATE BACKUP", use_container_width=True, key="settings_backup"):
-                backup_path = create_backup()
-                add_audit_event("backup_created", {"backup_path": os.path.basename(backup_path)})
-                with open(backup_path, "rb") as backup_file:
-                    st.download_button("DOWNLOAD BACKUP", backup_file.read(), file_name=os.path.basename(backup_path), mime="application/octet-stream", use_container_width=True, key="settings_download_backup")
-        else:
-            st.info("Backup creation is restricted to managers.")
-        st.markdown("### Recent activity")
-        render_recent_activity(limit=10)
-
-elif view == "photo_scanner":
-    render_module_shell("Photo Studio", "Capture a receipt or project update. The app will read and organize the photo for you.", "TOOLS")
-    studio_capture, studio_status = st.columns([1.25, 0.75])
-    with studio_capture:
-        st.markdown("### Camera")
-        st.markdown("Use your device camera to create a clear project record.")
-        if st.button("📷 OPEN CAMERA", use_container_width=True, key="open_photo_studio"):
-            st.session_state.scanner_open = True
-            st.rerun()
-        if st.session_state.scanner_open:
-            photo_camera_dialog()
-    with studio_status:
-        st.markdown("### Studio status")
-        st.metric("Saved photos", len(st.session_state.get("scanner_photos", [])))
-        if st.session_state.get("scanned_photo_bytes"):
-            st.success("Photo ready for review")
-            st.caption("Review the scan, save the file, or retake the photo from the camera window.")
-        else:
-            st.info("No photo captured yet")
-        if st.button("OPEN PHOTO GALLERY", use_container_width=True, key="studio_gallery"):
-            set_view("project_tools")
-    if st.button("BACK TO DASHBOARD", key="studio_back"):
-        set_view("home")
-
-elif view == "project_tools":
-    render_module_shell("Project Tools", "Organize project evidence, search across records, and prepare focused reports from one control center.", "TOOLS")
-    st.caption("Organize project evidence, find records quickly, and prepare focused reports.")
-    tools_gallery, tools_search, tools_cleanup = st.tabs(["PHOTO GALLERY", "SEARCH & REPORTS", "DATA CLEANUP"])
-
-    with tools_gallery:
-        uploaded_photos = st.file_uploader("Add project photos", type=["jpg", "jpeg", "png", "webp"], accept_multiple_files=True, key="project_photo_uploads")
-        upload_tag = st.selectbox("Photo category", ["General", "Before", "After", "Framing", "Electrical", "Plumbing", "Painting", "Inspection"], key="project_photo_tag")
-        if uploaded_photos and st.button("SAVE ALL PHOTOS", use_container_width=True, key="save_project_photos"):
-            existing_hashes = {photo.get("hash") for photo in st.session_state.scanner_photos}
-            saved_count = 0
-            for uploaded in uploaded_photos:
-                photo_bytes, photo_mime = normalize_photo_bytes(uploaded.getvalue(), uploaded.type or "image/jpeg")
-                photo_hash = hashlib.sha256(photo_bytes).hexdigest()
-                if photo_hash in existing_hashes:
-                    continue
-                photo_id = str(uuid.uuid4())
-                relative_path = save_scanner_photo(photo_bytes, photo_mime, photo_id)
-                st.session_state.scanner_photos.append({"id": photo_id, "hash": photo_hash, "file": relative_path, "tag": upload_tag, "saved_at": manila_now().isoformat()})
-                existing_hashes.add(photo_hash)
-                saved_count += 1
-            persist_state()
-            st.success(f"Saved {saved_count} new photo(s).")
-        photos = st.session_state.get("scanner_photos", [])
-        if not photos:
-            st.info("No saved project photos yet.")
-        else:
-            selected_tag = st.selectbox("Filter photos", ["All"] + sorted({photo.get("tag", "General") for photo in photos}), key="gallery_filter")
-            visible_photos = [photo for photo in photos if selected_tag == "All" or photo.get("tag", "General") == selected_tag]
-            gallery_columns = st.columns(4)
-            for index, photo in enumerate(visible_photos):
-                photo_path = os.path.abspath(os.path.join(APP_DIR, photo.get("file", "")))
-                if not os.path.isfile(photo_path):
-                    continue
-                with gallery_columns[index % 4]:
-                    with open(photo_path, "rb") as image_file:
-                        image_bytes = image_file.read()
-                    st.image(image_bytes, use_container_width=True)
-                    st.caption(f"{photo.get('tag', 'General')} | {photo.get('saved_at', '')[:10]}")
-                    st.download_button("DOWNLOAD", image_bytes, file_name=os.path.basename(photo_path), key=f"download_photo_{photo['id']}", use_container_width=True)
-            if len(visible_photos) >= 2:
-                st.markdown("#### BEFORE / AFTER COMPARISON")
-                photo_options = {f"{photo.get('tag', 'General')} | {photo.get('saved_at', '')[:10]} | {photo['id'][:8]}": photo for photo in visible_photos}
-                compare_left, compare_right = st.columns(2)
-                with compare_left:
-                    left_label = st.selectbox("Before photo", list(photo_options), key="compare_left")
-                with compare_right:
-                    right_label = st.selectbox("After photo", list(photo_options), index=min(1, len(photo_options) - 1), key="compare_right")
-                comparison_columns = st.columns(2)
-                for column, label in zip(comparison_columns, (left_label, right_label)):
-                    comparison_path = os.path.join(APP_DIR, photo_options[label].get("file", ""))
-                    if os.path.isfile(comparison_path):
-                        with column:
-                            st.image(comparison_path, use_container_width=True)
-
-    with tools_search:
-        query = st.text_input("Search materials, labor, payroll, and tasks", key="global_search").strip().lower()
-        all_records = searchable_records(st.session_state)
-        all_records += [{"category": "Task", **task} for task in st.session_state.get("planner_tasks", [])]
-        results = [record for record in all_records if not query or query in " ".join(str(value) for value in record.values()).lower()]
-        st.metric("Matching records", len(results))
-        if results:
-            st.dataframe(results, use_container_width=True, hide_index=True)
-        else:
-            st.info("No matching records.")
-        st.markdown("#### CUSTOM REPORT")
-        report_type = st.selectbox("Report data", ["All records", "Materials only", "Expenses only"], key="custom_report_type")
-        report_records = [record for record in all_records if report_type == "All records" or record.get("category") == report_type.removesuffix(" only")]
-        report_records = [{
-            "type": "material" if record.get("category") == "Material" else "expense",
-            "date": record.get("date", record.get("month", "")),
-            "qty": record.get("qty", 1),
-            "name": record.get("name", record.get("item", record.get("description", ""))),
-            "price": record.get("price", record.get("amount", record.get("net", 0))),
-            "delivery": record.get("delivery", 0),
-            "amount": record.get("amount", record.get("price", record.get("net", 0))),
-        } for record in report_records if record.get("category") != "Task"]
-        report_html = build_html_report(report_records, st.session_state.budget, custom_title="CUSTOM PROJECT REPORT")
-        st.download_button("DOWNLOAD CUSTOM REPORT", report_html, file_name="custom_project_report.html", mime="text/html", use_container_width=True)
-
-    with tools_cleanup:
-        duplicate_groups = find_duplicate_records(searchable_records(st.session_state))
-        st.metric("Duplicate groups", len(duplicate_groups))
-        for group in duplicate_groups:
-            st.warning("Duplicate: " + " | ".join(str(item.get("name", item.get("item", item.get("description", "record")))) for item in group))
-        if duplicate_groups and st.button("REMOVE DUPLICATE RECORDS", use_container_width=True, key="remove_duplicates"):
-            seen = set()
-            for key in ("records", "labor_records", "payroll_expenses"):
-                kept = []
-                for record in st.session_state.get(key, []):
-                    signature = (record.get("type", key), str(record.get("name", record.get("item", record.get("description", "")))).strip().lower(), round(float(record.get("amount", record.get("price", record.get("net", 0))) or 0), 2), record.get("date", record.get("month", "")))
-                    if signature not in seen:
-                        seen.add(signature)
-                        kept.append(record)
-                st.session_state[key] = kept
-            persist_state()
-            st.success("Duplicate records removed; the first copy was kept.")
-            st.rerun()
-        st.markdown("#### DISPLAY")
-        dark_mode = st.toggle("Dark mode", value=st.session_state.dark_mode, key="dark_mode_toggle")
-        if dark_mode != st.session_state.dark_mode:
-            st.session_state.dark_mode = dark_mode
-            persist_state()
-            st.rerun()
-
+elif view == "update":
+    st.markdown("## Upgrade Center")
+    st.caption("Administrator-only signed release installation. The current app is backed up first.")
+    admin_password = st.text_input("Administrator password", type="password", key="admin_update_password")
+    uploaded_upgrade = st.file_uploader("Choose signed Python upgrade", type=["py"], key="upgrade_file")
+    signature = st.text_input("Release SHA-256 HMAC signature", key="upgrade_signature")
+    confirm_upgrade = st.checkbox("I have reviewed this signed release and want to install it.")
+    if st.button("INSTALL SIGNED UPGRADE", use_container_width=True,
+                 disabled=not (admin_password and uploaded_upgrade and signature and confirm_upgrade)):
+        try:
+            if not ADMIN_PASSWORD or not hmac.compare_digest(admin_password, ADMIN_PASSWORD):
+                raise ValueError("Administrator authentication failed.")
+            backup_path = install_update(uploaded_upgrade, signature)
+            st.success(f"Upgrade installed. Backup created at {os.path.basename(backup_path)}.")
+            st.warning("Restart the Streamlit app to load the new version.")
+        except ValueError as error:
+            st.error(str(error))
+    st.divider()
+    st.subheader("Backups")
+    backup_dir = os.path.join(APP_DIR, "backups")
+    backup_names = sorted(os.listdir(backup_dir), reverse=True) if os.path.isdir(backup_dir) else []
+    if backup_names:
+        st.dataframe([{"Backup": name} for name in backup_names[:10]], use_container_width=True, hide_index=True)
+    else:
+        st.caption("No upgrades have been installed yet.")
 
 else:
     st.info("Welcome to Ailyn Project Management System. Use the command sidebar to navigate.")

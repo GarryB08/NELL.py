@@ -14,6 +14,20 @@ def test_labor_calculation_uses_tier_rate():
     assert gross == 1625.0
 
 
+def test_labor_calculation_accepts_custom_daily_rate():
+    gross, full, partial = app_logic.calculate_labor_pay(2.5, "CUSTOM", 700)
+    assert full == 1400.0
+    assert partial == 350.0
+    assert gross == 1750.0
+
+
+def test_hed_labor_calculation_accepts_entered_daily_rate():
+    gross, full, partial = app_logic.calculate_labor_pay(1.5, "HED LABOR", 600)
+    assert full == 600.0
+    assert partial == 300.0
+    assert gross == 900.0
+
+
 def test_monthly_totals_separate_payroll():
     totals = app_logic.monthly_totals(
         [{"type": "material", "month": "2026-08", "amount": 1200}],
